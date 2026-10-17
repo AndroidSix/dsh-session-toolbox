@@ -41,7 +41,7 @@ DSH 装机验证（可选，需本机 DSH）：`npm pack --ignore-scripts` 后�
 - 修改逻辑一律「先写失败用例再改实现」；journal/时序类改动必须带崩溃注入测试。
 - 中文注释克制、命名表达意图；UI 文案 zh/en 双语。
 - commit message：`type: 一句话`（feat/fix/ui/test/docs/chore）。
-- 发版：改 `package.json version` → `npm run build`（自动重写 `cordis.patch.yml` 与 `lib/host-vX.Y.Z.js`）→ 一并提交 → 打 `vX.Y.Z` tag → GitHub Release；CI 校验 tag↔version 一致后发布 npm（provenance，无需 token）。
+- 发版：改 `package.json version` → `npm run build`（自动重写 `cordis.patch.yml` 与 `lib/host-vX.Y.Z.js`）→ 一并提交 → 打 `vX.Y.Z` tag → GitHub Release。npm 发布当前为手动门槛（npm 名称 `dsh-session-kit` 被无关旧包占用；确定新名称/作用域并配置 Trusted Publishing 后，在 publish.yml 手动 dispatch 即可）。
 
 ## 升级适配（官方 DSH 更新后）
 

@@ -53,27 +53,25 @@ DSH 0.2.0-rc.2 的会话有三个「官方没做」的缺口：粘贴的截图�
 
 要求：DSH ≥ 0.2.0-rc.2（Node 22.19+ / 24 由 DSH 自带）。
 
-**方式一：npm**
+**方式一：GitHub 链接（首选）**
 
-```bash
-npm install -g dsh-session-kit   # 或在 DSH 插件页输入包名安装
-```
-
-DSH 内：侧栏 → 插件 → 安装 → `dsh-session-kit`，启用后即时生效（HMR 可用时热载，否则重启一次）。
-
-**方式二：GitHub**
+DSH 内：侧栏 → 插件 → 安装 → 仓库地址：
 
 ```
 https://github.com/AndroidSix/dsh-session-kit.git
 ```
 
-**方式三：本地构建**
+`lib/` 随发布分支提交，DSH 直接加载构建产物，无需本地构建；启用后即时生效（HMR 可用时热载，否则重启一次）。
+
+**方式二：本地构建**
 
 ```bash
 git clone https://github.com/AndroidSix/dsh-session-kit.git
 cd dsh-session-kit && npm ci && npm run build
 # DSH 插件页 → 本地目录 → 选择该仓库目录
 ```
+
+> npm 渠道说明：npm 上 `dsh-session-kit` 名称已被一个无关旧包占用；本项目的 npm 发布暂未启用（`.github/workflows/publish.yml` 保留但改为手动触发），待确定作用域名（如 `@androidsix/…`）后再开放。GitHub 安装路径不受影响。
 
 安装后打开 侧栏 → 插件 → Session Kit 详情 即为工具箱页面；会话行的「⋯」菜单出现「切换到其它项目…」与「移入回收站」；输入区出现 🛟 徽标。
 

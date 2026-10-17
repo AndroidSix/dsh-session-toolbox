@@ -19,6 +19,9 @@ concurrency:
 
 jobs:
   publish:
+    # Gated: the unscoped npm name is taken by an unrelated package; publish
+    # manually (workflow_dispatch) once a scoped/unconflicted name is decided.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
