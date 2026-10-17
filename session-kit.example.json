@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "draftVault": {
+    "enabled": true,
+    "maxSizeBytes": 209715200,
+    "ttlDays": 7
+  },
+  "trash": {
+    "ttlDays": 30,
+    "autoPurge": false
+  },
+  "move": {
+    "enabled": true
+  }
+}

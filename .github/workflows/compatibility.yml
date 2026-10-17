@@ -1,0 +1,28 @@
+name: Cross-platform compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Verify engine lifecycle on real DSH modules
+        run: node --test tests/kernel.test.mjs tests/move.test.mjs tests/trash.test.mjs tests/session-log.test.mjs tests/paths.test.mjs tests/api.test.mjs tests/startup.test.mjs tests/draft-vault.test.mjs

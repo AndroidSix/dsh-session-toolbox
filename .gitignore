@@ -1,0 +1,16 @@
+# --- 依赖与本地数据 ---
+node_modules/
+.DS_Store
+*.log
+
+# --- 发布产物 lib/ 随发布分支提交：DSH 插件页/CLI 可直接从 GitHub 安装（免构建）。
+#     重建：npm run build ---
+
+# 本机调试与私有材料，绝不提交
+.session-kit-live/
+*.tgz
+session-kit.json
+journal.json
+trash.json
+vault-manifest.json
+tmp-live/

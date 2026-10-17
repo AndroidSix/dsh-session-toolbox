@@ -1,0 +1,3 @@
+- insert:
+    - id: session-kit-v1-0.1.0
+      name: ./lib/host-v0.1.0.js
