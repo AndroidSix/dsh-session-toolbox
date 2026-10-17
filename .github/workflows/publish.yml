@@ -47,7 +47,7 @@ jobs:
           '
       - run: npm ci --ignore-scripts
       - run: npm run check
-      - run: npm pack --ignore-scripts
+      - run: npm run check:tarball
       - name: Attach tarball to the GitHub release
         run: gh release upload "$RELEASE_TAG" ./*.tgz --clobber
         env:
