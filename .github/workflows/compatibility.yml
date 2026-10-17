@@ -24,5 +24,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run build
-      - name: Verify engine lifecycle on real DSH modules
-        run: node --test tests/kernel.test.mjs tests/move.test.mjs tests/trash.test.mjs tests/session-log.test.mjs tests/paths.test.mjs tests/api.test.mjs tests/startup.test.mjs tests/draft-vault.test.mjs
+      - name: Run the full suite (real cordis kernel lifecycle + engines + browser bundle)
+        run: node --test 'tests/*.test.mjs'
+      - name: Verify package shape from the working tree
+        run: node scripts/check-package.mjs

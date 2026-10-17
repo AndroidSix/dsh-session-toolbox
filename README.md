@@ -125,7 +125,7 @@ CLI 直写 `~/.dsh/storages/workspace.json` 的离线镜像；日常操作请优
 ## 开发与验证
 
 ```bash
-npm ci && npm run check     # build + 51 项测试
+npm ci && npm run check     # build + 58 项测试 + 包形态门禁
 ```
 
 测试不需要 DSH 运行：会话日志用真实格式的**多帧带校验和 zstd** 合成夹具（`tests/fixtures/`），路径编码直接从官方 `dsh-session-persistence-jsonl` 逐字复刻并对样本自校验；`tests/kernel.test.mjs` 在**真实 cordis v4 内核**里加载插件走完整生命周期（provide/inject/effect/dispose）；`tests/draft-vault.test.mjs` 用「官方处理器契约双身」（读 `clipboardData.items`→`getAsFile`→`preventDefault`）验证合成粘贴的接受性。
