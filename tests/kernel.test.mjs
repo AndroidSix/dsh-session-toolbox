@@ -21,9 +21,9 @@ test('real cordis kernel: plugin boots, registers the route, serves state', asyn
 	ctx.provide('webServer', {
 		register(route) { routes.push(route); return () => { const i = routes.indexOf(route); if (i >= 0) routes.splice(i, 1); }; },
 	});
-	const fiber = await ctx.plugin({ id: 'dsh-session-kit-v1-test', name: host.name, inject: host.inject, Config: host.Config, apply: (scoped, config) => host.apply(scoped, config) });
+	const fiber = await ctx.plugin({ id: 'dsh-session-toolbox-v1-test', name: host.name, inject: host.inject, Config: host.Config, apply: (scoped, config) => host.apply(scoped, config) });
 	assert.equal(routes.length, 1, 'route registered through ctx.inject([webServer])');
-	const kit = ctx.get('sessionKit');
+	const kit = ctx.get('sessionToolbox');
 	assert.ok(kit, 'kit service provided');
 	const res = capture();
 	await routes[0].handler({ method: 'GET', headers: { host: '127.0.0.1:19387' }, socket: { remoteAddress: '127.0.0.1' } }, res);
@@ -34,12 +34,12 @@ test('real cordis kernel: plugin boots, registers the route, serves state', asyn
 	// A POST through the real kernel plumbing must dispatch to a real action.
 	const key = state.key;
 	const posted = capture();
-	await routes[0].handler({ method: 'POST', headers: { host: '127.0.0.1:19387', 'content-type': 'application/json', 'x-session-kit-key': key },
+	await routes[0].handler({ method: 'POST', headers: { host: '127.0.0.1:19387', 'content-type': 'application/json', 'x-session-toolbox-key': key },
 		socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify({ type: 'trash.list' })); } }, posted);
 	assert.deepEqual(JSON.parse(posted.body).items, []);
 	// dispose: the plugin fiber's effects must tear down cleanly.
 	await fiber.dispose();
-	assert.equal(ctx.get('sessionKit'), undefined, 'service dies with the plugin fiber');
+	assert.equal(ctx.get('sessionToolbox'), undefined, 'service dies with the plugin fiber');
 	assert.equal(routes.length, 0, 'route unregistered via the effect disposer');
 	void dir;
 });

@@ -1,5 +1,5 @@
 /**
- * dsh-session-kit host plugin: draft vault manifest mirror (§4 FR1), session
+ * dsh-session-toolbox host plugin: draft vault manifest mirror (§4 FR1), session
  * move (§10) and trash bin (§11) for DeepSeek Harness. Every official surface
  * is reached through `ctx.get(...)` service names probed at runtime; a missing
  * capability degrades that feature to a visible "unavailable" state — never a
@@ -17,21 +17,21 @@ import { apiHandler, dispatch } from './api.mjs';
 import pkg from '../package.json' with { type: 'json' };
 const pluginVersion = pkg.version;
 
-export const name = 'dsh-session-kit';
+export const name = 'dsh-session-toolbox';
 export const inject = [];
 // schemastery has no `.optional()`; empty defaults mean "unset" (apply() treats '' as absent).
 export const Config = z.object({
-	configFile: z.string().description('Directory for session-kit data (defaults to <DSH_HOME>/session-kit)').default(''),
+	configFile: z.string().description('Directory for session-toolbox data (defaults to <DSH_HOME>/session-toolbox)').default(''),
 	dshHome: z.string().description('Override the DSH home whose sessions/ storage the tool manages (advanced)').default(''),
 });
 
 export function defaultKitRoot() {
-	return join(resolveDshHome(), 'session-kit');
+	return join(resolveDshHome(), 'session-toolbox');
 }
 
 export async function apply(ctx, options = {}) {
 	const dshHome = resolve(options.dshHome || resolveDshHome());
-	const root = resolve(options.configFile || join(dshHome, 'session-kit'));
+	const root = resolve(options.configFile || join(dshHome, 'session-toolbox'));
 	await mkdir(root, { recursive: true, mode: 0o700 });
 	const capabilities = {
 		workspaceRegistry: ctx.get('workspaceRegistry') !== undefined,
@@ -39,7 +39,7 @@ export async function apply(ctx, options = {}) {
 		sessionPersistence: ctx.get('sessionPersistence') !== undefined,
 		webServer: false, // flips true when the optional webServer inject fires
 	};
-	const settingsDoc = new JsonDocument(root, 'session-kit.json', { version: 1 }, guardSettings);
+	const settingsDoc = new JsonDocument(root, 'session-toolbox.json', { version: 1 }, guardSettings);
 	const journalDoc = new JsonDocument(root, 'journal.json', { version: 1, active: null }, guardJournal);
 	const ledgerDoc = new JsonDocument(root, 'trash.json', { version: 1, items: [] }, guardLedger);
 	const manifestDoc = new JsonDocument(root, 'vault-manifest.json', { version: 1, records: [] }, guardManifest);
@@ -47,8 +47,8 @@ export async function apply(ctx, options = {}) {
 	let settingsCache = await settingsDoc.read().catch(() => ({ trash: {}, draftVault: {} }));
 	let journalCache = null;
 	try { journalCache = (await journalDoc.read()).active; }
-	catch (error) { ctx.logger?.warn?.(`session-kit: journal unreadable — ${error.message}`); }
-	if (journalCache !== null) ctx.logger?.warn?.(`session-kit: unresolved move journal for ${journalCache.sessionId}; complete or roll it back from the panel or CLI`);
+	catch (error) { ctx.logger?.warn?.(`session-toolbox: journal unreadable — ${error.message}`); }
+	if (journalCache !== null) ctx.logger?.warn?.(`session-toolbox: unresolved move journal for ${journalCache.sessionId}; complete or roll it back from the panel or CLI`);
 
 	const move = new MoveEngine({
 		root,
@@ -113,15 +113,15 @@ export async function apply(ctx, options = {}) {
 
 	ctx.inject?.(['webServer'], webCtx => {
 		capabilities.webServer = true;
-		webCtx.effect(() => webCtx.webServer.register({ kind: 'exact', path: '/.well-known/dsh-session-kit', handler: apiHandler(kit) }));
+		webCtx.effect(() => webCtx.webServer.register({ kind: 'exact', path: '/.well-known/dsh-session-toolbox', handler: apiHandler(kit) }));
 	});
 
 	// Expose the kit in-process (cordis plugins must return nothing; the service
 	// is the surface other plugins or future official hooks can reach).
-	ctx.provide('sessionKit', kit);
+	ctx.provide('sessionToolbox', kit);
 
 	ctx.effect(() => () => {});
-	ctx.logger?.info?.('dsh-session-kit ready', JSON.stringify({ version: pluginVersion, capabilities }));
+	ctx.logger?.info?.('dsh-session-toolbox ready', JSON.stringify({ version: pluginVersion, capabilities }));
 }
 
 /**

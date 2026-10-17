@@ -7,9 +7,9 @@ node_modules/
 #     重建：npm run build ---
 
 # 本机调试与私有材料，绝不提交
-.session-kit-live/
+.session-toolbox-live/
 *.tgz
-session-kit.json
+session-toolbox.json
 journal.json
 trash.json
 vault-manifest.json

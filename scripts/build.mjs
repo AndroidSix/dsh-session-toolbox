@@ -11,10 +11,10 @@ await copyFile('lib/index.js', 'lib/host.js');
 await copyFile('lib/index.js', `lib/host-v${version}.js`);
 // Versioned entry + versioned component id: every release replaces the server and browser module
 // generations together so a hot reload can never keep executing the previous build.
-await writeFile('cordis.patch.yml', `- insert:\n    - id: session-kit-v1-${version}\n      name: ./lib/host-v${version}.js\n`);
+await writeFile('cordis.patch.yml', `- insert:\n    - id: session-toolbox-v1-${version}\n      name: ./lib/host-v${version}.js\n`);
 // Client bundle: browser CJS wrapped for __ModuleLoader__, React/slots resolved by the host loader.
 // The draft vault is imported directly by the client (one browser bundle, no loader/CSP surface).
 await build({ entryPoints: { client: 'src/client.jsx' }, outdir: 'lib', bundle: true, platform: 'browser', format: 'cjs',
-  banner: { js: 'window.__ModuleLoader__.load({ id: "dsh-session-kit", factory: (require) => { var module = { exports: {} };' },
+  banner: { js: 'window.__ModuleLoader__.load({ id: "dsh-session-toolbox", factory: (require) => { var module = { exports: {} };' },
   footer: { js: 'return module.exports; } });' },
   target: 'es2022', packages: 'external', jsx: 'automatic', sourcemap: true, legalComments: 'eof' });

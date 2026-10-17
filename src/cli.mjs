@@ -14,7 +14,7 @@ import { guardJournal, guardLedger, JsonDocument } from './store.mjs';
 import { writeOwned } from './move.mjs';
 import { apiHandler, dispatch } from './api.mjs';
 
-export const defaultKitRoot = () => join(resolveDshHome(), 'session-kit');
+export const defaultKitRoot = () => join(resolveDshHome(), 'session-toolbox');
 
 /** Offline ledger over workspace.json (host stopped). */
 export class OfflineLedger {
@@ -52,7 +52,7 @@ export class OfflineLedger {
 }
 
 export function buildKit({ root = defaultKitRoot(), dshHome = resolveDshHome(), ledger = new OfflineLedger(join(dshHome, 'storages', 'workspace.json')), now = () => Date.now() } = {}) {
-	const settingsDoc = new JsonDocument(root, 'session-kit.json', { version: 1 });
+	const settingsDoc = new JsonDocument(root, 'session-toolbox.json', { version: 1 });
 	const journalDoc = new JsonDocument(root, 'journal.json', { version: 1, active: null }, guardJournal);
 	const ledgerDoc = new JsonDocument(root, 'trash.json', { version: 1, items: [] }, guardLedger);
 	const manifestDoc = new JsonDocument(root, 'vault-manifest.json', { version: 1, records: [] });
@@ -105,14 +105,14 @@ function offlineAdapter(ledger) {
 	};
 }
 
-const USAGE = `dsh-session-kit — 草稿保险箱 / 会话切换项目 / 回收站（CLI：在 DSH 停止时执行离线维护）
+const USAGE = `dsh-session-toolbox — 草稿保险箱 / 会话切换项目 / 回收站（CLI：在 DSH 停止时执行离线维护）
 
 用法：
-  dsh-session-kit status
-  dsh-session-kit move --session <session-…> --to <绝对路径> [--create] [--root <kit目录>]
-  dsh-session-kit recover            # 完成(前滚)被中断的迁移；先尝试，失败再回滚
-  dsh-session-kit rollback
-  dsh-session-kit trash-purge --item <itemId>
+  dsh-session-toolbox status
+  dsh-session-toolbox move --session <session-…> --to <绝对路径> [--create] [--root <kit目录>]
+  dsh-session-toolbox recover            # 完成(前滚)被中断的迁移；先尝试，失败再回滚
+  dsh-session-toolbox rollback
+  dsh-session-toolbox trash-purge --item <itemId>
 
 注意：CLI 直写 <DSH_HOME>/storages/workspace.json 作为离线账本镜像；运行中的
 DSH 请优先通过插件面板操作（宿主 RPC 与内存索引更准）。执行 move 前请完全退出

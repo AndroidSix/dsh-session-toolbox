@@ -7,7 +7,7 @@
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 
-export const API_PATH = '/.well-known/dsh-session-kit';
+export const API_PATH = '/.well-known/dsh-session-toolbox';
 const MAX_BODY = 4 * 1024 * 1024;
 
 class ApiError extends Error {
@@ -39,7 +39,7 @@ export function apiHandler(kit) {
 			if (req.headers['sec-fetch-site'] === 'cross-site') throw new ApiError(403, '来源无效');
 			if (req.method === 'GET') { json(res, 200, { ...await kit.state(), key }); return; }
 			if (req.method !== 'POST') throw new ApiError(405, '方法无效');
-			const actual = Buffer.from(String(req.headers['x-session-kit-key'] ?? '')), expected = Buffer.from(key);
+			const actual = Buffer.from(String(req.headers['x-session-toolbox-key'] ?? '')), expected = Buffer.from(key);
 			if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new ApiError(401, '请刷新面板后重试');
 			if (!/^application\/json(?:\s*;|$)/i.test(String(req.headers['content-type'] ?? ''))) throw new ApiError(415, '需要 JSON');
 			let size = 0; const chunks = [];

@@ -1,8 +1,9 @@
 name: Publish to npm
 
+# Manual only until the owner binds npm Trusted Publishing (owner=androidsup,
+# repo=dsh-session-toolbox, workflow=publish.yml) on npmjs.com; then add back
+# `release: types: [published]` for automatic publishes.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -19,9 +20,6 @@ concurrency:
 
 jobs:
   publish:
-    # Gated: the unscoped npm name is taken by an unrelated package; publish
-    # manually (workflow_dispatch) once a scoped/unconflicted name is decided.
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write

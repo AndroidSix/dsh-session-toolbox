@@ -1,10 +1,10 @@
-# DSH Session Kit
+# DSH Session Toolbox
 
 草稿保险箱 · 会话切换项目 · 回收站 —— 三个 DeepSeek Harness（DSH）会话管理增强，装进同一个插件。
 
 创建于 2026-10-17 · MIT · 只作为第三方插件运行，**不修改官方安装包**。
 
-DSH 0.2.0-rc.2 的会话有三个「官方没做」的缺口：粘贴的截图草稿只活在内存里（切会话/刷新/重启即丢）；会话与项目在创建时绑死（聊到一半发现该在别的项目里继续，只能重开）；「删除」没有后悔药（归档不是回收站，删掉的项目注册表找不回标题与顺序）。Session Kit 用运行时探测 + 官方公开服务面补齐这三块，全部数据只存本机。
+DSH 0.2.0-rc.2 的会话有三个「官方没做」的缺口：粘贴的截图草稿只活在内存里（切会话/刷新/重启即丢）；会话与项目在创建时绑死（聊到一半发现该在别的项目里继续，只能重开）；「删除」没有后悔药（归档不是回收站，删掉的项目注册表找不回标题与顺序）。Session Toolbox 用运行时探测 + 官方公开服务面补齐这三块，全部数据只存本机。
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -13,10 +13,10 @@ DSH 0.2.0-rc.2 的会话有三个「官方没做」的缺口：粘贴的截图�
 │  ├ 会话右键：切换到其它项目… / 移入回收站                  │
 │  └ 插件页：工具箱（开关、迁移向导、回收站列表）            │
 ├────────────────────────────────────────────────────────────┤
-│  dsh-session-kit (client bundle)                            │
-│        │  /.well-known/dsh-session-kit (loopback, 随机密钥) │
-│  dsh-session-kit (host plugin, cordis)                      │
-│    ├ draft manifest mirror  ~/.dsh/session-kit/             │
+│  dsh-session-toolbox (client bundle)                            │
+│        │  /.well-known/dsh-session-toolbox (loopback, 随机密钥) │
+│  dsh-session-toolbox (host plugin, cordis)                      │
+│    ├ draft manifest mirror  ~/.dsh/session-toolbox/             │
 │    ├ move journal + trash ledger                            │
 │    ├ 会话日志 zstd 帧手术（仅重写 header 帧）               │
 │    └ 官方服务：workspaceRegistry / sessionPersistence /     │
@@ -53,41 +53,45 @@ DSH 0.2.0-rc.2 的会话有三个「官方没做」的缺口：粘贴的截图�
 
 要求：DSH ≥ 0.2.0-rc.2（Node 22.19+ / 24 由 DSH 自带）。
 
-**方式一：GitHub 链接（首选）**
-
-DSH 内：侧栏 → 插件 → 安装 → 仓库地址：
-
-```
-https://github.com/AndroidSix/dsh-session-kit.git
-```
-
-`lib/` 随发布分支提交，DSH 直接加载构建产物，无需本地构建；启用后即时生效（HMR 可用时热载，否则重启一次）。
-
-**方式二：本地构建**
+**方式一：npm（首选）**
 
 ```bash
-git clone https://github.com/AndroidSix/dsh-session-kit.git
-cd dsh-session-kit && npm ci && npm run build
+npm install -g dsh-session-toolbox   # 或在 DSH 插件页输入包名安装
+```
+
+DSH 内：侧栏 → 插件 → 安装 → `dsh-session-toolbox`，启用后即时生效（HMR 可用时热载，否则重启一次）。
+
+**方式二：GitHub 链接**
+
+```
+https://github.com/AndroidSix/dsh-session-toolbox.git
+```
+
+`lib/` 随发布分支提交，DSH 直接加载构建产物，无需本地构建。
+
+**方式三：本地构建**
+
+```bash
+git clone https://github.com/AndroidSix/dsh-session-toolbox.git
+cd dsh-session-toolbox && npm ci && npm run build
 # DSH 插件页 → 本地目录 → 选择该仓库目录
 ```
 
-> npm 渠道说明：npm 上 `dsh-session-kit` 名称已被一个无关旧包占用；本项目的 npm 发布暂未启用（`.github/workflows/publish.yml` 保留但改为手动触发），待确定作用域名（如 `@androidsix/…`）后再开放。GitHub 安装路径不受影响。
-
-安装后打开 侧栏 → 插件 → Session Kit 详情 即为工具箱页面；会话行的「⋯」菜单出现「切换到其它项目…」与「移入回收站」；输入区出现 🛟 徽标。
+安装后打开 侧栏 → 插件 → Session Toolbox 详情 即为工具箱页面；会话行的「⋯」菜单出现「切换到其它项目…」与「移入回收站」；输入区出现 🛟 徽标。
 
 ## 数据放在哪
 
 | 内容 | 位置 |
 |---|---|
-| 图片草稿字节 | 浏览器 IndexedDB（`dsh-session-kit-vault`，仅 DSH Web 视图可见） |
-| 草稿清单镜像 / 设置 / 迁移 journal / 回收站账本 | `~/.dsh/session-kit/`（0600/0700，原子写 + 文件锁） |
+| 图片草稿字节 | 浏览器 IndexedDB（`dsh-session-toolbox-vault`，仅 DSH Web 视图可见） |
+| 草稿清单镜像 / 设置 / 迁移 journal / 回收站账本 | `~/.dsh/session-toolbox/`（0600/0700，原子写 + 文件锁） |
 | 会话日志与项目账本 | 官方原位置（`~/.dsh/sessions/…`、`workspace.json`），插件仅在迁移/彻底删除时按其格式改写 |
 
 隐私：全部本机，无任何外部上传；loopback 端点仅接受 127.0.0.1/::1、校验 Host/Origin/Sec-Fetch-Site，写操作需每次 GET 下发的随机密钥（timing-safe 比对）。
 
 ## 配置
 
-`~/.dsh/session-kit/session-kit.json`（也可在工具箱页面里改，改文件需重启 DSH）：
+`~/.dsh/session-toolbox/session-toolbox.json`（也可在工具箱页面里改，改文件需重启 DSH）：
 
 ```jsonc
 {
@@ -102,14 +106,14 @@ cd dsh-session-kit && npm ci && npm run build
 
 ## CLI
 
-`dsh-session-kit` 命令面向「DSH 已停止」的离线维护与救援：
+`dsh-session-toolbox` 命令面向「DSH 已停止」的离线维护与救援：
 
 ```bash
-dsh-session-kit status                                   # 当前设置/journal/回收站
-dsh-session-kit move --session <id> --to <绝对路径> [--create] [--dry-run]
-dsh-session-kit recover                                  # 检出中断迁移并前滚，失败则回滚
-dsh-session-kit rollback
-dsh-session-kit trash-purge --item <itemId>
+dsh-session-toolbox status                                   # 当前设置/journal/回收站
+dsh-session-toolbox move --session <id> --to <绝对路径> [--create] [--dry-run]
+dsh-session-toolbox recover                                  # 检出中断迁移并前滚，失败则回滚
+dsh-session-toolbox rollback
+dsh-session-toolbox trash-purge --item <itemId>
 ```
 
 CLI 直写 `~/.dsh/storages/workspace.json` 的离线镜像；日常操作请优先在 DSH 面板里做（宿主内存索引同步更准确）。执行 CLI move 前请完全退出 DSH（关窗口不等于退出），完成后重启。

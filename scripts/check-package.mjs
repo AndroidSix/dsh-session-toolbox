@@ -36,7 +36,7 @@ try {
 		console.error(`package shape broken:\n  ${missing.join('\n  ')}`);
 		process.exitCode = 1;
 	} else {
-		console.log(`package shape ok: dsh-session-kit@${pkg.version} (${Object.keys(pkg.exports).length} exports, entry ${entry})`);
+		console.log(`package shape ok: dsh-session-toolbox@${pkg.version} (${Object.keys(pkg.exports).length} exports, entry ${entry})`);
 	}
 } finally {
 	if (dir !== null && process.argv.includes('--tarball')) rmSync(dirname(dir), { recursive: true, force: true });

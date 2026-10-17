@@ -14,7 +14,7 @@ function fakeRes() {
 function fakeReq({ method = 'GET', host = '127.0.0.1:19387', remote = '127.0.0.1', origin, key, body, contentType = 'application/json' } = {}) {
 	const req = { method, headers: { host }, socket: { remoteAddress: remote } };
 	if (origin !== undefined) req.headers.origin = origin;
-	if (key !== undefined) req.headers['x-session-kit-key'] = key;
+	if (key !== undefined) req.headers['x-session-toolbox-key'] = key;
 	if (contentType !== undefined) req.headers['content-type'] = contentType;
 	if (body !== undefined) req[Symbol.asyncIterator] = async function* () { yield Buffer.from(typeof body === 'string' ? body : JSON.stringify(body)); };
 	return req;

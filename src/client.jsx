@@ -1,5 +1,5 @@
 /**
- * dsh-session-kit browser plugin: management page (§4 FR5/FR6, §10 MR6, §11
+ * dsh-session-toolbox browser plugin: management page (§4 FR5/FR6, §10 MR6, §11
  * TB2), session context-menu entries, the input-dock vault badge, and the
  * draft vault itself (capture + IndexedDB + synthetic-paste restore; route A).
  * Every official surface is probed (`ctx.get?.`, guarded registrations); no
@@ -10,9 +10,9 @@ import pkg from '../package.json' with { type: 'json' };
 const pluginVersion = pkg.version;
 import { createVault } from './draft-vault.js';
 
-export const name = 'dsh-session-kit-client';
+export const name = 'dsh-session-toolbox-client';
 export const inject = ['slots'];
-export const NS = 'dsh-session-kit';
+export const NS = 'dsh-session-toolbox';
 const ENDPOINT = `/.well-known/${NS}`;
 
 let vault; // browser-side singleton (IndexedDB + host manifest)
@@ -42,7 +42,7 @@ export async function callHost(input) {
 	if (!sessionKey) await loadState();
 	const res = await readResponse(await fetch(ENDPOINT, {
 		method: 'POST', cache: 'no-store',
-		headers: { 'content-type': 'application/json', 'x-session-kit-key': sessionKey },
+		headers: { 'content-type': 'application/json', 'x-session-toolbox-key': sessionKey },
 		body: JSON.stringify(input),
 	}));
 	sessionKey = res.key ?? sessionKey;
@@ -69,10 +69,10 @@ export function apply(ctx) {
 	// Keyed slot (one occupant = package name): the plugin settings page.
 	ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({ name: 'plugins.bundle.config', key: NS }, KitPage));
 	// Session context menu: move + trash entries beside the official four.
-	ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({ name: 'sidebar.workspaces.session.menu.item', id: 'session-kit-move', order: 500, locale: NS }, MoveSessionMenuItem));
-	ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({ name: 'sidebar.workspaces.session.menu.item', id: 'session-kit-trash', order: 600, locale: NS }, TrashSessionMenuItem));
+	ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({ name: 'sidebar.workspaces.session.menu.item', id: 'session-toolbox-move', order: 500, locale: NS }, MoveSessionMenuItem));
+	ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({ name: 'sidebar.workspaces.session.menu.item', id: 'session-toolbox-trash', order: 600, locale: NS }, TrashSessionMenuItem));
 	// Input dock badge (§4 FR5): how many image drafts are backed up here.
-	ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({ name: 'conversation.input.dock', id: 'session-kit-vault-badge', order: 5, locale: NS }, VaultBadge));
+	ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({ name: 'conversation.input.dock', id: 'session-toolbox-vault-badge', order: 5, locale: NS }, VaultBadge));
 }
 
 function useKit() {
@@ -119,7 +119,7 @@ export function KitPage() {
 		<div className="sk">
 			<style>{styles}</style>
 			<h2>会话工具箱</h2>
-			<p className="muted">草稿保险箱 · 会话切换项目 · 回收站 — v{pluginVersion}。数据仅存本机（浏览器 IndexedDB + ~/.dsh/session-kit/）。</p>
+			<p className="muted">草稿保险箱 · 会话切换项目 · 回收站 — v{pluginVersion}。数据仅存本机（浏览器 IndexedDB + ~/.dsh/session-toolbox/）。</p>
 			{error ? <p className="error">后台连接失败：{error}</p> : null}
 			{feedback ? <p className="good">{feedback}</p> : null}
 			<section className="box">

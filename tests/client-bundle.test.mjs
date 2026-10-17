@@ -45,13 +45,13 @@ async function loadClient() {
 test('client bundle carries the module-loader envelope', async () => {
 	const source = await clientSource();
 	assert.ok(source.startsWith('window.__ModuleLoader__.load({'), 'must be the loader envelope first');
-	assert.match(source, /id:\s*"dsh-session-kit"/);
+	assert.match(source, /id:\s*"dsh-session-toolbox"/);
 	assert.ok(source.includes('return module.exports'), 'factory must return exports');
 });
 
 test('client plugin exports name/inject/apply and registers the expected slots', async () => {
 	const entry = await loadClient();
-	assert.equal(entry.id, 'dsh-session-kit');
+	assert.equal(entry.id, 'dsh-session-toolbox');
 	const react = { createElement: () => null, Fragment: 'Fragment', useState: () => [null, () => {}], useEffect: () => {}, useRef: () => ({ current: null }) };
 	const plugin = entry.factory(id => {
 		if (id === 'react') return react;
@@ -70,10 +70,10 @@ test('client plugin exports name/inject/apply and registers the expected slots',
 	plugin.apply(ctx);
 	const names = new Set(registered.map(row => row.name));
 	assert.deepEqual(names, new Set(['plugins.bundle.config', 'sidebar.workspaces.session.menu.item', 'conversation.input.dock']));
-	assert.ok(registered.some(r => r.name === 'sidebar.workspaces.session.menu.item' && r.id === 'session-kit-move'));
-	assert.ok(registered.some(r => r.name === 'sidebar.workspaces.session.menu.item' && r.id === 'session-kit-trash'));
-	assert.ok(registered.some(r => r.name === 'plugins.bundle.config' && r.key === 'dsh-session-kit'));
-	assert.ok(registered.some(r => r.name === 'conversation.input.dock' && r.id === 'session-kit-vault-badge'));
+	assert.ok(registered.some(r => r.name === 'sidebar.workspaces.session.menu.item' && r.id === 'session-toolbox-move'));
+	assert.ok(registered.some(r => r.name === 'sidebar.workspaces.session.menu.item' && r.id === 'session-toolbox-trash'));
+	assert.ok(registered.some(r => r.name === 'plugins.bundle.config' && r.key === 'dsh-session-toolbox'));
+	assert.ok(registered.some(r => r.name === 'conversation.input.dock' && r.id === 'session-toolbox-vault-badge'));
 });
 
 test('client bundle never references Node-only globals', async () => {

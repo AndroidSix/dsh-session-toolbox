@@ -9,12 +9,12 @@ import { encodeSegment, projectKey } from '../src/paths.mjs';
 
 /**
  * Opt-in validation against genuine installed-DSH artifacts (read-only; set
- * `DSH_SESSION_KIT_LIVE=1`). Every stored session log must walk with the
+ * `DSH_SESSION_TOOLBOX_LIVE=1`). Every stored session log must walk with the
  * official-equivalent scanner, survive a header rewrite, and re-walk. The
  * rewrite target is a throwaway temp path — real stores are never written.
  * Nothing leaves the machine; nothing is logged beyond counts and paths.
  */
-const enabled = process.env.DSH_SESSION_KIT_LIVE === '1';
+const enabled = process.env.DSH_SESSION_TOOLBOX_LIVE === '1';
 const realRoot = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'sessions');
 let artifacts = [];
 if (enabled) try {
@@ -33,8 +33,8 @@ if (enabled) try {
 const line = buf => zstdDecompressSync(buf).toString('utf8');
 
 test(`real session logs (${artifacts.length} found): walk + rewrite + re-walk`, async t => {
-	if (!enabled) return t.skip('set DSH_SESSION_KIT_LIVE=1 to validate against the local install');
-	assert.ok(artifacts.length > 0, 'DSH_SESSION_KIT_LIVE=1 but no session logs found under the sessions root');
+	if (!enabled) return t.skip('set DSH_SESSION_TOOLBOX_LIVE=1 to validate against the local install');
+	assert.ok(artifacts.length > 0, 'DSH_SESSION_TOOLBOX_LIVE=1 but no session logs found under the sessions root');
 	for (const artifact of artifacts) {
 		const bytes = await readFile(artifact.file);
 		const { header, frames } = readHeader(bytes);
@@ -53,7 +53,7 @@ test(`real session logs (${artifacts.length} found): walk + rewrite + re-walk`, 
 });
 
 test('a rewritten copy reloads byte-stably from disk', async t => {
-	if (!enabled) return t.skip('set DSH_SESSION_KIT_LIVE=1 to validate against the local install');
+	if (!enabled) return t.skip('set DSH_SESSION_TOOLBOX_LIVE=1 to validate against the local install');
 	const artifact = artifacts.find(row => row.segment.includes('0120e3ef')) ?? artifacts[0];
 	if (artifact === undefined) return t.skip('no artifacts to rewrite');
 	const base = await mkdtemp(join(tmpdir(), 'sk-live-'));

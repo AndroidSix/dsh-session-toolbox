@@ -20,7 +20,7 @@ async function world(t, { live = [], ledgerError = null } = {}) {
 	const home = join(base, 'dsh');
 	const sessionsRoot = join(home, 'sessions');
 	const projcacheRoot = join(home, 'storages', 'session_projcache', 'sessions');
-	const root = join(home, 'session-kit');
+	const root = join(home, 'session-toolbox');
 	// Canonical spellings (Windows realpath returns backslashes): same as the host's cwd stamps.
 	const real = await realpath(base);
 	const fromCwd = await realpath(await mkdir(join(real, 'project-a'), { recursive: true }).then(() => join(real, 'project-a')));

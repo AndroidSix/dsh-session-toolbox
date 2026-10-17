@@ -18,7 +18,7 @@
  *   them — that is exactly the loss this vault repairs.
  */
 
-export const DB_NAME = 'dsh-session-kit-vault';
+export const DB_NAME = 'dsh-session-toolbox-vault';
 export const STORE = 'blobs';
 export const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 export const MAX_FILE_BYTES = 10 * 1024 * 1024; // the official per-image admission cap
@@ -110,7 +110,7 @@ export function createVault(options = {}) {
 	function notice(message) {
 		lastNotice = message;
 		bus.emit('notice', message);
-		try { globalThis.window?.dispatchEvent?.(new CustomEvent('dsh-session-kit-notice', { detail: message })); } catch { /* test envs */ }
+		try { globalThis.window?.dispatchEvent?.(new CustomEvent('dsh-session-toolbox-notice', { detail: message })); } catch { /* test envs */ }
 	}
 	function changed() { bus.emit('change'); }
 
@@ -130,7 +130,7 @@ export function createVault(options = {}) {
 
 	/** Best-effort host manifest mirror (status display only; failures invisible). */
 	async function syncHost() {
-		const endpoint = options.endpoint ?? '/.well-known/dsh-session-kit';
+		const endpoint = options.endpoint ?? '/.well-known/dsh-session-toolbox';
 		try {
 			if (hostKey === '') {
 				const probe = await fetchImpl(endpoint, { cache: 'no-store' });
@@ -138,7 +138,7 @@ export function createVault(options = {}) {
 			}
 			const records = (await allRecords()).slice(-500).map(({ key, sessionId, attachmentId, name, size, hash, seeded, createdAt }) =>
 				({ key, sessionId, attachmentId, name, size, hash, seeded, createdAt }));
-			await fetchImpl(endpoint, { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json', 'x-session-kit-key': hostKey },
+			await fetchImpl(endpoint, { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json', 'x-session-toolbox-key': hostKey },
 				body: JSON.stringify({ type: 'vault.sync', records }) });
 		} catch { /* the manifest is cosmetic; the vault itself is IndexedDB */ }
 	}
@@ -284,7 +284,7 @@ export function createVault(options = {}) {
 			if (override !== undefined) limits = { ...limits, ...override };
 			else {
 				try {
-					const res = await fetchImpl(`${options.endpoint ?? '/.well-known/dsh-session-kit'}`, { cache: 'no-store' });
+					const res = await fetchImpl(`${options.endpoint ?? '/.well-known/dsh-session-toolbox'}`, { cache: 'no-store' });
 					const next = await res.json();
 					limits = { ...limits, ...(next.settings?.draftVault ?? {}) };
 				} catch { /* defaults hold */ }

@@ -77,7 +77,7 @@ async function boot(t, { services = {}, files = true } = {}) {
 	const dshHome = join(base, 'dsh');
 	const sessionsRoot = join(dshHome, 'sessions');
 	const projcacheRoot = join(dshHome, 'storages', 'session_projcache', 'sessions');
-	const root = join(dshHome, 'session-kit');
+	const root = join(dshHome, 'session-toolbox');
 	const from = join(base, 'project-a'), to = join(base, 'project-b');
 	if (files) {
 		await mkdir(from, { recursive: true }); await mkdir(to, { recursive: true });
@@ -101,9 +101,9 @@ async function boot(t, { services = {}, files = true } = {}) {
 test('boots with zero official services and reports capabilities honestly', async t => {
 	const w = await boot(t, { files: false });
 	await apply(w.ctx, { configFile: w.root, dshHome: w.dshHome });
-	const kit = w.ctx.get('sessionKit');
+	const kit = w.ctx.get('sessionToolbox');
 	assert.ok(kit);
-	assert.equal(w.ctx.routes.registered.includes('/.well-known/dsh-session-kit'), true);
+	assert.equal(w.ctx.routes.registered.includes('/.well-known/dsh-session-toolbox'), true);
 	const state = await kit.state();
 	assert.deepEqual(state.capabilities, { workspaceRegistry: false, sessions: false, sessionPersistence: false, webServer: true });
 	assert.equal(state.trash.length, 0);
@@ -114,7 +114,7 @@ test('boots with zero official services and reports capabilities honestly', asyn
 test('missing services degrade actions with visible stable errors', async t => {
 	const w = await boot(t, { files: false });
 	await apply(w.ctx, { configFile: w.root, dshHome: w.dshHome });
-	const kit = w.ctx.get('sessionKit');
+	const kit = w.ctx.get('sessionToolbox');
 	await assert.rejects(kit.action({ type: 'trash.session', sessionId: ID }), /workspaceRegistry unavailable/);
 	await assert.rejects(kit.action({ type: 'preflight', sessionId: ID, toCwd: w.to }), /no session-persistence service/);
 	await w.cleanup();
@@ -125,7 +125,7 @@ test('a corrupt journal warns at boot instead of throwing', async t => {
 	await mkdir(w.root, { recursive: true });
 	await writeFile(join(w.root, 'journal.json'), '{oops');
 	await apply(w.ctx, { configFile: w.root, dshHome: w.dshHome });
-	const kit = w.ctx.get('sessionKit');
+	const kit = w.ctx.get('sessionToolbox');
 	assert.ok(w.ctx.log.some(([level, message]) => level === 'warn' && /journal unreadable/.test(String(message))));
 	assert.ok(kit);
 	await w.cleanup();
@@ -134,7 +134,7 @@ test('a corrupt journal warns at boot instead of throwing', async t => {
 test('settings.update deep-merges and persists across boots', async t => {
 	const w = await boot(t, { files: false });
 	await apply(w.ctx, { configFile: w.root, dshHome: w.dshHome });
-	const kit = w.ctx.get('sessionKit');
+	const kit = w.ctx.get('sessionToolbox');
 	await kit.updateSettings({ draftVault: { ttlDays: 3 } });
 	const next = await kit.updateSettings({ trash: { autoPurge: true } });
 	assert.equal(next.draftVault.ttlDays, 3);
@@ -142,7 +142,7 @@ test('settings.update deep-merges and persists across boots', async t => {
 	assert.equal(next.trash.autoPurge, true);
 	const ctx2 = fakeCtx({});
 	await apply(ctx2, { configFile: w.root, dshHome: w.dshHome });
-	const kit2 = ctx2.get('sessionKit');
+	const kit2 = ctx2.get('sessionToolbox');
 	assert.equal((await kit2.state()).settings.trash.autoPurge, true);
 	await w.cleanup();
 });
@@ -153,14 +153,14 @@ test('end-to-end loopback move rewrites real files through the registered route'
 	const persistence = { list: async () => [{ header: { id: ID, cwd: w.from, version: 4 }, revision: 1 }] };
 	const ctx = fakeCtx({ workspaceRegistry: registry, sessions: { list: () => [] }, sessionPersistence: persistence });
 	await apply(ctx, { configFile: w.root, dshHome: w.dshHome });
-	const kit = ctx.get('sessionKit');
+	const kit = ctx.get('sessionToolbox');
 	// GET hands the snapshot + write key; POSTs need the key (loopback guards inside).
 	const probe = capture();
 	await ctx.routes.handler({ method: 'GET', headers: { host: '127.0.0.1:19387' }, socket: { remoteAddress: '127.0.0.1' } }, probe);
 	const key = JSON.parse(probe.body).key;
 	const post = async input => {
 		const res = capture();
-		await ctx.routes.handler({ method: 'POST', headers: { host: '127.0.0.1:19387', 'content-type': 'application/json', 'x-session-kit-key': key },
+		await ctx.routes.handler({ method: 'POST', headers: { host: '127.0.0.1:19387', 'content-type': 'application/json', 'x-session-toolbox-key': key },
 			socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(input)); } }, res);
 		return { status: res.status, body: JSON.parse(res.body) };
 	};

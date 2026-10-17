@@ -1,5 +1,5 @@
 /**
- * Plugin-owned durable documents under `<DSH_HOME>/session-kit/`. All writes go
+ * Plugin-owned durable documents under `<DSH_HOME>/session-toolbox/`. All writes go
  * through `@deepseek-ai/dsh-atomic-write` (`writeFileAtomic` inside `withFileLock`)
  * with owner-only modes, mirroring the host's durability discipline. Corrupt
  * files are never auto-reset: they fail loud and surface in status.
@@ -42,10 +42,10 @@ export class JsonDocument {
 			value = JSON.parse(await readFile(this.file, 'utf8'));
 		} catch (error) {
 			if (error.code === 'ENOENT') value = structuredClone(this.#fallback);
-			else if (error instanceof SyntaxError) throw new Error(`session-kit: corrupt JSON in ${this.file}: ${error.message}`, { cause: error });
+			else if (error instanceof SyntaxError) throw new Error(`session-toolbox: corrupt JSON in ${this.file}: ${error.message}`, { cause: error });
 			else throw error;
 		}
-		if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(`session-kit: ${this.file} is not a JSON object`);
+		if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(`session-toolbox: ${this.file} is not a JSON object`);
 		return this.#guard === undefined ? value : this.#guard(value, this.file);
 	}
 	async write(value) {
@@ -71,43 +71,43 @@ export class JsonDocument {
 }
 
 export function guardSettings(value, file) {
-	if (value.version !== undefined && value.version !== 1) throw new Error(`session-kit: unsupported settings version in ${file}: ${String(value.version)}`);
+	if (value.version !== undefined && value.version !== 1) throw new Error(`session-toolbox: unsupported settings version in ${file}: ${String(value.version)}`);
 	const draft = value.draftVault ?? {};
-	if (draft.enabled !== undefined && typeof draft.enabled !== 'boolean') throw new Error(`session-kit: settings.draftVault.enabled must be boolean (${file})`);
-	if (draft.maxSizeBytes !== undefined && !positiveInt(draft.maxSizeBytes)) throw new Error(`session-kit: settings.draftVault.maxSizeBytes must be a positive safe integer (${file})`);
-	if (draft.ttlDays !== undefined && !positiveInt(draft.ttlDays)) throw new Error(`session-kit: settings.draftVault.ttlDays must be a positive integer (${file})`);
+	if (draft.enabled !== undefined && typeof draft.enabled !== 'boolean') throw new Error(`session-toolbox: settings.draftVault.enabled must be boolean (${file})`);
+	if (draft.maxSizeBytes !== undefined && !positiveInt(draft.maxSizeBytes)) throw new Error(`session-toolbox: settings.draftVault.maxSizeBytes must be a positive safe integer (${file})`);
+	if (draft.ttlDays !== undefined && !positiveInt(draft.ttlDays)) throw new Error(`session-toolbox: settings.draftVault.ttlDays must be a positive integer (${file})`);
 	const trash = value.trash ?? {};
-	if (trash.ttlDays !== undefined && !positiveInt(trash.ttlDays)) throw new Error(`session-kit: settings.trash.ttlDays must be a positive integer (${file})`);
-	if (trash.autoPurge !== undefined && typeof trash.autoPurge !== 'boolean') throw new Error(`session-kit: settings.trash.autoPurge must be boolean (${file})`);
+	if (trash.ttlDays !== undefined && !positiveInt(trash.ttlDays)) throw new Error(`session-toolbox: settings.trash.ttlDays must be a positive integer (${file})`);
+	if (trash.autoPurge !== undefined && typeof trash.autoPurge !== 'boolean') throw new Error(`session-toolbox: settings.trash.autoPurge must be boolean (${file})`);
 	return mergeSettings(value);
 }
 
 export function guardJournal(value, file) {
-	if (value.version !== 1) throw new Error(`session-kit: unsupported journal version in ${file}: ${String(value.version)}`);
+	if (value.version !== 1) throw new Error(`session-toolbox: unsupported journal version in ${file}: ${String(value.version)}`);
 	const entry = value.active;
 	if (entry === null || entry === undefined) return value;
 	if (typeof entry.sessionId !== 'string' || typeof entry.fromCwd !== 'string' && entry.fromCwd !== null || typeof entry.toCwd !== 'string') {
-		throw new Error(`session-kit: malformed move journal (${file})`);
+		throw new Error(`session-toolbox: malformed move journal (${file})`);
 	}
-	if (!Array.isArray(entry.done) || typeof entry.startedAt !== 'string') throw new Error(`session-kit: move journal lacks done/startedAt (${file})`);
+	if (!Array.isArray(entry.done) || typeof entry.startedAt !== 'string') throw new Error(`session-toolbox: move journal lacks done/startedAt (${file})`);
 	return value;
 }
 
 export function guardLedger(value, file) {
-	if (value.version !== 1) throw new Error(`session-kit: unsupported ledger version in ${file}: ${String(value.version)}`);
-	if (!Array.isArray(value.items)) throw new Error(`session-kit: trash ledger has no items array (${file})`);
+	if (value.version !== 1) throw new Error(`session-toolbox: unsupported ledger version in ${file}: ${String(value.version)}`);
+	if (!Array.isArray(value.items)) throw new Error(`session-toolbox: trash ledger has no items array (${file})`);
 	for (const item of value.items) {
-		if ((item.kind !== 'session' && item.kind !== 'workspace') || typeof item.id !== 'string') throw new Error(`session-kit: malformed trash item (${file})`);
-		if (item.snapshot === null || typeof item.snapshot !== 'object') throw new Error(`session-kit: trash item lacks snapshot (${file})`);
+		if ((item.kind !== 'session' && item.kind !== 'workspace') || typeof item.id !== 'string') throw new Error(`session-toolbox: malformed trash item (${file})`);
+		if (item.snapshot === null || typeof item.snapshot !== 'object') throw new Error(`session-toolbox: trash item lacks snapshot (${file})`);
 	}
 	return value;
 }
 
 export function guardManifest(value, file) {
-	if (value.version !== 1) throw new Error(`session-kit: unsupported vault manifest version in ${file}: ${String(value.version)}`);
-	if (!Array.isArray(value.records)) throw new Error(`session-kit: vault manifest has no records array (${file})`);
+	if (value.version !== 1) throw new Error(`session-toolbox: unsupported vault manifest version in ${file}: ${String(value.version)}`);
+	if (!Array.isArray(value.records)) throw new Error(`session-toolbox: vault manifest has no records array (${file})`);
 	for (const record of value.records) {
-		if (typeof record.sessionId !== 'string' || typeof record.attachmentId !== 'string') throw new Error(`session-kit: malformed vault record (${file})`);
+		if (typeof record.sessionId !== 'string' || typeof record.attachmentId !== 'string') throw new Error(`session-toolbox: malformed vault record (${file})`);
 	}
 	return value;
 }
