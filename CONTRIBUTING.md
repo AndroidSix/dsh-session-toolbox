@@ -41,7 +41,7 @@ DSH 装机验证（可选，需本机 DSH）：`npm pack --ignore-scripts` 后�
 - 修改逻辑一律「先写失败用例再改实现」；journal/时序类改动必须带崩溃注入测试。
 - 中文注释克制、命名表达意图；UI 文案 zh/en 双语。
 - commit message：`type: 一句话`（feat/fix/ui/test/docs/chore）。
-- 发版：改 `package.json version` → `npm run build`（自动重写 `cordis.patch.yml` 与 `lib/host-vX.Y.Z.js`）→ 一并提交 → 打 `vX.Y.Z` tag → GitHub Release（附 tarball）。npm 发布当前走手动：在 npm 后台把 Trusted Publishing 绑定到 owner=androidsup / repo=dsh-session-toolbox / workflow=publish.yml 之前，`publish.yml` 保持 workflow_dispatch-only，可本地 `npm publish` 或绑定后手动 dispatch。
+- 发版：改 `package.json version` → `npm run build`（自动重写 `cordis.patch.yml` 与 `lib/host-vX.Y.Z.js`）→ 一并提交 → 打 `vX.Y.Z` tag → GitHub Release（附 tarball）；CI 校验 tag↔version↔patch 一致后自动 `npm publish`（Trusted Publishing 绑定 owner=AndroidSix / repo=dsh-session-toolbox / workflow=publish.yml，provenance 签名，无需存 token）。紧急补发可用 publish.yml 的手动 dispatch。
 
 ## 升级适配（官方 DSH 更新后）
 

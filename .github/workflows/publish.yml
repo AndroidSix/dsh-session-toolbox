@@ -1,9 +1,10 @@
 name: Publish to npm
 
-# Manual only until the owner binds npm Trusted Publishing (owner=androidsup,
-# repo=dsh-session-toolbox, workflow=publish.yml) on npmjs.com; then add back
-# `release: types: [published]` for automatic publishes.
+# Automatic on GitHub Release (npm Trusted Publishing / OIDC, no token stored);
+# workflow_dispatch stays for manual re-publish of an existing tag.
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
