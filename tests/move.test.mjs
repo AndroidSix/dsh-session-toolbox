@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { zstdDecompressSync } from 'node:zlib';
@@ -45,6 +45,10 @@ async function world(t, { live = [], ledgerError = null } = {}) {
 		moveLedger: async (...args) => { ledgerCalls.push(args); if (ledgerError !== null) throw ledgerError; },
 		resyncIndex: async () => {},
 	};
+	// Simulate an idle session: logs untouched for over the churn window.
+	const idle = new Date(Date.now() - 5 * 60_000);
+	await utimes(join(dir, 'session.v4.jsonl.zstd'), idle, idle);
+	await utimes(join(otherDir, 'session.v4.jsonl.zstd'), idle, idle);
 	const engine = new MoveEngine({ root, sessionsRoot, projcacheRoot, journal: journalDoc, capabilities });
 	t.after(() => rm(base, { recursive: true, force: true }));
 	return { engine, root, sessionsRoot, projcacheRoot, fromCwd, toCwd, dir, otherDir, ledgerCalls, journalDoc, capabilities };
@@ -66,6 +70,14 @@ test('happy path: artifact relocates, header rewrites, ledger + caches updated, 
 	assert.equal(await stat(join(w.projcacheRoot, `${ID}.json`)).then(() => true, () => false), false);
 	assert.deepEqual(w.ledgerCalls, [[ID, w.fromCwd, w.toCwd]]);
 	assert.equal((await w.journalDoc.read()).active, null);
+});
+
+test('a freshly-written (churning) log is refused to avoid orphaning appends', async t => {
+	const w = await world(t);
+	// Leave the log at now (default harness backdates it); re-touch to simulate an active appender.
+	const now = new Date();
+	await utimes(join(w.dir, 'session.v4.jsonl.zstd'), now, now);
+	await assert.rejects(w.engine.preflight({ sessionId: ID, toCwd: w.toCwd }), e => e.code === 'session-churning');
 });
 
 test('preflight fails closed on busy / unknown / same-target / missing-target / bad id', async t => {

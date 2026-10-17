@@ -115,6 +115,11 @@ export class MoveEngine {
 		const fromProject = found[0];
 		const logName = await findLogFile(join(this.sessionsRoot, fromProject, encoded));
 		if (logName === undefined) throw new MovePreflightError('artifact-missing', `session directory for ${sessionId} holds no session log`);
+		const logPath = join(this.sessionsRoot, fromProject, encoded, logName);
+		// §10 MR1 belt-and-braces (CLI/offline path): a freshly-written log means an
+		// appender is active; moving it now would orphan their writes.
+		const logStat = await stat(logPath);
+		if (this.now() - logStat.mtimeMs < 10_000) throw new MovePreflightError('session-churning', `session log was written ${Math.round((this.now() - logStat.mtimeMs) / 1000)}s ago; make sure DSH has stopped using it, then retry`);
 		if (header.cwd !== undefined && fromProject !== projectKey(header.cwd)) {
 			// §10 MN3: the layout changed in a way this build cannot follow.
 			throw new MovePreflightError('unknown-layout', `cwd '${header.cwd}' should live at '${projectKey(header.cwd)}' but the artifact was observed at '${fromProject}'`);

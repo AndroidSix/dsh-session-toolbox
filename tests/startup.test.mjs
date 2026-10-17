@@ -84,7 +84,12 @@ async function boot(t, { services = {}, files = true } = {}) {
 		await mkdir(projcacheRoot, { recursive: true });
 		const artifact = join(sessionsRoot, projectKey(from), encodeSegment(ID));
 		await mkdir(artifact, { recursive: true });
-		await writeFile(join(artifact, 'session.v4.jsonl.zstd'), sessionArtifact({ type: 'session', version: 4, id: ID, cwd: from }, ['{"seq":1,"type":"turn/start"}\n']));
+		const logFile = join(artifact, 'session.v4.jsonl.zstd');
+		await writeFile(logFile, sessionArtifact({ type: 'session', version: 4, id: ID, cwd: from }, ['{"seq":1,"type":"turn/start"}\n']));
+		// Idle session: the churn guard refuses logs written within the last 10s.
+		const idle = new Date(Date.now() - 5 * 60_000);
+		const { utimes } = await import('node:fs/promises');
+		await utimes(logFile, idle, idle);
 		await mkdir(join(sessionsRoot, projectKey(from), encodeSegment(S2)), { recursive: true });
 		await writeFile(join(projcacheRoot, `${ID}.json`), '{}');
 	}
