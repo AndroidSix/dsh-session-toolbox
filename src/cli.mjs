@@ -7,13 +7,11 @@
  */
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { realpath } from 'node:fs/promises';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { MoveEngine } from './move.mjs';
 import { TrashEngine } from './trash.mjs';
 import { guardJournal, guardLedger, JsonDocument } from './store.mjs';
 import { writeOwned } from './move.mjs';
-import { encodeSegment, projectKey } from './paths.mjs';
 import { apiHandler, dispatch } from './api.mjs';
 
 export const defaultKitRoot = () => join(resolveDshHome(), 'session-kit');

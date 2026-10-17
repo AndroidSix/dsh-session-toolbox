@@ -13,7 +13,7 @@
  * atomic placement, undoable until the last step), drops the projection-cache
  * record and vault manifest entries, and only then removes the ledger item.
  */
-import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
+import { readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { encodeSegment } from './paths.mjs';

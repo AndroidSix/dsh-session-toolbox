@@ -6,7 +6,7 @@
  * crash, never a patch (NFR3 / §10 MN1). The plugin declares no hard `inject`
  * dependencies so it can never block host boot.
  */
-import { mkdir, readdir, realpath, stat } from 'node:fs/promises';
+import { mkdir, realpath, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
