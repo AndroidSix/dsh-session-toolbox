@@ -21,10 +21,10 @@ async function world(t, { live = [], ledgerError = null } = {}) {
 	const sessionsRoot = join(home, 'sessions');
 	const projcacheRoot = join(home, 'storages', 'session_projcache', 'sessions');
 	const root = join(home, 'session-kit');
-	const fromCwd = await realpath(base) + '/project-a'; // realpath-parent so canonical equals
-	const toCwd = await realpath(base) + '/project-b';
-	await mkdir(fromCwd, { recursive: true });
-	await mkdir(toCwd, { recursive: true });
+	// Canonical spellings (Windows realpath returns backslashes): same as the host's cwd stamps.
+	const real = await realpath(base);
+	const fromCwd = await realpath(await mkdir(join(real, 'project-a'), { recursive: true }).then(() => join(real, 'project-a')));
+	const toCwd = await realpath(await mkdir(join(real, 'project-b'), { recursive: true }).then(() => join(real, 'project-b')));
 	await mkdir(projcacheRoot, { recursive: true });
 	const dir = join(sessionsRoot, projectKey(fromCwd), encodeSegment(ID));
 	await mkdir(dir, { recursive: true });
