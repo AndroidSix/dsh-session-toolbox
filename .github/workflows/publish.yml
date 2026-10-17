@@ -1,7 +1,5 @@
 name: Publish to npm
 
-# Automatic on GitHub Release (npm Trusted Publishing / OIDC, no token stored);
-# workflow_dispatch stays for manual re-publish of an existing tag.
 on:
   release:
     types: [published]
@@ -34,28 +32,32 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
-      - name: Verify tag, package version and lock agree
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - name: Use npm with Trusted Publishing support
+        run: npm install --global npm@11.19.0
+      - name: Validate release version
         run: |
-          node --input-type=module -e '
-          import { readFileSync } from "node:fs";
-          const tag = process.env.RELEASE_TAG;
-          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-          const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
-          if (tag !== `v${pkg.version}`) throw new Error(`tag ${tag} != v${pkg.version}`);
-          if (lock.version !== pkg.version || lock.packages?.[""]?.version !== pkg.version) throw new Error("package-lock version drift");
-          const patch = readFileSync("cordis.patch.yml", "utf8");
-          if (!patch.includes(`host-v${pkg.version}.js`)) throw new Error("cordis.patch.yml not rebuilt for this version");
-          '
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync('package.json'));
+          const lock = JSON.parse(readFileSync('package-lock.json'));
+          if (process.env.RELEASE_TAG !== `v${pkg.version}` || lock.version !== pkg.version || lock.packages[''].version !== pkg.version) {
+            throw new Error('Release tag and package versions must match');
+          }
+          const patch = readFileSync('cordis.patch.yml', 'utf8');
+          if (!patch.includes(`host-v${pkg.version}.js`)) {
+            throw new Error('cordis.patch.yml was not rebuilt for this version');
+          }
+          appendFileSync(process.env.GITHUB_ENV, `NPM_TAG=${pkg.version.includes('-') ? 'next' : 'latest'}\n`);
+          JS
       - run: npm ci --ignore-scripts
       - run: npm run check
-      - run: npm run check:tarball
-      - name: Attach tarball to the GitHub release
-        run: gh release upload "$RELEASE_TAG" ./*.tgz --clobber
+      - name: Pack only distributable files
+        run: npm pack --ignore-scripts
+      - name: Attach package to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-      - name: Publish (trusted publishing / provenance, no token needed)
-        run: |
-          tag="${RELEASE_TAG#v}"
-          npm_tag=$([[ "$tag" == *-* ]] && echo next || echo latest)
-          npm publish ./*.tgz --access public --provenance --ignore-scripts --tag "$npm_tag"
+        run: gh release upload "$RELEASE_TAG" ./dsh-session-toolbox-*.tgz --clobber
+      - name: Publish using npm Trusted Publishing
+        run: npm publish ./dsh-session-toolbox-*.tgz --access public --provenance --ignore-scripts --tag "$NPM_TAG"
