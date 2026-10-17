@@ -27,6 +27,13 @@ npm run build
 npm test          # 或 npm run check
 ```
 
+真机数据验证（可选，强烈建议在发布前本机跑一次）：
+
+```bash
+DSH_SESSION_KIT_LIVE=1 npm test   # 对 ~/.dsh/sessions 全部真实日志做只读
+                                  # walk→rewrite→re-walk 校验（绝不写真实目录）
+```
+
 DSH 装机验证（可选，需本机 DSH）：`npm pack --ignore-scripts` 后用插件页本地安装产物 tgz，重启观察面板。
 
 ## 约定

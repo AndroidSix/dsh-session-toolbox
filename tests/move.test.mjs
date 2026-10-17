@@ -115,9 +115,26 @@ test('ledger failure defers the move; complete() in a fresh engine finishes it',
 		journal: w.journalDoc, capabilities: { ...w.capabilities, moveLedger: async (...args) => { w.ledgerCalls.push(args); }, listHeaders: async () => [{ id: ID, cwd: w.toCwd }] } });
 	const done = await revived.complete();
 	assert.equal(done.ok, true);
-	assert.equal(done.deferredLedger, false);
+	assert.notEqual(done.deferred, true);
 	assert.equal((await w.journalDoc.read()).active, null);
 	assert.equal(w.ledgerCalls.length, 2);
+});
+
+test('persistently failing ledger keeps the journal and backups alive for rollback', async t => {
+	const w = await world(t, { ledgerError: new Error('attach rejected') });
+	await w.engine.move(await w.engine.preflight({ sessionId: ID, toCwd: w.toCwd }));
+	// complete with the ledger still failing: deferred, journal retained
+	const sick = new MoveEngine({ root: w.root, sessionsRoot: w.sessionsRoot, projcacheRoot: w.projcacheRoot,
+		journal: w.journalDoc, capabilities: { ...w.capabilities, moveLedger: async () => { throw new Error('still rejected'); } } });
+	const again = await sick.complete();
+	assert.equal(again.deferred, true);
+	assert.notEqual((await w.journalDoc.read()).active, null);
+	assert.ok((await stat(join(w.root, 'backups', `${ID}.orig`))).isFile(), 'original backup kept while unresolved');
+	// rollback from the deferred state converges fully: artifact back, journal + backups gone
+	const rolled = await sick.rollback();
+	assert.equal(rolled.ok, true);
+	assert.ok((await stat(join(w.dir, 'session.v4.jsonl.zstd'))).isFile());
+	assert.equal((await w.journalDoc.read()).active, null);
 });
 
 test('crash after backup+rewrite: original untouched; complete() publishes', async t => {

@@ -17,6 +17,7 @@ import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { encodeSegment } from './paths.mjs';
+import { relocate } from './move.mjs';
 
 export class TrashError extends Error {
 	code;
@@ -155,8 +156,7 @@ export class TrashEngine {
 		}
 		if (found === undefined) return; // already staged away (idempotent)
 		const staged = join(this.deps.kitRoot, 'pending-purge', `${sessionId}__${this.now()}`);
-		await mkdir(join(this.deps.kitRoot, 'pending-purge'), { recursive: true, mode: 0o700 });
-		await rename(found, staged);
+		await relocate(found, staged);
 		if (this.deps.projcacheRoot) await rm(join(this.deps.projcacheRoot, `${sessionId}.json`), { force: true });
 		// Durable placement done; only now drop the real bytes.
 		await rm(staged, { recursive: true, force: true });

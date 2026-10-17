@@ -47,6 +47,25 @@ export async function writeOwned(file, data, mode = 0o600) {
 }
 
 /**
+ * Move a directory between the sessions store and the kit working areas.
+ * `rename` is the atomic same-volume path; a cross-device layout (unusual, but
+ * possible when DSH_HOME points at a separate mount) falls back to a
+ * copy-then-remove so a move never dead-ends half-published.
+ */
+export async function relocate(source, target) {
+	await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+	try {
+		await rename(source, target);
+		return;
+	} catch (error) {
+		if (error.code !== 'EXDEV') throw error;
+	}
+	const { cp } = await import('node:fs/promises');
+	await cp(source, target, { recursive: true, errorOnExist: true, force: false });
+	await rm(source, { recursive: true, force: true });
+}
+
+/**
  * @param deps - {root (kit dir), sessionsRoot, projcacheRoot, journal: JsonDocument,
  *                 capabilities: {sessionLive, listHeaders, moveLedger, resyncIndex, refreshHeaderCache}, now}
  */
@@ -187,8 +206,7 @@ export class MoveEngine {
 
 	async phaseCommit(entry) {
 		// Retire first, then publish: the id is never simultaneously discoverable in two project dirs.
-		await mkdir(dirname(entry.retired), { recursive: true, mode: 0o700 });
-		await rename(entry.dir, entry.retired);
+		await relocate(entry.dir, entry.retired);
 		await mkdir(entry.newDir, { recursive: true, mode: 0o700 });
 		await writeOwned(join(entry.newDir, entry.logName), await readFile(entry.stagedNew));
 		await fsyncFile(join(entry.newDir, entry.logName));
@@ -234,7 +252,7 @@ export class MoveEngine {
 		if (entry.done.includes('commit')) {
 			await rm(entry.newDir, { recursive: true, force: true });
 			await mkdir(dirname(entry.dir), { recursive: true, mode: 0o700 });
-			if (entry.retired !== undefined) await rename(entry.retired, entry.dir);
+			if (entry.retired !== undefined) await relocate(entry.retired, entry.dir);
 			else throw new MovePreflightError('journal-order', 'committed journal lost its retired directory');
 		}
 		if (entry.deferredLedger !== true && entry.done.includes('ledger') && this.caps.moveLedger !== undefined) {
@@ -263,7 +281,14 @@ export class MoveEngine {
 			if (phase !== 'backup' && !entry.done.includes('backup')) throw new MovePreflightError('journal-order', `journal skipped '${phase}' before completing 'backup'`);
 			await runs[phase](entry);
 		}
+		// Still-deferred accounting keeps the journal (and every backup) alive as
+		// the convergence pointer; rollback remains available (§10 MR3).
+		if (entry.deferredLedger === true) {
+			await this.writeJournal(entry);
+			return { ok: true, deferred: true, sessionId: entry.sessionId, toCwd: entry.toCwd, ledgerError: entry.ledgerError,
+				note: '文件已迁移但 DSH 账本仍未收敛；重启 DSH 后再次点完成，或选择回滚' };
+		}
 		await this.#finish(entry);
-		return { ok: true, sessionId: entry.sessionId, toCwd: entry.toCwd, deferredLedger: entry.deferredLedger === true };
+		return { ok: true, sessionId: entry.sessionId, toCwd: entry.toCwd };
 	}
 }
