@@ -79,6 +79,23 @@ cd dsh-session-toolbox && npm ci && npm run build
 
 安装后打开 侧栏 → 插件 → Session Toolbox 详情 即为工具箱页面；会话行的「⋯」菜单出现「切换到其它项目…」与「移入回收站」；输入区出现 🛟 徽标。
 
+### 生效时机（需要重启吗）
+
+**从插件页安装或启停，不需要重启。** DSH 桌面版默认启用 HMR：Plugin Manager 执行的操作会重新组合 profile，并在重新组合时替换磁盘上已变化的插件文件，结果即时生效。
+
+只有安装结果报告 `restart-required` 时才需要重启，`restartReason` 会说明原因：
+
+| `restartReason` | 含义 |
+|---|---|
+| `no-hmr` | 当前环境没有 HMR（如 headless / SDK） |
+| `package-moved` | 包被解析到了别的目录 |
+| `host-module` | 新模块被宿主静态引用，只能下次启动加载 |
+| `unmanaged-plugin` | 插件不归 Plugin Manager 管理 |
+
+**手工改动过安装目录时**（例如直接覆盖 `node_modules/dsh-session-toolbox`、或手工编辑 `package.json` 的 `dsh.profile.bundles`），这些改动不经过 Plugin Manager，不会触发重新组合。此时**去插件页把本插件停用再启用一次**即可，通常不必重启整个应用。
+
+> 提示：`lib/` 已随包提交，GitHub 与 npm 安装都不需要本地构建。
+
 ## 数据放在哪
 
 | 内容 | 位置 |
