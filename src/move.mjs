@@ -168,6 +168,17 @@ export class MoveEngine {
 			await this.phaseIndex(entry);
 		} catch (error) {
 			error.journal = await this.readJournal();
+			// Never leave a half-applied move behind. Phases after `commit` are safe
+			// to undo in reverse; if the rollback itself fails the journal stays as
+			// the recovery pointer and the panel offers complete/rollback explicitly.
+			if (error.journal !== null && error.journal.done?.includes('commit')) {
+				try {
+					await this.rollback();
+					error.rolledBack = true;
+				} catch (rollbackError) {
+					error.rollbackError = rollbackError.message;
+				}
+			}
 			throw error;
 		}
 		// A deferred ledger (same-process stale header cache) keeps the journal alive
@@ -225,6 +236,17 @@ export class MoveEngine {
 	}
 
 	async phaseLedger(entry) {
+		// Guard the accounting step with the artifact's real location: if the log is
+		// not where commit claimed to put it, recording the move in the ledger would
+		// orphan the session (registry says project B, bytes still live in A). This
+		// is exactly the half-applied state that stranded a session before.
+		const published = join(entry.newDir, entry.logName);
+		let landed = false;
+		try {
+			const { header } = readHeader(await readFile(published));
+			landed = header.cwd === entry.toCwd;
+		} catch { landed = false; }
+		if (!landed) throw new MovePreflightError('publish-missing', `migrated log not found at ${published}; refusing to touch the ledger`);
 		if (this.caps.moveLedger === undefined) { entry.deferredLedger = true; await this.#stage(entry, 'ledger'); return; }
 		try {
 			await this.caps.refreshHeaderCache?.();
@@ -247,6 +269,9 @@ export class MoveEngine {
 
 	async phaseIndex(entry) {
 		await this.caps.resyncIndex?.();
+		// Make the session's new placement visible without restarting DSH: re-read
+		// the headers and let the caller refetch just this session's row.
+		await this.caps.refreshPlacement?.(entry.sessionId)?.catch?.(() => {});
 		await this.#stage(entry, 'index');
 	}
 
@@ -266,6 +291,7 @@ export class MoveEngine {
 		}
 		if (this.projcacheRoot !== undefined) await rm(join(this.projcacheRoot, `${entry.sessionId}.json`), { force: true });
 		await this.caps.resyncIndex?.().catch(() => {});
+		await this.caps.refreshPlacement?.(entry.sessionId)?.catch?.(() => {});
 		await this.#finish({ ...entry, retired: entry.done.includes('commit') ? undefined : entry.retired });
 		return { ok: true, rolledBack: entry.done };
 	}

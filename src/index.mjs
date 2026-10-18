@@ -241,6 +241,22 @@ export function hostCapabilities(ctx) {
 			// every query path; there is nothing explicit to call in this build.
 			return ctx.get('sessionQuery') !== undefined ? 'lazy' : 'unavailable';
 		},
+		/**
+		 * Re-read the session headers so the registry (and every list built from
+		 * it) sees the session's new location. This is the host-side half of
+		 * "refresh"; the client half is a refetch scoped to this one session.
+		 */
+		refreshPlacement: async sessionId => {
+			const registry = ctx.get('workspaceRegistry');
+			if (registry === undefined) return 'unavailable';
+			if (typeof registry.listStoredHeaders === 'function' && typeof registry.replaceHeaderIndex === 'function') {
+				await registry.replaceHeaderIndex(await registry.listStoredHeaders());
+			}
+			await ctx.get('sessionPersistence')?.refresh?.().catch?.(() => {});
+			return registry.sessionKnown !== undefined && sessionId !== undefined
+				? (await registry.sessionKnown(sessionId) ? 'known' : 'unknown')
+				: 'refreshed';
+		},
 	};
 }
 
@@ -314,6 +330,8 @@ export function registryAdapter(ctx) {
 			return entity;
 		},
 		purgeSession: async () => ctx.get('sessionPersistence')?.delete === undefined ? 'unavailable' : 'present',
+		/** Re-read headers so a restored/archived session's placement is visible. */
+		refreshPlacement: async sessionId => hostCapabilities(ctx).refreshPlacement(sessionId),
 	};
 }
 

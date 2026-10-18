@@ -19,6 +19,18 @@ export const inject = ['slots', 'locale'];
 export const NS = 'dsh-session-toolbox';
 const ENDPOINT = `/.well-known/${NS}`;
 
+/**
+ * Broadcast a one-line notice to the toolbox page after the dialog closes.
+ *
+ * The context menu opens MoveDialog outside the page tree, so a local setState
+ * cannot reach the panel; a window event keeps the message visible where the
+ * user can act on it without coupling the two components.
+ */
+export const NOTICE_EVENT = 'dsh-session-toolbox:notice';
+function dispatchNotice(message) {
+	try { window.dispatchEvent(new CustomEvent(NOTICE_EVENT, { detail: message })); } catch { /* ignore */ }
+}
+
 let vault; // browser-side singleton (IndexedDB + host manifest)
 let directoryPicker; // ctx.get('directoryPicker') probed at apply time
 const store = { state: null, error: '', listeners: new Set() };
@@ -116,6 +128,18 @@ export function KitPage() {
 	const [busy, setBusy] = useState(false);
 	const [feedback, setFeedback] = useState('');
 	const say = message => { setFeedback(message); setTimeout(() => setFeedback(''), 8000); };
+	// The context menu's dialog lives outside this tree; it reports completion
+	// through a window event, and the panel refetches so the project list and the
+	// moved session's placement are current without a DSH restart.
+	useEffect(() => {
+		const onNotice = event => {
+			const message = typeof event?.detail === 'string' ? event.detail : '';
+			if (message) say(message);
+			void loadState().catch(() => {});
+		};
+		window.addEventListener(NOTICE_EVENT, onNotice);
+		return () => window.removeEventListener(NOTICE_EVENT, onNotice);
+	}, []);
 	const act = async (input, ok) => {
 		setBusy(true);
 		try { const result = await callHost(input); if (ok) say(ok); await loadState(); setBusy(false); return result; }
@@ -308,7 +332,16 @@ export function MoveDialog({ sessionId, close }) {
 	}, [sessionId]);
 	const submit = async () => {
 		setBusy(true); setError('');
-		try { await callHost({ type: 'move', sessionId, toCwd, createTarget }); close(); }
+		try {
+			const result = await callHost({ type: 'move', sessionId, toCwd, createTarget });
+			// The host has already re-read the session headers. The sidebar list is a
+			// server-driven snapshot, so the row appears there on the next refresh; say
+			// that plainly instead of closing on a silent success.
+			close();
+			dispatchNotice(result?.deferred
+				? '文件已迁移；DSH 账本将在下次启动时收敛，刷新侧栏后可见'
+				: '迁移完成；刷新侧栏后该会话就会出现在目标项目下');
+		}
 		catch (err) { setError(err.message); setBusy(false); }
 	};
 	const valid = /^\/|^[A-Za-z]:[\\/]/.test(toCwd);

@@ -99,6 +99,12 @@ export class TrashEngine {
 		if (item === undefined) throw new TrashError('item-unknown', `no trash item ${itemId}`);
 		if (item.kind === 'session') await this.#restoreSession(adapter, item.snapshot);
 		else await this.#restoreWorkspace(adapter, item.snapshot);
+		// Restoring changes where a session lives in the sidebar; refresh that one
+		// placement so the row reappears without a DSH restart (other sessions
+		// are untouched).
+		const affected = item.kind === 'session' ? [item.snapshot.sessionId]
+			: item.snapshot.sessions.map(row => row.sessionId);
+		for (const sessionId of affected) await adapter.refreshPlacement?.(sessionId)?.catch?.(() => {});
 		state.items = state.items.filter(row => row.id !== itemId);
 		await this.ledger.write(state);
 		return { ok: true };
