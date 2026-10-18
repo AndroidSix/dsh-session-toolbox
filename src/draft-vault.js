@@ -202,12 +202,24 @@ export function createVault(options = {}) {
 	function composerRoot() {
 		return document.querySelector?.('[data-conversation-session] [contenteditable="true"]') ?? undefined;
 	}
+	/**
+	 * Image cards currently sitting in the composer.
+	 *
+	 * The official composer region is `[data-composer-seat]` (carrying
+	 * `data-conversation-region="composer"`); the old selector also looked for a
+	 * `data-composer-bar` attribute that the current UI never emits, which made
+	 * every lookup fall through to a brittle parentElement walk and usually
+	 * return zero cards. A zero rail in turn defeated both the send detector and
+	 * the "composer already holds them" guard.
+	 */
 	function attachmentRail(editor) {
-		// Official structure: attachment cards are imgs with blob: srcs sitting
-		// above the contenteditable root inside the composer bar subtree.
-		const bar = editor?.closest?.('[data-composer-bar], [data-conversation-region="composer"]') ?? editor?.parentElement?.parentElement?.parentElement;
-		if (bar?.querySelectorAll === undefined) return undefined;
-		return [...bar.querySelectorAll('img')].filter(img => img.getAttribute?.('src')?.startsWith('blob:'));
+		const seat = editor?.closest?.('[data-composer-seat], [data-conversation-region="composer"]');
+		const root = seat ?? editor?.parentElement?.parentElement?.parentElement;
+		if (root?.querySelectorAll === undefined) return undefined;
+		return [...root.querySelectorAll('img')].filter(img => {
+			const src = img.getAttribute?.('src') ?? '';
+			return src.startsWith('blob:') || src.startsWith('data:image/');
+		});
 	}
 
 	// ---- FR2 restore -----------------------------------------------------------
@@ -218,9 +230,11 @@ export function createVault(options = {}) {
 		const rail = attachmentRail(editor);
 		if (rail === undefined) return false;
 		if (rail.length > 0) return true; // non-empty: official still holds them (or was seeded before)
-		// Never resurrect images that already travelled with a sent message: that is
-		// what duplicated screenshots whenever a session was switched back to.
-		const pending = (await allRecords()).filter(record => record.sessionId === sessionId && !record.sentAt);
+		// Never resurrect images that already travelled with a sent message. Two
+		// independent guards: an explicit sent flag, and a "already handed back to
+		// the composer" flag so a single batch is dispatched at most once even if
+		// the rail probe misses the cards.
+		const pending = (await allRecords()).filter(record => record.sessionId === sessionId && !record.sentAt && !record.delivered);
 		if (pending.length === 0) return true;
 		const files = [];
 		for (const record of pending) {
@@ -240,7 +254,7 @@ export function createVault(options = {}) {
 		else log('warn', 'synthetic paste was not accepted; vault stays idle for this session');
 		// A restore hands the images back to the official composer; they now live
 		// there (and will be retired when sent), so keep a single copy in the vault.
-		if (accepted) for (const record of pending) await putRecord({ ...record, seeded: true });
+		if (accepted) for (const record of pending) await putRecord({ ...record, seeded: true, delivered: now() });
 		changed();
 		return accepted;
 	}

@@ -187,9 +187,27 @@ async function applyInner(ctx, options = {}) {
  */
 export function hostCapabilities(ctx) {
 	return {
+		/**
+		 * Whether a session is actively working.
+		 *
+		 * The old check asked whether `sessions.list()` contained the id, but that
+		 * list holds every session the host has loaded — a session that is merely
+		 * open (or was opened at some point) counted as live and blocked every
+		 * move. The official activity hook is `workspace/session-activity`: a
+		 * `turn` entry means a turn is in flight (including one waiting on an
+		 * approval or an answer), which is exactly what must not be relocated.
+		 */
 		sessionLive: sessionId => {
-			const sessions = ctx.get('sessions');
-			return sessions ? sessions.list().some(session => session.header?.id === sessionId) : false;
+			try {
+				const activities = ctx.waterfall?.('workspace/session-activity', { sessionId }, () => []);
+				if (activities === undefined) return false;
+				// While the waterfall is still resolving it is a thenable; treat an
+				// unresolved answer as "not busy" rather than blocking the move.
+				if (typeof activities?.then === 'function') return false;
+				return Array.isArray(activities) && activities.some(entry => entry?.kind === 'turn');
+			} catch {
+				return false;
+			}
 		},
 		listHeaders: async () => {
 			const persistence = ctx.get('sessionPersistence');

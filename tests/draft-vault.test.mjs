@@ -48,8 +48,20 @@ function makeIndexedDb() {
 	function clone(record) { return { ...record }; }
 }
 
+/**
+ * Composer stub shaped like the real DOM: the composer seat
+ * (`[data-composer-seat]`, also carrying `data-conversation-region="composer"`)
+ * holds the attachment cards, and the conversation scope sits above it. The old
+ * stub only answered the `conversation-content` selector, so every attachment
+ * lookup silently used the parentElement fallback and the vault could never see
+ * the cards — which is exactly why the first duplicate-image fix missed.
+ */
 function makeEditor(railImgs = []) {
 	const listeners = [];
+	const seat = {
+		querySelectorAll: selector => selector === 'img' ? railImgs : [],
+	};
+	const scope = { isConnected: true, querySelectorAll: () => [] };
 	return {
 		listeners,
 		isConnected: true,
@@ -60,7 +72,11 @@ function makeEditor(railImgs = []) {
 			return event.defaultPrevented;
 		},
 		focus() {},
-		closest: selector => selector.includes('conversation-content') ? { isConnected: true, querySelectorAll: () => [] } : undefined,
+		closest: selector => {
+			if (selector.includes('composer-seat') || selector.includes('conversation-region')) return seat;
+			if (selector.includes('conversation-content')) return scope;
+			return undefined;
+		},
 		parentElement: { parentElement: { parentElement: { querySelectorAll: () => railImgs } } },
 	};
 }
@@ -186,6 +202,25 @@ test('restoring a draft does not re-capture it as a fresh copy', async () => {
 	for (const listener of saved.paste) listener(genuine);
 	await new Promise(resolve => setTimeout(resolve, 20));
 	assert.equal((await vault.records()).length, 1, 'identical bytes never duplicate');
+	vault.stop();
+});
+
+test('composer attachments are detected through the real seat structure', async () => {
+	// Cards live inside [data-composer-seat]; the vault must see them, otherwise
+	// "sent" can never be detected and drafts get replayed on every switch.
+	const cards = [{ getAttribute: () => 'blob:https://x/1' }, { getAttribute: () => 'blob:https://x/2' }];
+	const editor = makeEditor(cards);
+	browser(editor);
+	globalThis.MutationObserver = class { observe() {} disconnect() {} };
+	const vault = createVault({ endpoint: '/api', log: () => {}, fetchImpl: async () => Response.json({ settings: {}, key: 'k' }) });
+	await vault.start({ limits: { enabled: true } });
+	// A non-empty composer must not be seeded into (official still holds the cards).
+	await vault.intake('session-aaaa', [pngFile('held.png')]);
+	const accepted = await vault.seedSession('session-aaaa');
+	assert.equal(accepted, true);
+	const records = await vault.records();
+	assert.equal(records.length, 1);
+	assert.equal(records[0].delivered ?? 0, 0, 'nothing was handed to the composer');
 	vault.stop();
 });
 
