@@ -4,6 +4,11 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。版本号从 `0.1` 起；DSH 宿主接口（`workspaceRegistry` / `sessionPersistence` / `webServer` 服务面与 `~/.dsh/sessions` 布局）在 0.x 期间按 `0.2.0-rc.2` 基线验证，每次官方升级会重验并在此记录。
 
+## 0.1.2
+
+- 修复与 DSH `0.2.1-rc.2` 的不兼容：此前把官方内部包固定为精确版本 `0.2.0-rc.2`，导致 DSH 升级 rc 后被判为不兼容。改为声明 `engines.dsh`（官方优先判定字段，见 `dsh-app-boot` 的 `unmetRequirements`）+ 区间 peer，覆盖 `0.2.0-rc.2` 至 `0.2.x`；`0.3.0` 起仍会正确判为不兼容。
+- 已针对 `@deepseek-ai/dsh-home-paths` / `dsh-atomic-write` `0.2.1-rc.2`、`cordis` `4.0.5` 重跑全部测试（56 项通过）。两版 API 实测一致：`resolveDshHome` / `withFileLock` / `writeFileAtomic` 签名与导出均未变。
+
 ## 0.1.1
 
 - 发布渠道改为 GitHub Release 触发的 npm Trusted Publishing：`publish.yml` 与参考项目 `dsh-multi-router` 对齐，显式安装 `npm@11.19.0`、由版本后缀推导 `NPM_TAG`（稳定版 `latest` / 预发布 `next`），全程 OIDC 签名，仓库不存任何 npm token。
