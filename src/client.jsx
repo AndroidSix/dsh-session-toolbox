@@ -15,7 +15,7 @@ export const name = 'dsh-session-toolbox-client';
 // on property access for a service that was never injected (it does not return
 // undefined), which is what surfaced as "cannot get property \"locale\" without
 // inject" on the plugin page.
-export const inject = ['slots', 'locale'];
+export const inject = ['slots', 'locale', 'sessions'];
 export const NS = 'dsh-session-toolbox';
 const ENDPOINT = `/.well-known/${NS}`;
 
@@ -33,6 +33,9 @@ function dispatchNotice(message) {
 
 let vault; // browser-side singleton (IndexedDB + host manifest)
 let directoryPicker; // ctx.get('directoryPicker') probed at apply time
+let sessionsService; // ctx.sessions — injected above, used by the manual refresh
+/** @type {{ running: boolean }} */
+export const refreshState = { running: false };
 const store = { state: null, error: '', listeners: new Set() };
 
 async function readResponse(res) {
@@ -66,8 +69,29 @@ export async function callHost(input) {
 	return res;
 }
 
+/**
+ * Re-pull the host's session list so sidebar rows reflect the current placement.
+ *
+ * `sessions.refresh()` is the official baseline pull the sidebar snapshot is
+ * built from; calling it refreshes the list for every session without touching
+ * any conversation or restarting DSH. Falls back to a clear error when the host
+ * build does not expose it.
+ */
+export async function refreshSessionList() {
+	const service = sessionsService;
+	if (service === undefined) throw new Error('当前 DSH 未提供会话服务，无法刷新');
+	if (typeof service.refresh !== 'function') throw new Error('当前 DSH 版本的会话服务不支持刷新');
+	refreshState.running = true;
+	try { await service.refresh(); }
+	finally { refreshState.running = false; }
+	await loadState();
+}
+
 export function apply(ctx) {
 	directoryPicker = ctx.get?.('directoryPicker');
+	// Injected service: `refresh()` re-pulls the session list baseline from the
+	// host, which is what makes a moved/restored row appear without a restart.
+	sessionsService = ctx.sessions;
 	const vaultInstance = vault ??= createVault({
 		endpoint: ENDPOINT,
 		log: (level, message) => { try { (level === 'error' ? console.warn : console.log)(`[${NS}]`, message); } catch {} },
@@ -126,6 +150,7 @@ const styles = `
 export function KitPage() {
 	const { state, error } = useKit();
 	const [busy, setBusy] = useState(false);
+	const [refreshing, setRefreshing] = useState(false);
 	const [feedback, setFeedback] = useState('');
 	const say = message => { setFeedback(message); setTimeout(() => setFeedback(''), 8000); };
 	// The context menu's dialog lives outside this tree; it reports completion
@@ -151,6 +176,16 @@ export function KitPage() {
 			<style>{styles}</style>
 			<h2>会话工具箱</h2>
 			<p className="muted">草稿保险箱 · 会话切换项目 · 归档池 — v{pluginVersion}。数据仅存本机（浏览器 IndexedDB + ~/.dsh/session-toolbox/）。</p>
+			<div className="row">
+				<button disabled={busy || refreshing} onClick={() => {
+					setRefreshing(true);
+					void refreshSessionList()
+						.then(() => say('会话列表已刷新；迁移或还原过的会话应出现在新项目下'))
+						.catch(err => say(`刷新失败：${err.message}`))
+						.finally(() => setRefreshing(false));
+				}}>{refreshing ? '刷新中…' : '刷新会话列表'}</button>
+				<span className="muted">迁移或还原会话后，若侧栏没变化，点这里重新拉取列表（不影响任何会话内容）。</span>
+			</div>
 			{error ? <p className="error">后台连接失败：{error}</p> : null}
 			{feedback ? <p className="good">{feedback}</p> : null}
 			<section className="box">
