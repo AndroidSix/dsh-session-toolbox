@@ -4,6 +4,11 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。版本号从 `0.1` 起；DSH 宿主接口（`workspaceRegistry` / `sessionPersistence` / `webServer` 服务面与 `~/.dsh/sessions` 布局）在 0.x 期间按 `0.2.0-rc.2` 基线验证，每次官方升级会重验并在此记录。
 
+## 0.1.8
+
+- **回收站改名并明确语义**：会话的「删除」在 DSH 里本质就是官方归档，插件只是额外记录了入池时的项目归属、列表位置与置顶状态，因此可以还原到原位。界面统一改为「归档池」：菜单项「归档到归档池」、面板标题「归档池」、列名「入池时间」，并在面板里说明它同时出现在官方归档视图中。
+- **切换项目支持按名字选择**：迁移表单新增项目下拉（显示项目名与会话数），并**标出当前项目**且禁用它作为目标；选中后自动填入路径。输入会话 ID 后会显示它当前所属的项目（名称 + 路径）。宿主新增 `project.of` 动作与 `state.projects` 列表。
+
 ## 0.1.7
 
 - **修复插件页报错 `cannot get property "locale" without inject`**：客户端 `inject` 只声明了 `slots`，却直接读取 `ctx.locale`。cordis 的 reflect 代理对未注入的服务属性访问会抛错（而非返回 undefined），因此插件页无法完成同步。现已在 `inject` 中声明 `locale`，并按官方客户端插件的方式用 `ctx.effect` 包裹字典注册。

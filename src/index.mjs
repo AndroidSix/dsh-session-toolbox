@@ -101,6 +101,18 @@ async function applyInner(ctx, options = {}) {
 		settings: () => settingsCache.trash ?? {},
 	});
 
+	/** All known projects (id/path/title/session count) for the move picker. */
+	const listProjects = ctx => {
+		const registry = ctx.get('workspaceRegistry');
+		if (registry === undefined) return [];
+		return registry.list().map(row => ({
+			id: row.id,
+			path: row.path,
+			title: row.title ?? row.path,
+			sessions: (row.sessionIds ?? []).length,
+		})).sort((a, b) => a.title.localeCompare(b.title));
+	};
+
 	const kit = {
 		settings: settingsDoc,
 		manifest: manifestDoc,
@@ -134,11 +146,24 @@ async function applyInner(ctx, options = {}) {
 				capabilities,
 				settings,
 				journal,
+				projects: listProjects(ctx),
 				trash: await trash.items(),
 				// Bytes live in browser IndexedDB; the manifest mirrors their metadata only.
 				vault: { records: manifest.records.length, bytes: manifest.records.reduce((total, record) => total + (record.size ?? 0), 0) },
 				recovery: journal === null ? null : `未完成迁移：${journal.sessionId} → ${journal.toCwd}（已完成 ${journal.done.join('/') || '无'}）`,
 			};
+		},
+		/** The project a session currently belongs to (null when unknown). */
+		projectOf: async sessionId => {
+			if (sessionId === '') return null;
+			const registry = ctx.get('workspaceRegistry');
+			if (registry === undefined) return null;
+			for (const row of registry.list()) {
+				if ((row.sessionIds ?? []).includes(sessionId)) {
+					return { id: row.id, path: row.path, title: row.title ?? row.path };
+				}
+			}
+			return null;
 		},
 		action: input => dispatch(kit, input),
 	};

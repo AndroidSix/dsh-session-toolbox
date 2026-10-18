@@ -69,8 +69,8 @@ export function apply(ctx) {
 	// inside ctx.effect keeps the dictionaries disposable across hot reloads
 	// (same shape as the official client plugins).
 	ctx.effect(() => ctx.locale.register(NS, {
-		zh: { 'menu.move': '切换到其它项目…', 'menu.trash': '移入回收站' },
-		en: { 'menu.move': 'Move to another project…', 'menu.trash': 'Move to trash' },
+		zh: { 'menu.move': '切换到其它项目…', 'menu.trash': '归档到归档池' },
+		en: { 'menu.move': 'Move to another project…', 'menu.trash': 'Archive' },
 	}), 'session-toolbox: dictionaries');
 
 	// Keyed slot (one occupant = package name): the plugin settings page.
@@ -126,7 +126,7 @@ export function KitPage() {
 		<div className="sk">
 			<style>{styles}</style>
 			<h2>会话工具箱</h2>
-			<p className="muted">草稿保险箱 · 会话切换项目 · 回收站 — v{pluginVersion}。数据仅存本机（浏览器 IndexedDB + ~/.dsh/session-toolbox/）。</p>
+			<p className="muted">草稿保险箱 · 会话切换项目 · 归档池 — v{pluginVersion}。数据仅存本机（浏览器 IndexedDB + ~/.dsh/session-toolbox/）。</p>
 			{error ? <p className="error">后台连接失败：{error}</p> : null}
 			{feedback ? <p className="good">{feedback}</p> : null}
 			<section className="box">
@@ -159,6 +159,18 @@ function MoveSection({ act, busy, say, state }) {
 	const [createTarget, setCreateTarget] = useState(false);
 	const [plan, setPlan] = useState(null);
 	const journal = state?.journal;
+	// Known projects, so the target can be picked by name instead of typed as a path.
+	const projects = state?.projects ?? [];
+	// Which project the typed session currently belongs to (computed host-side).
+	const [fromProject, setFromProject] = useState(null);
+	useEffect(() => {
+		if (!sessionId) { setFromProject(null); return; }
+		let alive = true;
+		void callHost({ type: 'project.of', sessionId })
+			.then(result => { if (alive) setFromProject(result?.project ?? null); })
+			.catch(() => { if (alive) setFromProject(null); });
+		return () => { alive = false; };
+	}, [sessionId]);
 	const pick = async () => {
 		try {
 			const result = await directoryPicker?.pick?.();
@@ -175,9 +187,26 @@ function MoveSection({ act, busy, say, state }) {
 				{' '}<button disabled={busy} onClick={() => void act({ type: 'move.rollback' }, '迁移已回滚').catch(() => {})}>回滚</button></p>}
 			<div className="row">
 				<input className="grow mono" placeholder="session-…（或从会话右键菜单发起）" value={sessionId} onChange={e => { setSessionId(e.target.value); setPlan(null); }} />
+				{projects.length > 0 && (
+					<select className="grow" value={projects.some(p => p.path === toCwd) ? toCwd : ''}
+						onChange={e => { setToCwd(e.target.value); setPlan(null); }}>
+						<option value="">选择目标项目…</option>
+						{projects.map(project => (
+							<option key={project.id} value={project.path} disabled={fromProject?.path === project.path}>
+								{project.title}（{project.sessions} 个会话）{fromProject?.path === project.path ? ' — 当前项目' : ''}
+							</option>
+						))}
+					</select>
+				)}
 				<input className="grow mono" placeholder="目标项目绝对路径" value={toCwd} onChange={e => { setToCwd(e.target.value); setPlan(null); }} />
 				<button onClick={() => void pick()} disabled={busy}>浏览…</button>
 			</div>
+			{sessionId && (
+				<p className="muted">
+					当前项目：{fromProject === null ? '（未找到该会话，或它不属于任何项目）'
+						: <><strong>{fromProject.title}</strong>{' '}<span className="mono">{fromProject.path}</span></>}
+				</p>
+			)}
 			<label className="row"><input type="checkbox" checked={createTarget} onChange={e => setCreateTarget(e.target.checked)} /> 目标不存在时创建</label>
 			<div className="row">
 				<button disabled={busy || !sessionId || !toCwd} onClick={() => { setBusy(true); setPlan(null); void callHost({ type: 'preflight', sessionId, toCwd, createTarget })
@@ -196,11 +225,14 @@ function TrashSection({ act, busy, say, state }) {
 	const items = state?.trash ?? [];
 	return (
 		<section className="box">
-			<h3>回收站</h3>
-			<p className="muted">删除会话 = 官方归档 + 入站记录；删除项目保留全部会话日志。彻底删除会先移到暂存目录再清理，中断可用 CLI 检出。</p>
+			<h3>归档池</h3>
+			<p className="muted">
+				DSH 没有独立的「删除会话」——会话只能<b>归档</b>。这里就是官方的归档池：入池的会话仍然是官方归档状态（侧栏的归档视图里同样能看到），本插件额外记录了它入池时的<b>项目归属、列表位置与置顶状态</b>，因此可以一键还原到原位。
+				归档项目则保留全部会话日志，只移除项目注册表项。彻底删除会先移入暂存目录再清理，中断可用 CLI 检出。
+			</p>
 			{items.length === 0 ? <p className="muted">（空）</p> : (
 				<table>
-					<thead><tr><th>类型</th><th>对象</th><th>标题 / 路径</th><th>入站时间</th><th /></tr></thead>
+					<thead><tr><th>类型</th><th>对象</th><th>标题 / 路径</th><th>入池时间</th><th /></tr></thead>
 					<tbody>{items.map(item => (
 						<tr key={item.itemId}>
 							<td>{item.kind === 'session' ? '会话' : '项目'}</td>
@@ -208,7 +240,7 @@ function TrashSection({ act, busy, say, state }) {
 							<td className="mono">{item.kind === 'session' ? item.snapshot.title || '（无标题）' : item.snapshot.path}</td>
 							<td>{new Date(item.trashedAt).toLocaleString('zh-CN', { hour12: false })}</td>
 							<td className="row">
-								<button disabled={busy} onClick={() => void act({ type: 'trash.restore', itemId: item.itemId }, '已还原（若处于归档态请先在列表里还原归档）').catch(() => {})}>还原</button>
+								<button disabled={busy} onClick={() => void act({ type: 'trash.restore', itemId: item.itemId }, '已还原到原位').catch(() => {})}>还原</button>
 								<button disabled={busy} onClick={() => void act({ type: 'trash.purge', itemId: item.itemId }, '已彻底删除').catch(() => {})}>彻底删除</button>
 							</td>
 						</tr>))}
@@ -216,7 +248,7 @@ function TrashSection({ act, busy, say, state }) {
 				</table>
 			)}
 			<div className="row">
-				<span className="muted">保留 {state?.settings?.trash?.ttlDays ?? 30} 天；到期自动清理{state?.settings?.trash?.autoPurge ? '（已开）' : '（未开，仅提醒）'}。</span>
+				<span className="muted">保留 {state?.settings?.trash?.ttlDays ?? 30} 天；到期自动移出{state?.settings?.trash?.autoPurge ? '（已开）' : '（未开，仅提醒）'}。</span>
 				<button disabled={busy} onClick={() => void act({ type: 'settings.update', patch: { trash: { ...state?.settings?.trash, autoPurge: !(state?.settings?.trash?.autoPurge) } } }, '策略已更新').catch(() => {})}>切换自动清理</button>
 				<button disabled={busy} onClick={() => void act({ type: 'trash.sweep' }, '已按 TTL 巡检').catch(() => {})}>巡检到期项</button>
 			</div>
@@ -247,9 +279,9 @@ export function TrashSessionMenuItem({ sessionId, t }) {
 			try { await callHost({ type: 'trash.session', sessionId }); setConfirm(false); }
 			catch { sayRow(`回收失败`); setConfirm(false); }
 			setBusy(false);
-		}}>确认移入回收站？（先归档）</button>;
+		}}>确认归档？（会话将进入归档池）</button>;
 	}
-	return <button role="menuitem" style={menuItemStyle} onClick={() => setConfirm(true)}>{t ? t('menu.trash') : '移入回收站'}</button>;
+	return <button role="menuitem" style={menuItemStyle} onClick={() => setConfirm(true)}>{t ? t('menu.trash') : '归档到归档池'}</button>;
 }
 function sayRow(message) { store.error = message; for (const listener of store.listeners) listener(); }
 

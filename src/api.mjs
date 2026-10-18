@@ -67,6 +67,7 @@ export async function dispatch(kit, input) {
 		case 'trash.restore': return await kit.trash.restore(String(input.itemId ?? ''));
 		case 'trash.purge': return await kit.trash.purge(String(input.itemId ?? ''));
 		case 'trash.sweep': return await kit.trash.sweep();
+		case 'project.of': return { project: await kit.projectOf(String(input.sessionId ?? '')) };
 		case 'settings.update': return { settings: await kit.updateSettings(input.patch ?? {}) };
 		case 'vault.sync': return { records: (await kit.vaultSync(Array.isArray(input.records) ? input.records : [])).records.length };
 		case 'vault.sweep': {
