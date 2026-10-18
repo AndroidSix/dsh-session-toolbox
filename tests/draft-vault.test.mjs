@@ -149,6 +149,46 @@ test('seedSession replays a synthetic ClipboardEvent the official handler accept
 	vault.stop();
 });
 
+test('intake dedupes identical bytes for the same session', async () => {
+	const editor = makeEditor();
+	browser(editor);
+	const vault = createVault({ endpoint: '/api', log: () => {}, fetchImpl: async () => Response.json({ settings: {}, key: 'k' }) });
+	await vault.start({ limits: { enabled: true } });
+	await vault.intake('session-aaaa', [pngFile('same.png')]);
+	await vault.intake('session-aaaa', [pngFile('same-copy.png')]);
+	assert.equal((await vault.records()).length, 1, 'the same image must not be vaulted twice');
+	await vault.intake('session-aaaa', [new File([new Uint8Array(2048)], 'other.png', { type: 'image/png' })]);
+	assert.equal((await vault.records()).length, 2, 'a different image still lands');
+	vault.stop();
+});
+
+test('restoring a draft does not re-capture it as a fresh copy', async () => {
+	const editor = makeEditor();
+	const saved = browser(editor);
+	globalThis.MutationObserver = class { observe() {} disconnect() {} };
+	const vault = createVault({ endpoint: '/api', log: () => {}, fetchImpl: async () => Response.json({ settings: {}, key: 'k' }) });
+	await vault.start({ limits: { enabled: true } });
+	await vault.intake('session-aaaa', [pngFile('only.png')]);
+	assert.equal(saved.paste.length, 1, 'one document-level paste listener');
+
+	// What seedSession dispatches: a marked synthetic paste carrying the same image.
+	const restoreMarker = Symbol.for('dsh-session-toolbox.seed');
+	const replay = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+	Object.defineProperty(replay, 'clipboardData', { value: { files: [pngFile('only.png')], items: [] } });
+	Object.defineProperty(replay, restoreMarker, { value: true });
+	for (const listener of saved.paste) listener(replay);
+	await new Promise(resolve => setTimeout(resolve, 20));
+	assert.equal((await vault.records()).length, 1, 'a marked replay must not be stored again');
+
+	// A genuine user paste of the same bytes is also deduped.
+	const genuine = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+	Object.defineProperty(genuine, 'clipboardData', { value: { files: [pngFile('only.png')], items: [] } });
+	for (const listener of saved.paste) listener(genuine);
+	await new Promise(resolve => setTimeout(resolve, 20));
+	assert.equal((await vault.records()).length, 1, 'identical bytes never duplicate');
+	vault.stop();
+});
+
 test('seedSession refuses a non-empty rail and is a no-op with an empty vault', async () => {
 	const editor = makeEditor([{ getAttribute: () => 'blob:http://x' }]);
 	browser(editor);
@@ -180,11 +220,13 @@ test('sweep enforces TTL then LRU capacity', async () => {
 	let clock = 1_000_000;
 	const vault = createVault({ endpoint: '/api', now: () => clock, log: () => {}, fetchImpl: async () => Response.json({ settings: {}, key: 'k' }) });
 	await vault.start({ limits: { enabled: true, ttlDays: 1, maxSizeBytes: 2048 } });
-	await vault.intake('s1', [pngFile('a.png'), pngFile('b.png')]);
+	// distinct bytes: identical images are deduped per session (§ draft intake)
+	const distinct = (name, seed) => new File([new Uint8Array(1024).fill(seed)], name, { type: 'image/png' });
+	await vault.intake('s1', [distinct('a.png', 1), distinct('b.png', 2)]);
 	clock += 2 * 24 * 60 * 60 * 1000; // past TTL
 	const expired = await vault.sweep();
 	assert.equal(expired.removed, 2);
-	await vault.intake('s2', [pngFile('c.png'), pngFile('d.png'), pngFile('e.png')]);
+	await vault.intake('s2', [distinct('c.png', 3), distinct('d.png', 4), distinct('e.png', 5)]);
 	const overCap = await vault.sweep();
 	assert.ok(overCap.removed >= 1, 'capacity 2048 must evict oldest of the 3×1024');
 	assert.ok(overCap.bytes <= 2048);

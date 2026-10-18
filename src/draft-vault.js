@@ -21,6 +21,9 @@
 export const DB_NAME = 'dsh-session-toolbox-vault';
 export const STORE = 'blobs';
 export const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+/** Marks our own synthetic paste so it is not re-captured as a new draft. */
+const SEED_MARKER = Symbol.for('dsh-session-toolbox.seed');
+
 export const MAX_FILE_BYTES = 10 * 1024 * 1024; // the official per-image admission cap
 export const DEFAULT_LIMITS = Object.freeze({ enabled: true, maxSizeBytes: 200 * 1024 * 1024, ttlDays: 7 });
 
@@ -166,15 +169,22 @@ export function createVault(options = {}) {
 	// ---- FR1 capture ---------------------------------------------------------
 	async function intake(sessionId, files) {
 		if (!limits.enabled || sessionId === undefined || sessionId === '') return;
+		const existing = (await allRecords()).filter(record => record.sessionId === sessionId);
+		const seen = new Set(existing.map(record => record.hash));
+		let added = 0;
 		for (const item of files) {
 			if (!isImageFile(item)) continue;
+			const hash = await contentHash(item);
+			if (seen.has(hash)) continue; // same image already held for this session
+			seen.add(hash);
 			const id = (globalThis.crypto?.randomUUID?.() ?? `id-${now()}-${Math.random().toString(36).slice(2)}`);
 			const record = { key: `${sessionId}__${id}`, sessionId, attachmentId: id,
-				name: item.name || '', type: item.type, size: item.size, hash: await contentHash(item), createdAt: now(), seeded: false };
+				name: item.name || '', type: item.type, size: item.size, hash, createdAt: now(), seeded: false };
 			record.blob = item;
 			await putRecord(record);
-			notice(`已备份 1 张草稿图片（会话 ${sessionId.slice(-6)}）`);
+			added += 1;
 		}
+		if (added > 0) notice(`已备份 ${added} 张草稿图片（会话 ${sessionId.slice(-6)}）`);
 		void syncHost();
 	}
 
@@ -218,6 +228,9 @@ export function createVault(options = {}) {
 		if (files.length === 0) { changed(); return false; }
 		const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
 		Object.defineProperty(event, 'clipboardData', { value: fakeClipboardData(files) });
+		// Mark as a restore so our own intake (which observes the same event)
+		// never stores the replayed images as a second fresh draft.
+		try { Object.defineProperty(event, SEED_MARKER, { value: true }); } catch { /* ignore */ }
 		try { editor.focus?.(); } catch { /* ignore */ }
 		editor.dispatchEvent(event);
 		const accepted = event.defaultPrevented === true;
@@ -289,8 +302,12 @@ export function createVault(options = {}) {
 					limits = { ...limits, ...(next.settings?.draftVault ?? {}) };
 				} catch { /* defaults hold */ }
 			}
-			document.addEventListener('paste', event => void intake(currentSession(), readImages(event)).catch(() => {}), true);
-			document.addEventListener('drop', event => void intake(currentSession(), readImages(event)).catch(() => {}), true);
+			const capture = event => {
+				if (event[SEED_MARKER] === true) return;
+				void intake(currentSession(), readImages(event)).catch(() => {});
+			};
+			document.addEventListener('paste', capture, true);
+			document.addEventListener('drop', capture, true);
 			document.addEventListener('change', event => void intake(currentSession(), fileInputImages(event)).catch(() => {}), true);
 			teardown = watchMounts();
 			void sweep().catch(() => {});
