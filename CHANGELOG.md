@@ -4,6 +4,12 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。版本号从 `0.1` 起；DSH 宿主接口（`workspaceRegistry` / `sessionPersistence` / `webServer` 服务面与 `~/.dsh/sessions` 布局）在 0.x 期间按 `0.2.0-rc.2` 基线验证，每次官方升级会重验并在此记录。
 
+## 0.1.6
+
+- **插件启动失败不再拖垮整个应用**：`apply` 全程包裹错误隔离，任何内部异常都降级为警告并继续（此前宿主入口抛错会让 DSH 报 `entry did not activate` 而无法启动）。
+- 失败详情写入 `~/.dsh/session-toolbox/startup-error.log`（含完整堆栈），便于定位；依赖缺失时额外提示"从插件页卸载后重新安装"，因为 peer 依赖必须由包管理器安装到插件自己的 `node_modules`，手工覆盖 `lib/` 会丢失它们。
+- 无功能变更，纯健壮性修复。
+
 ## 0.1.5
 
 - 文档修正：首次安装后若界面无变化，**需要完全重启 DSH**。原因是宿主侧 `dsh-client-modules` 把包元数据的"非客户端包"否定判定按 Loader specifier 缓存到重启，且扫描为逐包增量、无全量重扫路径；此时宿主半边可能已工作（`~/.dsh/session-toolbox/` 已创建），但菜单项与面板不会出现。0.1.4 中"停用再启用即可"的说法不适用于此场景。

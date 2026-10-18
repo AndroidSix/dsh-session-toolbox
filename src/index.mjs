@@ -7,6 +7,7 @@
  * dependencies so it can never block host boot.
  */
 import { mkdir, realpath, stat } from 'node:fs/promises';
+import { appendFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
@@ -30,6 +31,37 @@ export function defaultKitRoot() {
 }
 
 export async function apply(ctx, options = {}) {
+	try {
+		return await applyInner(ctx, options);
+	} catch (error) {
+		// A failing third-party plugin must never take the whole app down.
+		// Record the real stack so the failure is diagnosable, then degrade.
+		recordStartupFailure(error);
+		const hint = /Cannot find package|ERR_MODULE_NOT_FOUND/.test(String(error?.message ?? error))
+			? '（依赖缺失：请从插件页卸载后重新安装，让包管理器重新拉取 peer 依赖）'
+			: '';
+		ctx.logger?.warn?.(`session-toolbox: disabled after startup error${hint} — ${error?.message ?? error}`);
+	}
+}
+
+/** Absolute path of the startup-failure log, next to the plugin's other state. */
+function startupFailureLog() {
+	try {
+		return join(resolve(resolveDshHome()), 'session-toolbox', 'startup-error.log');
+	} catch { return ''; }
+}
+
+/** Append a startup failure (with stack) so a failed activation stays diagnosable. */
+function recordStartupFailure(error) {
+	const file = startupFailureLog();
+	if (file === '') return;
+	try {
+		const detail = `${new Date().toISOString()}\n${error?.stack ?? String(error)}\n\n`;
+		appendFileSync(file, detail, { mode: 0o600 });
+	} catch { /* diagnostics must never throw */ }
+}
+
+async function applyInner(ctx, options = {}) {
 	const dshHome = resolve(options.dshHome || resolveDshHome());
 	const root = resolve(options.configFile || join(dshHome, 'session-toolbox'));
 	await mkdir(root, { recursive: true, mode: 0o700 });
