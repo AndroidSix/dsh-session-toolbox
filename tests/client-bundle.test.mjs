@@ -60,13 +60,33 @@ test('client plugin exports name/inject/apply and registers the expected slots',
 	});
 	assert.equal(typeof plugin.apply, 'function');
 	assert.equal(plugin.inject.includes('slots'), true);
+	// cordis throws on property access for a service that was never injected, so
+	// every service the client touches must be declared here (locale included).
+	assert.equal(plugin.inject.includes('locale'), true, 'locale must be injected before ctx.locale is read');
 	const registered = [];
-	const ctx = {
+	// Strict context: mirrors cordis' reflect handler, where reading a service
+	// property that was never injected throws instead of yielding undefined.
+	// This is what caught the shipped "cannot get property \"locale\" without
+	// inject" failure on the plugin page.
+	const builtins = {
 		get: () => undefined,
-		effect: () => {},
-		locale: { register: () => {} },
-		slots: { inject: (name, fn) => { fn(); }, register: spec => { registered.push(spec); return () => {}; } },
+		effect: cb => { cb(); },
+		inject: () => () => {},
+		provide: () => {},
+		on: () => () => {},
 	};
+	const services = {
+		slots: { inject: (name, fn) => { fn(); }, register: spec => { registered.push(spec); return () => {}; } },
+		locale: { register: () => () => {} },
+	};
+	const ctx = new Proxy(builtins, {
+		get(target, prop) {
+			if (typeof prop === 'symbol' || prop === 'then' || String(prop).startsWith('_')) return Reflect.get(target, prop);
+			if (Reflect.has(target, prop)) return Reflect.get(target, prop);
+			if (plugin.inject.includes(prop)) return services[prop];
+			throw new Error(`cannot get property "${String(prop)}" without inject`);
+		},
+	});
 	plugin.apply(ctx);
 	const names = new Set(registered.map(row => row.name));
 	assert.deepEqual(names, new Set(['plugins.bundle.config', 'sidebar.workspaces.session.menu.item', 'conversation.input.dock']));

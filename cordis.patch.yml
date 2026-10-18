@@ -1,3 +1,3 @@
 - insert:
-    - id: session-toolbox-v1-0.1.6
-      name: ./lib/host-v0.1.6.js
+    - id: session-toolbox-v1-0.1.7
+      name: ./lib/host-v0.1.7.js

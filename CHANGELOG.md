@@ -4,6 +4,11 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。版本号从 `0.1` 起；DSH 宿主接口（`workspaceRegistry` / `sessionPersistence` / `webServer` 服务面与 `~/.dsh/sessions` 布局）在 0.x 期间按 `0.2.0-rc.2` 基线验证，每次官方升级会重验并在此记录。
 
+## 0.1.7
+
+- **修复插件页报错 `cannot get property "locale" without inject`**：客户端 `inject` 只声明了 `slots`，却直接读取 `ctx.locale`。cordis 的 reflect 代理对未注入的服务属性访问会抛错（而非返回 undefined），因此插件页无法完成同步。现已在 `inject` 中声明 `locale`，并按官方客户端插件的方式用 `ctx.effect` 包裹字典注册。
+- 客户端测试改用与 cordis reflect 一致的**严格 ctx**（未注入即抛错），该用例已验证能拦住本次回归。
+
 ## 0.1.6
 
 - **插件启动失败不再拖垮整个应用**：`apply` 全程包裹错误隔离，任何内部异常都降级为警告并继续（此前宿主入口抛错会让 DSH 报 `entry did not activate` 而无法启动）。

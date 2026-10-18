@@ -11,7 +11,11 @@ const pluginVersion = pkg.version;
 import { createVault } from './draft-vault.js';
 
 export const name = 'dsh-session-toolbox-client';
-export const inject = ['slots'];
+// `locale` is a real service, so it must be injected before use: cordis throws
+// on property access for a service that was never injected (it does not return
+// undefined), which is what surfaced as "cannot get property \"locale\" without
+// inject" on the plugin page.
+export const inject = ['slots', 'locale'];
 export const NS = 'dsh-session-toolbox';
 const ENDPOINT = `/.well-known/${NS}`;
 
@@ -61,10 +65,13 @@ export function apply(ctx) {
 	ctx.effect?.(() => () => clearInterval(timer));
 	vaultInstance.on('change', () => void loadState());
 	void vaultInstance.start();
-	ctx.locale?.register?.(NS, {
+	// `locale` is injected above, so the service is guaranteed here; registering
+	// inside ctx.effect keeps the dictionaries disposable across hot reloads
+	// (same shape as the official client plugins).
+	ctx.effect(() => ctx.locale.register(NS, {
 		zh: { 'menu.move': '切换到其它项目…', 'menu.trash': '移入回收站' },
 		en: { 'menu.move': 'Move to another project…', 'menu.trash': 'Move to trash' },
-	});
+	}), 'session-toolbox: dictionaries');
 
 	// Keyed slot (one occupant = package name): the plugin settings page.
 	ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({ name: 'plugins.bundle.config', key: NS }, KitPage));
