@@ -293,7 +293,19 @@ export function MoveDialog({ sessionId, close }) {
 	const [createTarget, setCreateTarget] = useState(false);
 	const [error, setError] = useState('');
 	const [busy, setBusy] = useState(false);
+	// Same project picker as the panel: the dialog is what the context menu opens,
+	// so it must not fall back to typing a path by hand.
+	const [projects, setProjects] = useState([]);
+	const [fromProject, setFromProject] = useState(null);
 	useEffect(() => { const dialog = ref.current; dialog?.showModal(); return () => { try { dialog?.close(); } catch {} }; }, []);
+	useEffect(() => {
+		let alive = true;
+		void loadState().then(next => { if (alive) setProjects(next?.projects ?? []); }).catch(() => {});
+		void callHost({ type: 'project.of', sessionId })
+			.then(result => { if (alive) setFromProject(result?.project ?? null); })
+			.catch(() => { if (alive) setFromProject(null); });
+		return () => { alive = false; };
+	}, [sessionId]);
 	const submit = async () => {
 		setBusy(true); setError('');
 		try { await callHost({ type: 'move', sessionId, toCwd, createTarget }); close(); }
@@ -306,7 +318,22 @@ export function MoveDialog({ sessionId, close }) {
 				<div className="modal-head"><strong>会话切换到其它项目</strong><button onClick={close} disabled={busy}>关闭</button></div>
 				<div className="modal-body">
 					<p className="muted mono">{sessionId}</p>
-					<input autoFocus className="grow mono" placeholder="目标项目绝对路径" value={toCwd} onChange={e => setToCwd(e.target.value)} />
+					<p className="muted">
+						当前项目：{fromProject === null ? '（未找到，或不属于任何项目）'
+						: <><strong>{fromProject.title}</strong>{' '}<span className="mono">{fromProject.path}</span></>}
+					</p>
+					{projects.length > 0 && (
+						<select className="grow" value={projects.some(p => p.path === toCwd) ? toCwd : ''}
+							onChange={e => setToCwd(e.target.value)}>
+							<option value="">选择目标项目…</option>
+							{projects.map(project => (
+								<option key={project.id} value={project.path} disabled={fromProject?.path === project.path}>
+									{project.title}（{project.sessions} 个会话）{fromProject?.path === project.path ? ' — 当前项目' : ''}
+								</option>
+							))}
+						</select>
+					)}
+					<input className="grow mono" placeholder="目标项目绝对路径" value={toCwd} onChange={e => setToCwd(e.target.value)} />
 					<label className="row"><input type="checkbox" checked={createTarget} onChange={e => setCreateTarget(e.target.checked)} /> 目录不存在时创建</label>
 					{error ? <p className="error">{error}</p> : null}
 					<div className="row"><button className="primary" disabled={busy || !valid} onClick={() => void submit()}>体检并迁移</button>
