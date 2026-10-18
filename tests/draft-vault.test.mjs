@@ -189,6 +189,26 @@ test('restoring a draft does not re-capture it as a fresh copy', async () => {
 	vault.stop();
 });
 
+test('a draft that was sent is never replayed into the composer again', async () => {
+	const editor = makeEditor();
+	browser(editor);
+	globalThis.MutationObserver = class { observe() {} disconnect() {} };
+	const vault = createVault({ endpoint: '/api', log: () => {}, fetchImpl: async () => Response.json({ settings: {}, key: 'k' }) });
+	await vault.start({ limits: { enabled: true } });
+	await vault.intake('session-aaaa', [pngFile('sent.png')]);
+	assert.equal((await vault.records()).length, 1);
+	// The message goes out: the vault retires the backup (sentAt set).
+	await vault.retire('session-aaaa');
+	assert.equal((await vault.records())[0].sentAt > 0, true, 'record must be marked sent');
+	// Switching away and back must not resurrect it, even though the rail is empty.
+	const taken = [];
+	officialPasteHandler(editor, taken);
+	const accepted = await vault.seedSession('session-aaaa');
+	assert.equal(taken.length, 0, 'a sent image must not be pasted back');
+	assert.equal(accepted, true, 'nothing to restore is a success, not a failure');
+	vault.stop();
+});
+
 test('seedSession refuses a non-empty rail and is a no-op with an empty vault', async () => {
 	const editor = makeEditor([{ getAttribute: () => 'blob:http://x' }]);
 	browser(editor);

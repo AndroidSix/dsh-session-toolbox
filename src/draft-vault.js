@@ -139,8 +139,8 @@ export function createVault(options = {}) {
 				const probe = await fetchImpl(endpoint, { cache: 'no-store' });
 				hostKey = (await probe.json()).key ?? '';
 			}
-			const records = (await allRecords()).slice(-500).map(({ key, sessionId, attachmentId, name, size, hash, seeded, createdAt }) =>
-				({ key, sessionId, attachmentId, name, size, hash, seeded, createdAt }));
+			const records = (await allRecords()).slice(-500).map(({ key, sessionId, attachmentId, name, size, hash, seeded, createdAt, sentAt }) =>
+				({ key, sessionId, attachmentId, name, size, hash, seeded, createdAt, sentAt: sentAt ?? 0 }));
 			await fetchImpl(endpoint, { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json', 'x-session-toolbox-key': hostKey },
 				body: JSON.stringify({ type: 'vault.sync', records }) });
 		} catch { /* the manifest is cosmetic; the vault itself is IndexedDB */ }
@@ -179,7 +179,7 @@ export function createVault(options = {}) {
 			seen.add(hash);
 			const id = (globalThis.crypto?.randomUUID?.() ?? `id-${now()}-${Math.random().toString(36).slice(2)}`);
 			const record = { key: `${sessionId}__${id}`, sessionId, attachmentId: id,
-				name: item.name || '', type: item.type, size: item.size, hash, createdAt: now(), seeded: false };
+				name: item.name || '', type: item.type, size: item.size, hash, createdAt: now(), sentAt: 0, seeded: false };
 			record.blob = item;
 			await putRecord(record);
 			added += 1;
@@ -218,7 +218,9 @@ export function createVault(options = {}) {
 		const rail = attachmentRail(editor);
 		if (rail === undefined) return false;
 		if (rail.length > 0) return true; // non-empty: official still holds them (or was seeded before)
-		const pending = (await allRecords()).filter(record => record.sessionId === sessionId);
+		// Never resurrect images that already travelled with a sent message: that is
+		// what duplicated screenshots whenever a session was switched back to.
+		const pending = (await allRecords()).filter(record => record.sessionId === sessionId && !record.sentAt);
 		if (pending.length === 0) return true;
 		const files = [];
 		for (const record of pending) {
@@ -236,11 +238,41 @@ export function createVault(options = {}) {
 		const accepted = event.defaultPrevented === true;
 		if (accepted) notice(`已恢复 ${files.length} 张草稿图片（会话 ${sessionId.slice(-6)}）`);
 		else log('warn', 'synthetic paste was not accepted; vault stays idle for this session');
+		// A restore hands the images back to the official composer; they now live
+		// there (and will be retired when sent), so keep a single copy in the vault.
+		if (accepted) for (const record of pending) await putRecord({ ...record, seeded: true });
 		changed();
 		return accepted;
 	}
 
 	// ---- FR3 lifecycle ---------------------------------------------------------
+	/**
+	 * Mark a session's backed-up drafts as already sent, so they are never
+	 * replayed into the composer again.
+	 *
+	 * Inferring "sent" from the attachment rail reaching zero used to miss the
+	 * common case: the rail is already empty by the time the session mounts
+	 * again, so the transition never happened while we were watching and the
+	 * old images were restored on every switch. Observing the composer while it
+	 * is mounted (below) plus this explicit retirement keeps the vault honest.
+	 */
+	async function retireSession(sessionId, reason) {
+		let retired = 0;
+		for (const record of await allRecords()) {
+			if (record.sessionId !== sessionId || record.sentAt) continue;
+			await putRecord({ ...record, sentAt: now() });
+			retired += 1;
+		}
+		if (retired > 0) {
+			notice(reason === 'sent'
+				? `本会话草稿已随消息发送，${retired} 张备份不再恢复`
+				: `本会话草稿已清空，${retired} 张备份不再恢复`);
+			void syncHost();
+		}
+		changed();
+		return retired;
+	}
+
 	function watchSession(sessionId, editor) {
 		let rail = attachmentRail(editor)?.length ?? 0;
 		const scope = editor.closest?.('[data-conversation-content]') ?? editor;
@@ -248,10 +280,9 @@ export function createVault(options = {}) {
 			const next = attachmentRail(editor)?.length ?? rail;
 			if (next === rail) return;
 			if (rail > 0 && next === 0 && scope?.isConnected === true) {
-				// Sent or manually removed while mounted → backups retire (§ FR3).
-				for (const record of await allRecords()) if (record.sessionId === sessionId) await dropRecord(record.key);
-				notice('本会话草稿图片已清空，备份同步移除');
-				void syncHost();
+				// Cards disappeared while the composer was mounted: the message was
+				// sent (or the user removed them), so retire the backups for good.
+				await retireSession(sessionId, 'sent');
 			}
 			rail = next;
 			changed();
@@ -259,7 +290,17 @@ export function createVault(options = {}) {
 		if (typeof MutationObserver !== 'function') return () => {};
 		const observer = new MutationObserver(() => void check());
 		observer.observe(scope, { subtree: true, childList: true });
-		return () => observer.disconnect();
+
+		// Belt and braces: listen for the send gesture itself, so a fast unmount
+		// (enter then immediately switch away) still retires the drafts.
+		const onKeyDown = event => {
+			if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+			const target = event.target;
+			if (target?.closest?.('[data-conversation-session]') === null || target?.closest?.('[data-conversation-session]') === undefined) return;
+			if ((attachmentRail(editor)?.length ?? 0) > 0) void retireSession(sessionId, 'sent');
+		};
+		document.addEventListener('keydown', onKeyDown, true);
+		return () => { observer.disconnect(); document.removeEventListener('keydown', onKeyDown, true); };
 	}
 
 	function watchMounts() {
@@ -321,6 +362,8 @@ export function createVault(options = {}) {
 		},
 		sweep,
 		seedSession,
+		/** Retire a session's unsent drafts (called when its images were sent). */
+		retire: async (sessionId = currentSession(), reason = 'sent') => retireSession(sessionId, reason),
 		intake,
 		watchMounts,
 	};
