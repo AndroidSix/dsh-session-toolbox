@@ -4,6 +4,12 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。版本号从 `0.1` 起；DSH 宿主接口（`workspaceRegistry` / `sessionPersistence` / `webServer` 服务面与 `~/.dsh/sessions` 布局）在 0.x 期间按 `0.2.0-rc.2` 基线验证，每次官方升级会重验并在此记录。
 
+## 0.1.1
+
+- 发布渠道改为 GitHub Release 触发的 npm Trusted Publishing：`publish.yml` 与参考项目 `dsh-multi-router` 对齐，显式安装 `npm@11.19.0`、由版本后缀推导 `NPM_TAG`（稳定版 `latest` / 预发布 `next`），全程 OIDC 签名，仓库不存任何 npm token。
+- 版本一致性校验扩展为四重：tag ↔ `package.json` ↔ `package-lock.json` ↔ `cordis.patch.yml` 中的 `host-vX.Y.Z.js`，任一处漂移即拒绝发布。
+- 本版本无功能变更，用于激活并验证 Trusted Publisher 绑定后的自动发布链路。
+
 ## 0.1.0
 
 - 首个版本：合并交付三个能力位（需求文档 §1–§11）。
