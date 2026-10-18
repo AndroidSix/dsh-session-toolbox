@@ -92,7 +92,9 @@ cd dsh-session-toolbox && npm ci && npm run build
 | `host-module` | 新模块被宿主静态引用，只能下次启动加载 |
 | `unmanaged-plugin` | 插件不归 Plugin Manager 管理 |
 
-**手工改动过安装目录时**（例如直接覆盖 `node_modules/dsh-session-toolbox`、或手工编辑 `package.json` 的 `dsh.profile.bundles`），这些改动不经过 Plugin Manager，不会触发重新组合。此时**去插件页把本插件停用再启用一次**即可，通常不必重启整个应用。
+**首次安装后如果界面没有变化，请完全退出 DSH 再打开一次。** 原因在宿主侧：客户端模块的包元数据（包括"这个包不是客户端包"的否定判定）按 Loader specifier 缓存到重启，且扫描是逐包增量的、没有全量重扫路径。如果 DSH 启动时本插件尚未装好或不完整，这个否定结论会一直保留到下次启动——代价是宿主半边可能已经能工作（`~/.dsh/session-toolbox/` 会被创建），但菜单项与面板不会出现。
+
+同样地，**手工改动安装目录**（直接覆盖 `node_modules/dsh-session-toolbox`、手工编辑 `package.json` 的 `dsh.profile.bundles`）也不经过 Plugin Manager；这类改动后请直接重启。
 
 > 提示：`lib/` 已随包提交，GitHub 与 npm 安装都不需要本地构建。
 
