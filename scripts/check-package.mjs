@@ -14,9 +14,10 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 
 let dir = null;
+let temporary = null;
 try {
 	if (process.argv.includes('--tarball')) {
-		dir = mkdtempSync(join(tmpdir(), 'sk-pack-'));
+		dir = temporary = mkdtempSync(join(tmpdir(), 'sk-pack-'));
 		const tgz = execFileSync('npm', ['pack', '--ignore-scripts', '--silent'], { cwd: root, encoding: 'utf8' }).trim().split('\n').at(-1);
 		execFileSync('tar', ['-xzf', join(root, tgz), '-C', dir], { stdio: 'pipe' });
 		dir = join(dir, 'package');
@@ -39,5 +40,5 @@ try {
 		console.log(`package shape ok: dsh-session-toolbox@${pkg.version} (${Object.keys(pkg.exports).length} exports, entry ${entry})`);
 	}
 } finally {
-	if (dir !== null && process.argv.includes('--tarball')) rmSync(dirname(dir), { recursive: true, force: true });
+	if (temporary !== null) rmSync(temporary, { recursive: true, force: true });
 }

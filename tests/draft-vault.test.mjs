@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createVault, isImageFile, contentHash, MAX_FILE_BYTES, DEFAULT_LIMITS } from '../src/draft-vault.js';
+import { createVault as createVaultImpl, isImageFile, contentHash, MAX_FILE_BYTES, DEFAULT_LIMITS } from '../src/draft-vault.js';
+
+const vaults = [];
+function createVault(options) { const vault = createVaultImpl(options); vaults.push(vault); return vault; }
 
 /** ---- minimal browser doubles (Node has File/Blob but no DOM/IndexedDB) ---- */
 class FakeClipboardEvent {
@@ -26,12 +29,13 @@ function makeIndexedDb() {
 					createObjectStore: () => ({}),
 					transaction(store) {
 						const map = storeFor(store);
+						const tx = { oncomplete: null, onerror: null, onabort: null };
 						const objectStore = {
-							put(value) { const r = request2(clone(value)); map.set(value.key, clone(value)); return r; },
-							delete(key) { const r = request2(true); map.delete(key); return r; },
-							getAll() { return request2([...map.values()].map(clone)); },
+							put(value) { const r = request2(clone(value), tx); map.set(value.key, clone(value)); return r; },
+							delete(key) { const r = request2(true, tx); map.delete(key); return r; },
+							getAll() { return request2([...map.values()].map(clone), tx); },
 						};
-						return { objectStore: () => objectStore, oncomplete: null, onerror: null, onabort: null };
+						return Object.assign(tx, { objectStore: () => objectStore });
 					},
 				};
 				request.onupgradeneeded?.();
@@ -40,9 +44,9 @@ function makeIndexedDb() {
 			return request;
 		},
 	};
-	function request2(value) {
+	function request2(value, tx) {
 		const request = { result: value };
-		setImmediate(() => request.onsuccess?.());
+		setImmediate(() => { request.onsuccess?.(); setImmediate(() => tx.oncomplete?.()); });
 		return request;
 	}
 	function clone(record) { return { ...record }; }
@@ -115,7 +119,7 @@ function teardown() {
 }
 const pngFile = (name = 'shot.png', size = 1024) => new File([new Uint8Array(size)], name, { type: 'image/png' });
 
-test.afterEach(teardown);
+test.afterEach(() => { for (const vault of vaults.splice(0)) vault.stop(); teardown(); });
 
 test('isImageFile accepts the four official types up to 10MB', () => {
 	assert.equal(isImageFile(pngFile()), true);
@@ -283,7 +287,7 @@ test('sweep enforces TTL then LRU capacity', async () => {
 	assert.equal(expired.removed, 2);
 	await vault.intake('s2', [distinct('c.png', 3), distinct('d.png', 4), distinct('e.png', 5)]);
 	const overCap = await vault.sweep();
-	assert.ok(overCap.removed >= 1, 'capacity 2048 must evict oldest of the 3×1024');
+	assert.equal((await vault.records()).filter(record => record.sessionId === 's2').length, 2, 'capacity is enforced during intake');
 	assert.ok(overCap.bytes <= 2048);
 	vault.stop();
 });
@@ -292,4 +296,129 @@ test('defaults match the spec (200MB / 7 days / enabled)', () => {
 	assert.equal(DEFAULT_LIMITS.enabled, true);
 	assert.equal(DEFAULT_LIMITS.maxSizeBytes, 200 * 1024 * 1024);
 	assert.equal(DEFAULT_LIMITS.ttlDays, 7);
+});
+
+test('an unsent image can be restored again after refreshing the browser', async () => {
+	const editor = makeEditor();
+	browser(editor);
+	const options = { fetchImpl: async () => Response.json({ settings: {}, key: 'k' }) };
+	const first = createVault(options);
+	const taken = [];
+	officialPasteHandler(editor, taken);
+	await first.intake('session-aaaa', [pngFile()]);
+	await first.seedSession('session-aaaa');
+	const reloaded = createVault(options); // same IndexedDB, fresh browser lifecycle
+	await reloaded.seedSession('session-aaaa');
+	assert.equal(taken.length, 2, 'unsent backup must survive more than one restore');
+});
+
+test('pasting the same image after sending creates a new pending draft', async () => {
+	browser(makeEditor());
+	const vault = createVault();
+	await vault.intake('session-aaaa', [pngFile()]);
+	await vault.retire('session-aaaa');
+	await vault.intake('session-aaaa', [pngFile()]);
+	assert.equal((await vault.records()).filter(record => !record.sentAt).length, 1);
+});
+
+test('stop removes capture listeners and restart does not duplicate them', async () => {
+	const saved = browser(makeEditor());
+	document.removeEventListener = (type, listener) => { saved[type] = saved[type].filter(fn => fn !== listener); };
+	const vault = createVault({ fetchImpl: async () => Response.json({ settings: {}, key: 'k' }) });
+	await vault.start();
+	vault.stop();
+	assert.equal(saved.paste.length + saved.drop.length + saved.change.length, 0);
+	await vault.start();
+	vault.stop();
+});
+
+function nativeInput() {
+	let attachments = [];
+	const listeners = new Set();
+	return {
+		store: { getSnapshot: () => ({ attachmentIds: attachments.map(a => a.id) }), subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); } },
+		resolve: () => attachments,
+		set(next) { attachments = next; for (const listener of listeners) listener(); },
+	};
+}
+const settle = () => new Promise(resolve => setTimeout(resolve, 40));
+
+test('native input clears sent screenshots even after the conversation unmounts', async () => {
+	browser(makeEditor());
+	const input = nativeInput();
+	const vault = createVault({ getInput: () => input, fetchImpl: async () => Response.json({ key: 'k' }) });
+	await vault.start({ limits: {} });
+	input.set([{ id: 'native-1', kind: 'image', file: pngFile() }]);
+	await settle();
+	assert.equal(await vault.countFor('session-aaaa'), 1);
+	// Unmounting the visible composer must not stop the native input listener.
+	document.querySelector = () => null;
+	input.set([]);
+	await settle();
+	assert.equal(await vault.countFor('session-aaaa'), 0, 'sent screenshots cannot return on the next switch');
+});
+
+test('native drafts prevent duplicate restore before image thumbnails have rendered', async () => {
+	const editor = makeEditor();
+	browser(editor);
+	const input = nativeInput();
+	input.set([{ id: 'native-1', kind: 'image', file: pngFile() }]);
+	const vault = createVault({ getInput: () => input });
+	await vault.intake('session-aaaa', [pngFile()]);
+	const taken = [];
+	officialPasteHandler(editor, taken);
+	await vault.seedSession();
+	assert.equal(taken.length, 0, 'native attachment ids are authoritative while the DOM rail is still empty');
+});
+
+test('native removal retires only the removed image and failed-send restoration backs it up again', async () => {
+	browser(makeEditor());
+	const input = nativeInput();
+	const a = { id: 'a', kind: 'image', file: pngFile() };
+	const b = { id: 'b', kind: 'image', file: pngFile('b.png', 2048) };
+	const vault = createVault({ getInput: () => input, fetchImpl: async () => Response.json({ key: 'k' }) });
+	await vault.start({ limits: {} });
+	input.set([a, b]); await settle();
+	input.set([b]); await settle();
+	assert.equal(await vault.countFor('session-aaaa'), 1);
+	input.set([]); await settle();
+	input.set([b]); await settle(); // native failed-send path restores its rail
+	assert.equal(await vault.countFor('session-aaaa'), 1);
+});
+
+test('native attachments admitted during an IndexedDB restore are not pasted twice', async () => {
+	const editor = makeEditor(); browser(editor);
+	const input = nativeInput();
+	const vault = createVault({ getInput: () => input });
+	await vault.intake('session-aaaa', [pngFile()]);
+	const taken = []; officialPasteHandler(editor, taken);
+	const pending = vault.seedSession();
+	input.set([{ id: 'admitted-while-reading', kind: 'image', file: pngFile() }]);
+	await pending;
+	assert.equal(taken.length, 0);
+});
+
+test('a released input binding cannot re-backup an image sent by its replacement', async () => {
+	const saved = browser(makeEditor());
+	const old = nativeInput(), replacement = nativeInput();
+	const image = { id: 'old-id', kind: 'image', file: pngFile('already-sent.png') };
+	old.set([image]);
+	let lateNotification;
+	const subscribe = old.store.subscribe;
+	old.store.subscribe = listener => { lateNotification = listener; return subscribe(listener); };
+	let current = old;
+	const vault = createVault({ getInput: () => current, fetchImpl: async () => Response.json({ key: 'k' }) });
+	await vault.start(); await settle();
+	assert.equal(await vault.countFor('session-aaaa'), 1);
+
+	// Navigation replaces the native Session binding. Its imported draft has
+	// fresh attachment ids; a queued notification can still hold the old input.
+	replacement.set([{ ...image, id: 'replacement-id' }]);
+	current = replacement;
+	saved.paste[0](new ClipboardEvent('paste'));
+	await settle();
+	replacement.set([]); await settle();
+	assert.equal(await vault.countFor('session-aaaa'), 0);
+	lateNotification(); await settle();
+	assert.equal(await vault.countFor('session-aaaa'), 0, 'a stale input callback must not resurrect the sent backup');
 });

@@ -120,3 +120,29 @@ test('dispatch routes the whole command vocabulary', async () => {
 	assert.equal(swept.records, 1);
 	await assert.rejects(dispatch(kit, { type: 'nonsense' }), /未知/);
 });
+
+test('loopback host parsing accepts IPv6 and rejects loopback-looking public names', async () => {
+	const handler = apiHandler({ state: async () => ({ ready: true }) });
+	for (const host of ['[::1]:19387', 'localhost:19387', '127.0.0.1:19387']) {
+		const req = fakeReq(); req.headers.host = host;
+		const res = fakeRes(); await handler(req, res);
+		assert.equal(res.status, 200, host);
+	}
+	for (const host of ['', '127.evil.example:19387', '127.0.0.1.evil.example:19387']) {
+		const req = fakeReq(); req.headers.host = host;
+		const res = fakeRes(); await handler(req, res);
+		assert.equal(res.status, 403, host);
+	}
+});
+
+test('workspace and group operations route through the shared host dispatch', async () => {
+ const calls = [];
+ const kit = { workspace: Object.fromEntries(['createGroup', 'renameGroup', 'deleteGroup', 'assignGroup', 'edit', 'complete'].map(name => [name, async (...args) => { calls.push([name, ...args]); return { ok: true }; }])) };
+ for (const input of [
+  { type: 'group.create', title: 'Work' }, { type: 'group.rename', groupId: 'g', title: 'Team' },
+  { type: 'group.delete', groupId: 'g' }, { type: 'group.assign', workspaceId: 'w', groupId: 'g' },
+  { type: 'workspace.edit', workspaceId: 'w', path: '/new', title: 'New' }, { type: 'workspace.complete' },
+ ]) assert.equal((await dispatch(kit, input)).ok, true);
+ assert.deepEqual(calls.map(row => row[0]), ['createGroup', 'renameGroup', 'deleteGroup', 'assignGroup', 'edit', 'complete']);
+ assert.deepEqual(calls[4][1], { workspaceId: 'w', path: '/new', title: 'New' });
+});

@@ -38,21 +38,47 @@ export class TrashEngine {
 		this.now = deps.now ?? (() => Date.now());
 	}
 
-	async items() { return (await this.ledger.read()).items.map(publicItem); }
+	async items() {
+		const state = await this.ledger.read();
+		return [...state.items, ...await this.#nativeItems(state)].map(publicItem);
+	}
 
-	#guardFree(id) {
-		if (typeof this.deps.journal === 'function' && this.deps.journal() !== null) {
+	/** Read native archives without enrolling them in the plugin's TTL policy. */
+	async #nativeItems(state) {
+		const covered = new Set(state.items.flatMap(item => item.kind === 'session' ? [item.id2] : item.snapshot.sessions.map(row => row.sessionId)));
+		const items = [];
+		for (const sessionId of await this.deps.adapter.archivedSet()) {
+			if (covered.has(sessionId)) continue;
+			const location = await this.deps.adapter.locateSession(sessionId);
+			items.push({ id: `native:${sessionId}`, kind: 'session', id2: sessionId, source: 'native', trashedAt: null,
+				snapshot: { sessionId, workspaceId: location.workspaceId ?? null, beforeId: location.beforeId ?? null,
+					title: location.title ?? null, previouslyArchived: false, previouslyPinned: false } });
+		}
+		return items;
+	}
+
+	async #item(state, itemId) {
+		return this.#find(state, row => row.id === itemId) ?? (await this.#nativeItems(state)).find(row => row.id === itemId);
+	}
+
+	async #guardJournal() {
+		if (typeof this.deps.journal === 'function' && await this.deps.journal() !== null) {
 			throw new TrashError('journal-active', 'a journaled move is unresolved; finish or roll it back first');
 		}
-		const live = this.deps.sessions?.() ?? [];
-		if (live.includes(id)) throw new TrashError('session-busy', `session ${id} is live; open it and stop its work first`);
+	}
+
+	async #guardFree(id, { force = false, purge = false } = {}) {
+		await this.#guardJournal();
+		const live = await this.deps.sessions?.() ?? [];
+		if (!force && live.includes(id)) throw new TrashError('session-busy', `session ${id} is active; stop its work first`);
+		if (purge && this.deps.loaded?.(id)) throw new TrashError('session-loaded', '会话仍由 DSH 持有。请完全重启后，不打开该会话再彻底删除，或退出 DSH 后使用 CLI。');
 	}
 
 	#find(state, predicate) { return state.items.find(predicate); }
 
 	/** §11 TB3: trash one session (archive + ledger; already-archived sessions only enter the bin). */
 	async trashSession(sessionId, { force = false } = {}) {
-		this.#guardFree(sessionId);
+		await this.#guardFree(sessionId, { force });
 		const adapter = this.deps.adapter;
 		const state = await this.ledger.read();
 		if (this.#find(state, item => item.kind === 'session' && item.id2 === sessionId)) throw new TrashError('already-trashed', 'this session is already in the trash bin');
@@ -60,7 +86,6 @@ export class TrashEngine {
 		const archived = await adapter.archivedSet();
 		const pinned = await adapter.pinnedSet();
 		const { workspaceId, beforeId, title } = await adapter.locateSession(sessionId);
-		if (!archived.has(sessionId)) await adapter.archiveSession(sessionId, force ? { stopActivity: true } : {});
 		const item = {
 			id: randomUUID(), kind: 'session', id2: sessionId, trashedAt: new Date(this.now()).toISOString(),
 			snapshot: { sessionId, workspaceId: workspaceId ?? null, beforeId: beforeId ?? null,
@@ -68,35 +93,39 @@ export class TrashEngine {
 		};
 		state.items.push(item);
 		await this.ledger.write(state);
+		if (!archived.has(sessionId)) await adapter.archiveSession(sessionId, force ? { stopActivity: true } : {});
 		return { ok: true, itemId: item.id };
 	}
 
 	/** §11 TB4: trash a project (archive all its sessions, snapshot order/state, delete registration). */
 	async trashWorkspace(workspaceId, { force = false } = {}) {
+		await this.#guardJournal();
 		const adapter = this.deps.adapter;
 		const state = await this.ledger.read();
 		if (this.#find(state, item => item.kind === 'workspace' && item.id2 === workspaceId)) throw new TrashError('already-trashed', 'this project is already in the trash bin');
 		const snapshot = await adapter.workspaceSnapshot(workspaceId);
 		if (snapshot === undefined) throw new TrashError('workspace-unknown', `workspace ${workspaceId} not found`);
-		const live = new Set(this.deps.sessions?.() ?? []);
+		const live = new Set(await this.deps.sessions?.() ?? []);
 		if (!force && snapshot.sessions.some(row => live.has(row.sessionId))) throw new TrashError('workspace-busy', 'the project has live sessions; use force to stop and trash them');
+		const item = { id: randomUUID(), kind: 'workspace', id2: workspaceId, trashedAt: new Date(this.now()).toISOString(), snapshot };
+		state.items.push(item);
+		await this.ledger.write(state);
 		for (const row of snapshot.sessions) {
 			if (row.previouslyArchived) continue;
 			await adapter.archiveSession(row.sessionId, live.has(row.sessionId) ? { stopActivity: true } : {});
 		}
-		const item = { id: randomUUID(), kind: 'workspace', id2: workspaceId, trashedAt: new Date(this.now()).toISOString(), snapshot };
-		state.items.push(item);
-		await this.ledger.write(state);
 		await adapter.deleteWorkspace(workspaceId);
 		return { ok: true, itemId: item.id };
 	}
 
 	/** §11 TB5 idempotent restore: converge to the snapshot; failures propagate so the item survives for retry. */
 	async restore(itemId) {
+		await this.#guardJournal();
 		const adapter = this.deps.adapter;
 		const state = await this.ledger.read();
-		const item = this.#find(state, row => row.id === itemId);
+		const item = await this.#item(state, itemId);
 		if (item === undefined) throw new TrashError('item-unknown', `no trash item ${itemId}`);
+		if (item.purge) throw new TrashError('purge-in-progress', '彻底删除已开始，请重试彻底删除以完成清理');
 		if (item.kind === 'session') await this.#restoreSession(adapter, item.snapshot);
 		else await this.#restoreWorkspace(adapter, item.snapshot);
 		// Restoring changes where a session lives in the sidebar; refresh that one
@@ -125,47 +154,53 @@ export class TrashEngine {
 		// Pins are dropped by archiving (official rule); restore them for sessions
 		// that were pinned before entering the bin.
 		for (const row of snapshot.sessions) {
-			if (row.previouslyPinned && !row.previouslyArchived) await adapter.pinSession(row.sessionId).catch(() => {});
+			if (row.previouslyPinned && !row.previouslyArchived) await adapter.pinSession(row.sessionId);
 		}
 	}
 
 	/** §11 TB6: hard-delete with staging so a crash never yields a half-deleted state. */
 	async purge(itemId) {
+		await this.#guardJournal();
 		const adapter = this.deps.adapter;
 		const state = await this.ledger.read();
-		const item = this.#find(state, row => row.id === itemId);
+		const item = await this.#item(state, itemId);
 		if (item === undefined) throw new TrashError('item-unknown', `no trash item ${itemId}`);
 		const sessionIds = item.kind === 'session' ? [item.snapshot.sessionId] : item.snapshot.sessions.map(row => row.sessionId);
-		for (const sessionId of sessionIds) this.#guardFree(sessionId);
-		for (const sessionId of sessionIds) {
-			await this.#stageArtifact(sessionId);
-			if (adapter.purgeSession) await adapter.purgeSession(sessionId);
+		for (const sessionId of sessionIds) await this.#guardFree(sessionId, { purge: true });
+		// Journal destinations before the first rename. Retries reuse the same staging
+		// paths, and a bookkeeping failure never destroys the only remaining bytes.
+		if (!item.purge) {
+			if (item.source === 'native') { item.trashedAt = new Date(this.now()).toISOString(); state.items.push(item); }
+			item.purge = [];
+			for (const sessionId of sessionIds) {
+				const encoded = encodeSegment(sessionId);
+				const found = [];
+				for (const project of await readdir(this.deps.sessionsRoot).catch(error => {
+					if (error.code === 'ENOENT') return [];
+					throw error;
+				})) {
+					if (project.startsWith('.')) continue;
+					const dir = join(this.deps.sessionsRoot, project, encoded);
+					if (await stat(dir).then(s => s.isDirectory(), error => { if (error.code === 'ENOENT') return false; throw error; })) found.push(dir);
+				}
+				if (found.length > 1) throw new TrashError('duplicate-artifact', `session ${sessionId} has duplicate placements`);
+				item.purge.push({ sessionId, source: found[0] ?? null, staged: join(this.deps.kitRoot, 'pending-purge', `${encoded}__${randomUUID()}`) });
+			}
+			await this.ledger.write(state);
 		}
-		for (const sessionId of sessionIds) {
-			await adapter.unpinSession(sessionId).catch(() => {});
-			await adapter.unarchiveSession(sessionId).catch(() => {});
+		for (const row of item.purge) {
+			if (row.source !== null && await stat(row.source).then(() => true, () => false)) await relocate(row.source, row.staged);
+			if (this.deps.projcacheRoot) await rm(join(this.deps.projcacheRoot, `${row.sessionId}.json`), { force: true });
+			await adapter.purgeSession?.(row.sessionId);
+			await adapter.unpinSession(row.sessionId);
+			await adapter.unarchiveSession(row.sessionId);
+			await this.deps.vault?.dropSession?.(row.sessionId);
 		}
-		if (item.kind === 'workspace') await adapter.deleteWorkspace(item.id2).catch(() => {});
-		if (this.deps.vault?.dropSession) for (const sessionId of sessionIds) await this.deps.vault.dropSession(sessionId);
+		if (item.kind === 'workspace') await adapter.deleteWorkspace(item.id2);
+		for (const row of item.purge) await rm(row.staged, { recursive: true, force: true });
 		state.items = state.items.filter(row => row.id !== itemId);
 		await this.ledger.write(state);
 		return { ok: true, purged: sessionIds };
-	}
-
-	async #stageArtifact(sessionId) {
-		const encoded = encodeSegment(sessionId);
-		const root = this.deps.sessionsRoot;
-		let found;
-		for (const project of await readdir(root).catch(() => [])) {
-			if (project.startsWith('.')) continue;
-			try { if ((await stat(join(root, project, encoded))).isDirectory()) { found = join(root, project, encoded); break; } } catch {}
-		}
-		if (found === undefined) return; // already staged away (idempotent)
-		const staged = join(this.deps.kitRoot, 'pending-purge', `${sessionId}__${this.now()}`);
-		await relocate(found, staged);
-		if (this.deps.projcacheRoot) await rm(join(this.deps.projcacheRoot, `${sessionId}.json`), { force: true });
-		// Durable placement done; only now drop the real bytes.
-		await rm(staged, { recursive: true, force: true });
 	}
 
 	/** TTL sweep (§11 T5). With autoPurge, expired items are hard-deleted; otherwise reported. */
@@ -188,5 +223,5 @@ export class TrashEngine {
 }
 
 function publicItem(item) {
-	return { itemId: item.id, kind: item.kind, targetId: item.id2, trashedAt: item.trashedAt, snapshot: item.snapshot };
+	return { itemId: item.id, kind: item.kind, targetId: item.id2, trashedAt: item.trashedAt, snapshot: item.snapshot, source: item.source ?? 'toolbox' };
 }

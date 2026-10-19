@@ -13,7 +13,9 @@ import z from '@deepseek-ai/schemastery';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { guardJournal, guardLedger, guardManifest, guardSettings, JsonDocument } from './store.mjs';
 import { MoveEngine } from './move.mjs';
+import { createSessionMaintenance } from './session-maintenance.mjs';
 import { TrashEngine } from './trash.mjs';
+import { WorkspaceTools, guardGroups, guardWorkspaceJournal } from './workspace.mjs';
 import { apiHandler, dispatch } from './api.mjs';
 import pkg from '../package.json' with { type: 'json' };
 const pluginVersion = pkg.version;
@@ -76,6 +78,9 @@ async function applyInner(ctx, options = {}) {
 	const ledgerDoc = new JsonDocument(root, 'trash.json', { version: 1, items: [] }, guardLedger);
 	const manifestDoc = new JsonDocument(root, 'vault-manifest.json', { version: 1, records: [] }, guardManifest);
 
+	const groupsDoc = new JsonDocument(root, 'groups.json', { version: 1, groups: [] }, guardGroups);
+	const workspaceJournalDoc = new JsonDocument(root, 'workspace-journal.json', { version: 1, active: null }, guardWorkspaceJournal);
+
 	let settingsCache = await settingsDoc.read().catch(() => ({ trash: {}, draftVault: {} }));
 	let journalCache = null;
 	try { journalCache = (await journalDoc.read()).active; }
@@ -89,15 +94,20 @@ async function applyInner(ctx, options = {}) {
 		journal: journalDoc,
 		capabilities: hostCapabilities(ctx),
 	});
+	const workspace = new WorkspaceTools({ registry: () => ctx.get('workspaceRegistry'), move, groups: groupsDoc, journal: workspaceJournalDoc, ledger: ledgerDoc });
 	const trash = new TrashEngine({
 		adapter: registryAdapter(ctx),
-		sessions: () => (ctx.get('sessions')?.list() ?? []).map(session => session.header?.id).filter(id => typeof id === 'string'),
+		sessions: async () => {
+			const ids = (ctx.get('sessions')?.list() ?? []).map(session => session.header?.id).filter(id => typeof id === 'string');
+			return (await Promise.all(ids.map(async id => await hostCapabilities(ctx).sessionLive(id) ? id : null))).filter(Boolean);
+		},
+		loaded: id => ctx.get('sessions')?.get?.(id) !== undefined,
 		sessionsRoot: join(dshHome, 'sessions'),
 		projcacheRoot: join(dshHome, 'storages', 'session_projcache', 'sessions'),
 		kitRoot: root,
 		ledger: ledgerDoc,
 		vault: { dropSession: sessionId => manifestDoc.update(current => ({ ...current, records: current.records.filter(record => record.sessionId !== sessionId) })) },
-		journal: () => journalCache,
+		journal: async () => (await journalDoc.read()).active,
 		settings: () => settingsCache.trash ?? {},
 	});
 
@@ -113,12 +123,14 @@ async function applyInner(ctx, options = {}) {
 		})).sort((a, b) => a.title.localeCompare(b.title));
 	};
 
+	let pendingAction = Promise.resolve();
 	const kit = {
 		settings: settingsDoc,
 		manifest: manifestDoc,
 		journal: journalDoc,
 		move,
 		trash,
+		workspace,
 		updateSettings: async patch => {
 			const next = await settingsDoc.update(current => deepMerge(current, patch));
 			settingsCache = next;
@@ -147,6 +159,8 @@ async function applyInner(ctx, options = {}) {
 				settings,
 				journal,
 				projects: listProjects(ctx),
+				groups: (await groupsDoc.read()).groups,
+				workspaceMove: await workspace.active(),
 				trash: await trash.items(),
 				// Bytes live in browser IndexedDB; the manifest mirrors their metadata only.
 				vault: { records: manifest.records.length, bytes: manifest.records.reduce((total, record) => total + (record.size ?? 0), 0) },
@@ -165,7 +179,14 @@ async function applyInner(ctx, options = {}) {
 			}
 			return null;
 		},
-		action: input => dispatch(kit, input),
+		action: input => {
+			const result = pendingAction.then(async () => {
+				if (!['workspace.complete', 'project.of', 'trash.list', 'vault.sync', 'vault.sweep', 'settings.update'].includes(input.type)) await workspace.assertIdle();
+				return dispatch(kit, input);
+			});
+			pendingAction = result.catch(() => {});
+			return result;
+		},
 	};
 
 	ctx.inject?.(['webServer'], webCtx => {
@@ -177,7 +198,12 @@ async function applyInner(ctx, options = {}) {
 	// is the surface other plugins or future official hooks can reach).
 	ctx.provide('sessionToolbox', kit);
 
-	ctx.effect(() => () => {});
+	ctx.effect(() => {
+		const sweep = () => { void kit.action({ type: 'trash.sweep' }).catch(error => ctx.logger?.warn?.(`session-toolbox: trash sweep failed — ${error.message}`)); };
+		const timer = setInterval(sweep, 60 * 60 * 1000);
+		timer.unref?.();
+		return () => clearInterval(timer);
+	});
 	ctx.logger?.info?.('dsh-session-toolbox ready', JSON.stringify({ version: pluginVersion, capabilities }));
 }
 
@@ -187,28 +213,21 @@ async function applyInner(ctx, options = {}) {
  */
 export function hostCapabilities(ctx) {
 	return {
+		sessionMaintenance: createSessionMaintenance(ctx),
 		/**
 		 * Whether a session is actively working.
 		 *
 		 * The old check asked whether `sessions.list()` contained the id, but that
 		 * list holds every session the host has loaded — a session that is merely
 		 * open (or was opened at some point) counted as live and blocked every
-		 * move. The official activity hook is `workspace/session-activity`: a
-		 * `turn` entry means a turn is in flight (including one waiting on an
-		 * approval or an answer), which is exactly what must not be relocated.
+		 * move. The official activity hook is `workspace/session-activity`: any
+		 * returned activity (turn, job, subagent or schedule) blocks relocation.
 		 */
-		sessionLive: sessionId => {
-			try {
-				const activities = ctx.waterfall?.('workspace/session-activity', { sessionId }, () => []);
-				if (activities === undefined) return false;
-				// While the waterfall is still resolving it is a thenable; treat an
-				// unresolved answer as "not busy" rather than blocking the move.
-				if (typeof activities?.then === 'function') return false;
-				return Array.isArray(activities) && activities.some(entry => entry?.kind === 'turn');
-			} catch {
-				return false;
-			}
+		sessionLive: async sessionId => {
+			const activities = await ctx.waterfall?.('workspace/session-activity', { sessionId }, () => Promise.resolve([]));
+			return Array.isArray(activities) && activities.length > 0;
 		},
+		sessionLoaded: sessionId => ctx.get('sessions')?.get?.(sessionId) !== undefined,
 		listHeaders: async () => {
 			const persistence = ctx.get('sessionPersistence');
 			if (persistence?.list !== undefined) return (await persistence.list()).map(snapshot => snapshot.header);
@@ -227,8 +246,11 @@ export function hostCapabilities(ctx) {
 			const registry = ctx.get('workspaceRegistry');
 			if (registry === undefined) throw new Error('workspaceRegistry unavailable in this DSH build');
 			const canonicalFrom = fromCwd === undefined ? undefined : await realpath(fromCwd).catch(() => fromCwd);
-			const source = canonicalFrom === undefined ? undefined : await registry.resolveByPath(canonicalFrom);
+			const source = canonicalFrom === undefined ? undefined : typeof registry.list === 'function'
+				? registry.list().find(row => row.path === canonicalFrom)
+				: await registry.resolveByPath(canonicalFrom);
 			if (source !== undefined) await source.detachSession(sessionId);
+			if (toCwd === undefined) return;
 			let target = await registry.resolveByPath(toCwd);
 			if (target === undefined) {
 				if (!(await stat(toCwd).then(s => s.isDirectory(), () => false))) throw new Error(`target directory ${toCwd} does not exist`);
@@ -278,16 +300,18 @@ export function registryAdapter(ctx) {
 			const rows = registry();
 			return typeof rows.sessionKnown === 'function' ? await rows.sessionKnown(sessionId) : false;
 		},
-		archivedSet: async () => new Set(registry().archivedSessionIds ?? []),
+		archivedSet: async () => new Set(ctx.get('workspaceRegistry')?.archivedSessionIds ?? []),
 		pinnedSet: async () => new Set(registry().pinnedSessionIds ?? []),
 		locateSession: async sessionId => {
+			let title = null;
+			try { title = (await ctx.get('sessionQuery')?.readTitle?.(sessionId))?.title ?? null; } catch { /* title is optional */ }
 			for (const entity of registry().list()) {
 				const ids = entity.sessionIds ?? [];
 				if (!ids.includes(sessionId)) continue;
 				const at = ids.indexOf(sessionId);
-				return { workspaceId: entity.id, beforeId: at + 1 < ids.length ? ids[at + 1] : null, title: null };
+				return { workspaceId: entity.id, beforeId: at + 1 < ids.length ? ids[at + 1] : null, title };
 			}
-			return { workspaceId: null, beforeId: null, title: null };
+			return { workspaceId: null, beforeId: null, title };
 		},
 		workspaceSnapshot: async workspaceId => {
 			const rows = registry();
@@ -300,7 +324,7 @@ export function registryAdapter(ctx) {
 			const at = order.indexOf(entity.id);
 			return {
 				workspaceId: entity.id, path: entity.path, title: entity.title,
-				beforeId: at > 0 ? order[at - 1] : null,
+				beforeId: at + 1 < order.length ? order[at + 1] : null,
 				sessions: ids.map((sessionId, index) => ({ sessionId,
 					previouslyArchived: archived.has(sessionId),
 					previouslyPinned: pinned.has(sessionId),
@@ -316,7 +340,7 @@ export function registryAdapter(ctx) {
 			const entity = registry().get(workspaceId);
 			if (entity === undefined) return;
 			if (!entity.sessionIds?.includes(sessionId)) await entity.attachSession(sessionId);
-			if (beforeId !== null && entity.sessionIds?.includes(beforeId)) await entity.insertSessionBefore(sessionId, beforeId);
+			await entity.insertSessionBefore(sessionId, beforeId !== null && entity.sessionIds?.includes(beforeId) ? beforeId : undefined);
 		},
 		restoreWorkspace: async snapshot => {
 			const rows = registry();
@@ -325,11 +349,20 @@ export function registryAdapter(ctx) {
 				await mkdir(snapshot.path, { recursive: true }).catch(() => {});
 				entity = await rows.create(snapshot.path, snapshot.title);
 			}
-			for (const row of [...snapshot.sessions].reverse()) await entity.attachSession(row.sessionId).catch(() => {});
-			if (snapshot.beforeId !== null && entity.id !== snapshot.beforeId) await rows.insertBefore(entity.id, snapshot.beforeId).catch(() => {});
+			for (const row of [...snapshot.sessions].reverse()) await entity.attachSession(row.sessionId);
+			for (const row of [...snapshot.sessions].reverse()) {
+				await entity.insertSessionBefore(row.sessionId, row.beforeId ?? undefined);
+			}
+			const anchor = rows.list().some(row => row.id === snapshot.beforeId) ? snapshot.beforeId : undefined;
+			if (entity.id !== anchor) await rows.insertBefore(entity.id, anchor);
 			return entity;
 		},
-		purgeSession: async () => ctx.get('sessionPersistence')?.delete === undefined ? 'unavailable' : 'present',
+		purgeSession: async sessionId => {
+			for (const entity of registry().list()) {
+				if (entity.sessionIds?.includes(sessionId)) await entity.detachSession(sessionId);
+			}
+			await hostCapabilities(ctx).refreshHeaderCache();
+		},
 		/** Re-read headers so a restored/archived session's placement is visible. */
 		refreshPlacement: async sessionId => hostCapabilities(ctx).refreshPlacement(sessionId),
 	};

@@ -5,13 +5,11 @@
  * same two-step order (source detach → target create/attach) and the registry
  * invariants preserved (§10 MR2 step 2, §11.1-2).
  */
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { MoveEngine } from './move.mjs';
 import { TrashEngine } from './trash.mjs';
-import { guardJournal, guardLedger, JsonDocument } from './store.mjs';
-import { writeOwned } from './move.mjs';
+import { guardJournal, guardLedger, guardSettings, JsonDocument } from './store.mjs';
 import { apiHandler, dispatch } from './api.mjs';
 
 export const defaultKitRoot = () => join(resolveDshHome(), 'session-toolbox');
@@ -20,30 +18,47 @@ export const defaultKitRoot = () => join(resolveDshHome(), 'session-toolbox');
 export class OfflineLedger {
 	constructor(workspaceFile) {
 		this.file = workspaceFile;
+		this.doc = new JsonDocument(dirname(workspaceFile), basename(workspaceFile), {
+			unit: { name: 'workspace', version: 2 },
+			global: { initialized: true, workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [] },
+			tables: { workspaces: {} },
+		});
 	}
-	async #read() {
-		try { return JSON.parse(await readFile(this.file, 'utf8')); }
-		catch (error) { if (error.code === 'ENOENT') return { unit: { name: 'workspace', version: 2 }, global: { initialized: true, workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [] }, tables: { workspaces: {} } }; throw error; }
-	}
-	#write(state) { return writeOwned(this.file, JSON.stringify(state, null, 2), 0o600); }
+	async #read() { return this.doc.read(); }
 	async moveLedger(sessionId, fromCwd, toCwd) {
-		const state = await this.#read();
-		const workspaces = state.tables?.workspaces ?? {};
-		for (const [id, record] of Object.entries(workspaces)) {
-			if (record.sessionIds.includes(sessionId)) record.sessionIds = record.sessionIds.filter(row => row !== sessionId);
-		}
-		const target = Object.entries(workspaces).find(([, record]) => record.path === toCwd);
-		if (target === undefined) {
-			const id = crypto.randomUUID();
-			workspaces[id] = { path: toCwd, title: (toCwd.split('/').filter(Boolean).at(-1) ?? toCwd), sessionIds: [sessionId], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-			state.global.workspaceIds.unshift(id);
-		} else {
-			const [id, record] = target;
-			if (!record.sessionIds.includes(sessionId)) record.sessionIds.unshift(sessionId);
-			record.updatedAt = new Date().toISOString();
-		}
-		await this.#write(state);
+		await this.doc.update(state => {
+			const workspaces = state.tables.workspaces;
+			for (const record of Object.values(workspaces)) record.sessionIds = record.sessionIds.filter(id => id !== sessionId);
+			if (toCwd !== undefined) {
+				const target = Object.values(workspaces).find(record => record.path === toCwd);
+				if (target === undefined) {
+					const id = crypto.randomUUID();
+					workspaces[id] = { path: toCwd, title: toCwd.split(/[/\\]/).filter(Boolean).at(-1) ?? toCwd, sessionIds: [sessionId], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+					state.global.workspaceIds.unshift(id);
+				} else {
+					target.sessionIds.unshift(sessionId);
+					target.updatedAt = new Date().toISOString();
+				}
+			}
+			return state;
+		});
 	}
+	async purgeSession(sessionId) {
+		await this.doc.update(state => {
+			for (const record of Object.values(state.tables.workspaces)) record.sessionIds = record.sessionIds.filter(id => id !== sessionId);
+			state.global.archivedSessionIds = state.global.archivedSessionIds.filter(id => id !== sessionId);
+			state.global.pinnedSessionIds = state.global.pinnedSessionIds.filter(id => id !== sessionId);
+			return state;
+		});
+	}
+	async deleteWorkspace(id) {
+		await this.doc.update(state => {
+			delete state.tables.workspaces[id];
+			state.global.workspaceIds = state.global.workspaceIds.filter(value => value !== id);
+			return state;
+		});
+	}
+
 	async resyncIndex() { return 'skipped-offline'; }
 	async listStoredHeaders() {
 		const state = await this.#read();
@@ -51,8 +66,9 @@ export class OfflineLedger {
 	}
 }
 
-export function buildKit({ root = defaultKitRoot(), dshHome = resolveDshHome(), ledger = new OfflineLedger(join(dshHome, 'storages', 'workspace.json')), now = () => Date.now() } = {}) {
-	const settingsDoc = new JsonDocument(root, 'session-toolbox.json', { version: 1 });
+export function buildKit({ root, dshHome = resolveDshHome(), ledger = new OfflineLedger(join(dshHome, 'storages', 'workspace.json')), now = () => Date.now() } = {}) {
+	root ??= join(dshHome, 'session-toolbox');
+	const settingsDoc = new JsonDocument(root, 'session-toolbox.json', { version: 1 }, guardSettings);
 	const journalDoc = new JsonDocument(root, 'journal.json', { version: 1, active: null }, guardJournal);
 	const ledgerDoc = new JsonDocument(root, 'trash.json', { version: 1, items: [] }, guardLedger);
 	const manifestDoc = new JsonDocument(root, 'vault-manifest.json', { version: 1, records: [] });
@@ -71,12 +87,12 @@ export function buildKit({ root = defaultKitRoot(), dshHome = resolveDshHome(), 
 		projcacheRoot: join(dshHome, 'storages', 'session_projcache', 'sessions'),
 		kitRoot: root,
 		ledger: ledgerDoc,
-		journal: () => null,
+		journal: async () => (await journalDoc.read()).active,
 		settings: () => lastSettings.trash ?? {},
 		now,
 	});
 	const kit = {
-		move, trash, journalDoc, settingsDoc, manifestDoc,
+		move, trash, journalDoc, settingsDoc, manifestDoc, settings: settingsDoc, manifest: manifestDoc,
 		updateSettings: async patch => { const next = await settingsDoc.update(current => ({ ...current, ...patch })); lastSettings = next; return next; },
 		state: async () => ({
 			pluginVersion: 'cli', settings: await settingsDoc.read(),
@@ -98,10 +114,10 @@ function offlineAdapter(ledger) {
 		unarchiveSession: async () => {},
 		pinSession: async () => {},
 		unpinSession: async () => {},
-		deleteWorkspace: async () => {},
+		deleteWorkspace: id => ledger.deleteWorkspace(id),
 		repairSlot: async () => {},
 		restoreWorkspace: async () => {},
-		purgeSession: async () => 'offline',
+		purgeSession: sessionId => ledger.purgeSession(sessionId),
 	};
 }
 

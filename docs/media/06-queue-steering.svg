@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="540" viewBox="0 0 1280 540" role="img" aria-labelledby="title desc">
+ <title id="title">队列手动引导流程</title>
+ <desc id="desc">点击消息旁的引导，把所选消息交给当前轮次，在下一可用步骤接收。当前工具继续执行，其余消息继续排队。此图为流程示意。</desc>
+ <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#2563eb"/></marker></defs>
+ <rect width="1280" height="540" rx="20" fill="#f5f7fb"/>
+ <g font-family="system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <text x="48" y="62" font-size="29" font-weight="700" fill="#172033">把补充信息交给当前轮次</text>
+  <text x="48" y="100" font-size="19" fill="#536078">流程示意 · 不代表立即打断正在执行的工具</text>
+  <rect x="48" y="150" width="320" height="180" rx="16" fill="white" stroke="#d6deea"/>
+  <text x="72" y="190" font-size="20" font-weight="600" fill="#172033">排队消息</text>
+  <rect x="70" y="211" width="276" height="44" rx="8" fill="#e8efff"/>
+  <text x="86" y="239" font-size="18" fill="#2448a4">第一条：补充验收要求</text>
+  <text x="86" y="294" font-size="18" fill="#536078">其他消息：继续等待</text>
+  <path d="M385 240 H448" stroke="#2563eb" stroke-width="3" marker-end="url(#arrow)"/>
+  <rect x="466" y="186" width="290" height="110" rx="16" fill="#2563eb"/>
+  <text x="611" y="231" font-size="24" font-weight="600" fill="white" text-anchor="middle">引导所选消息</text>
+  <text x="611" y="265" font-size="17" fill="#e5edff" text-anchor="middle">保留原消息及附件</text>
+  <path d="M773 240 H836" stroke="#2563eb" stroke-width="3" marker-end="url(#arrow)"/>
+  <rect x="854" y="150" width="378" height="180" rx="16" fill="white" stroke="#d6deea"/>
+  <text x="880" y="192" font-size="20" font-weight="600" fill="#172033">当前运行轮次</text>
+  <text x="880" y="243" font-size="19" fill="#172033">在下一可用步骤接收补充信息</text>
+  <text x="880" y="287" font-size="19" fill="#15714a">当前工具继续执行</text>
+  <rect x="48" y="374" width="1184" height="112" rx="14" fill="#e9eef6"/>
+  <text x="72" y="416" font-size="19" fill="#334155">使用条件：会话运行中、有排队消息，且会话可写、可继续。</text>
+  <text x="72" y="455" font-size="19" fill="#334155">想选择其他消息？使用原生队列中该条消息旁的「插话发送」。</text>
+ </g>
+</svg>

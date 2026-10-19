@@ -21,7 +21,7 @@ test('real cordis kernel: plugin boots, registers the route, serves state', asyn
 	ctx.provide('webServer', {
 		register(route) { routes.push(route); return () => { const i = routes.indexOf(route); if (i >= 0) routes.splice(i, 1); }; },
 	});
-	const fiber = await ctx.plugin({ id: 'dsh-session-toolbox-v1-test', name: host.name, inject: host.inject, Config: host.Config, apply: (scoped, config) => host.apply(scoped, config) });
+	const fiber = await ctx.plugin({ id: 'dsh-session-toolbox-v1-test', name: host.name, inject: host.inject, Config: host.Config, apply: (scoped, config) => host.apply(scoped, { configFile: join(dir, 'kit'), dshHome: join(dir, 'dsh') }) });
 	assert.equal(routes.length, 1, 'route registered through ctx.inject([webServer])');
 	const kit = ctx.get('sessionToolbox');
 	assert.ok(kit, 'kit service provided');

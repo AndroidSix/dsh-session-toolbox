@@ -24,7 +24,9 @@ function mergeSettings(raw) {
 		trash: { ...DEFAULT_SETTINGS.trash, ...(raw.trash ?? {}) },
 		move: { ...DEFAULT_SETTINGS.move, ...(raw.move ?? {}) },
 	};
-}const positiveInt = value => Number.isSafeInteger(value) && value > 0;
+}
+
+const positiveInt = value => Number.isSafeInteger(value) && value > 0;
 
 /** One durable JSON document: locked read-modify-write + schema guard. */
 export class JsonDocument {
@@ -72,6 +74,7 @@ export class JsonDocument {
 
 export function guardSettings(value, file) {
 	if (value.version !== undefined && value.version !== 1) throw new Error(`session-toolbox: unsupported settings version in ${file}: ${String(value.version)}`);
+	if (value.move?.enabled !== undefined && typeof value.move.enabled !== 'boolean') throw new Error(`session-toolbox: settings.move.enabled must be boolean (${file})`);
 	const draft = value.draftVault ?? {};
 	if (draft.enabled !== undefined && typeof draft.enabled !== 'boolean') throw new Error(`session-toolbox: settings.draftVault.enabled must be boolean (${file})`);
 	if (draft.maxSizeBytes !== undefined && !positiveInt(draft.maxSizeBytes)) throw new Error(`session-toolbox: settings.draftVault.maxSizeBytes must be a positive safe integer (${file})`);

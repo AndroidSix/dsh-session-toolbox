@@ -13,7 +13,7 @@
  */
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, open, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { encodeSegment, findLogFile, projectKey, verifyEncoders } from './paths.mjs';
 import { readHeader, rewriteHeaderFrame } from './session-log.mjs';
@@ -60,7 +60,6 @@ export async function relocate(source, target) {
 	} catch (error) {
 		if (error.code !== 'EXDEV') throw error;
 	}
-	const { cp } = await import('node:fs/promises');
 	await cp(source, target, { recursive: true, errorOnExist: true, force: false });
 	await rm(source, { recursive: true, force: true });
 }
@@ -93,7 +92,8 @@ export class MoveEngine {
 		if (typeof sessionId !== 'string' || !sessionId.startsWith('session-')) throw new MovePreflightError('bad-request', 'sessionId must look like session-<uuid>');
 		if (typeof toCwd !== 'string' || (!toCwd.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(toCwd))) throw new MovePreflightError('bad-request', 'toCwd must be an absolute path');
 		if (await this.readJournal() !== null) throw new MovePreflightError('journal-active', 'another move is journaled; complete or roll it back first');
-		if (this.caps.sessionLive?.(sessionId)) throw new MovePreflightError('session-busy', `session ${sessionId} is live; stop its work before moving`);
+		if (await this.caps.sessionLive?.(sessionId)) throw new MovePreflightError('session-busy', `session ${sessionId} is live; stop its work before moving`);
+		if (this.caps.sessionLoaded?.(sessionId) && !this.caps.sessionMaintenance) throw new MovePreflightError('session-loaded', '当前宿主不支持在线释放该会话，请关闭 DSH 后使用 CLI 迁移。');
 		const headers = await this.caps.listHeaders();
 		const header = headers.find(row => row.id === sessionId);
 		if (header === undefined) throw new MovePreflightError('session-unknown', `no stored session ${sessionId}`);
@@ -119,7 +119,7 @@ export class MoveEngine {
 		// §10 MR1 belt-and-braces (CLI/offline path): a freshly-written log means an
 		// appender is active; moving it now would orphan their writes.
 		const logStat = await stat(logPath);
-		if (this.now() - logStat.mtimeMs < 10_000) throw new MovePreflightError('session-churning', `session log was written ${Math.round((this.now() - logStat.mtimeMs) / 1000)}s ago; make sure DSH has stopped using it, then retry`);
+		if (!this.caps.sessionMaintenance && this.now() - logStat.mtimeMs < 10_000) throw new MovePreflightError('session-churning', `session log was written ${Math.round((this.now() - logStat.mtimeMs) / 1000)}s ago; make sure DSH has stopped using it, then retry`);
 		if (header.cwd !== undefined && fromProject !== projectKey(header.cwd)) {
 			// §10 MN3: the layout changed in a way this build cannot follow.
 			throw new MovePreflightError('unknown-layout', `cwd '${header.cwd}' should live at '${projectKey(header.cwd)}' but the artifact was observed at '${fromProject}'`);
@@ -154,6 +154,11 @@ export class MoveEngine {
 
 	/** Execute the whole move; on failure the journal survives for rollback/complete. */
 	async move(plan) {
+		const operation = async lease => this.#move(await this.preflight({ sessionId: plan.sessionId, toCwd: plan.toCwd }), lease);
+		return this.caps.sessionMaintenance ? this.caps.sessionMaintenance(plan.sessionId, operation) : operation();
+	}
+
+	async #move(plan, lease) {
 		const entry = { ...plan, done: [], deferredLedger: false,
 			backup: join(this.root, 'backups', `${plan.sessionId}.orig`),
 			stagedNew: join(this.root, 'backups', `${plan.sessionId}.new`),
@@ -162,7 +167,7 @@ export class MoveEngine {
 		try {
 			await this.phaseBackup(entry);
 			await this.phaseRewrite(entry);
-			await this.phaseCommit(entry);
+			await this.phaseCommit(entry, lease);
 			await this.phaseLedger(entry);
 			await this.phaseProjcache(entry);
 			await this.phaseIndex(entry);
@@ -171,9 +176,9 @@ export class MoveEngine {
 			// Never leave a half-applied move behind. Phases after `commit` are safe
 			// to undo in reverse; if the rollback itself fails the journal stays as
 			// the recovery pointer and the panel offers complete/rollback explicitly.
-			if (error.journal !== null && error.journal.done?.includes('commit')) {
+			if (error.journal !== null && (error.journal.done?.includes('commit') || await stat(entry.retired).then(() => true, () => false))) {
 				try {
-					await this.rollback();
+					await this.#rollback(await this.readJournal(), lease);
 					error.rolledBack = true;
 				} catch (rollbackError) {
 					error.rollbackError = rollbackError.message;
@@ -183,11 +188,11 @@ export class MoveEngine {
 		}
 		// A deferred ledger (same-process stale header cache) keeps the journal alive
 		// as the retry marker: the artifact is already moved, and the next process —
-		// or move.complete — converges the accounting (§10 MR3).
+		// with an explicit move.complete — converges the accounting (§10 MR3).
 		if (entry.deferredLedger === true) {
 			await this.writeJournal(entry);
 			return { ok: true, deferred: true, sessionId: entry.sessionId, toCwd: entry.toCwd,
-				note: '文件已迁移；DSH 账本将在下次启动或 move.complete 时收敛' };
+				note: '文件已迁移，但项目账本尚未完成；请在恢复区点完成，或选择回滚' };
 		}
 		await this.#finish(entry);
 		return { ok: true, sessionId: entry.sessionId, toCwd: entry.toCwd, deferredLedger: entry.deferredLedger === true };
@@ -220,18 +225,28 @@ export class MoveEngine {
 		await this.#stage(entry, 'rewrite');
 	}
 
-	async phaseCommit(entry) {
+	async phaseCommit(entry, lease) {
 		// Retire first, then publish: the id is never simultaneously discoverable in two project dirs.
-		await relocate(entry.dir, entry.retired);
+		if (this.caps.sessionLoaded?.(entry.sessionId) || await this.caps.sessionLive?.(entry.sessionId)) throw new MovePreflightError('session-busy', '会话已被加载或开始运行，请停止使用后重试');
+		if (!await stat(entry.retired).then(() => true, () => false)) {
+			if (sha256(await readFile(join(entry.dir, entry.logName))) !== entry.sourceHash) throw new MovePreflightError('source-changed', '会话日志在备份后发生变化，迁移已停止');
+			await relocate(entry.dir, entry.retired);
+		}
 		await mkdir(entry.newDir, { recursive: true, mode: 0o700 });
+		await lease?.protectDirectory(entry.newDir);
 		await writeOwned(join(entry.newDir, entry.logName), await readFile(entry.stagedNew));
 		await fsyncFile(join(entry.newDir, entry.logName));
+		// A placement/header change is our own write, not new conversation activity.
+		// Preserve the source timestamps so an immediate return move passes the churn
+		// guard. Any later external append/touch still receives a fresh mtime.
+		const sourceStat = await stat(join(entry.retired, entry.logName));
+		await utimes(join(entry.newDir, entry.logName), sourceStat.atime, sourceStat.mtime);
 		// Carry non-log artifacts (session-local files); never resurrect a stale lock.
-		for (const name of await readdir(entry.retired).catch(() => [])) {
+		for (const name of await readdir(entry.retired)) {
 			if (name === entry.logName || name === 'session.lock') continue;
-			await rename(join(entry.retired, name), join(entry.newDir, name)).catch(() => {});
+			await cp(join(entry.retired, name), join(entry.newDir, name), { recursive: true });
 		}
-		await rm(join(entry.newDir, 'session.lock'), { force: true });
+		if (!lease?.protectDirectory) await rm(join(entry.newDir, 'session.lock'), { force: true });
 		await this.#stage(entry, 'commit');
 	}
 
@@ -254,7 +269,7 @@ export class MoveEngine {
 			entry.deferredLedger = false;
 		} catch (error) {
 			// The registry's header/pin caches can lag a same-process move. Leaving the
-			// journal's ledger phase undone lets startup recovery re-run it in a fresh
+			// journal available lets explicit recovery re-run it in a fresh
 			// process where the caches are cold (§10 MR3/MR4).
 			entry.deferredLedger = true;
 			entry.ledgerError = String(error?.message ?? error);
@@ -279,14 +294,23 @@ export class MoveEngine {
 	async rollback() {
 		const entry = await this.readJournal();
 		if (entry === null) throw new MovePreflightError('no-journal', 'no journaled move to roll back');
-		if (entry.done.includes('commit')) {
+		const operation = lease => this.#rollback(entry, lease);
+		return this.caps.sessionMaintenance ? this.caps.sessionMaintenance(entry.sessionId, operation, { retired: entry.retired }) : operation();
+	}
+
+	async #rollback(entry, lease) {
+		if (this.caps.sessionLoaded?.(entry.sessionId) || await this.caps.sessionLive?.(entry.sessionId)) throw new MovePreflightError('session-busy', '会话已被加载或开始运行，请完全退出 DSH 后恢复迁移');
+		const retiredExists = entry.retired !== undefined && await stat(entry.retired).then(() => true, () => false);
+		if (entry.done.includes('commit') || retiredExists) {
+			// A previous rollback can have restored the bytes before ledger repair failed.
+			if (!retiredExists && sha256(await readFile(join(entry.dir, entry.logName))) !== entry.sourceHash) throw new MovePreflightError('journal-order', 'committed journal lost its retired directory');
 			await rm(entry.newDir, { recursive: true, force: true });
 			await mkdir(dirname(entry.dir), { recursive: true, mode: 0o700 });
-			if (entry.retired !== undefined) await relocate(entry.retired, entry.dir);
-			else throw new MovePreflightError('journal-order', 'committed journal lost its retired directory');
+			if (retiredExists) await relocate(entry.retired, entry.dir);
 		}
-		if (entry.deferredLedger !== true && entry.done.includes('ledger') && this.caps.moveLedger !== undefined) {
-			await this.caps.moveLedger(entry.sessionId, entry.toCwd, entry.fromCwd ?? undefined).catch(() => {});
+		if (entry.done.includes('ledger') && this.caps.moveLedger !== undefined) {
+			await this.caps.refreshHeaderCache?.();
+			await this.caps.moveLedger(entry.sessionId, entry.toCwd, entry.fromCwd ?? undefined);
 			await this.caps.refreshHeaderCache?.().catch(() => {});
 		}
 		if (this.projcacheRoot !== undefined) await rm(join(this.projcacheRoot, `${entry.sessionId}.json`), { force: true });
@@ -300,7 +324,13 @@ export class MoveEngine {
 	async complete() {
 		const entry = await this.readJournal();
 		if (entry === null) throw new MovePreflightError('no-journal', 'no journaled move to complete');
-		const runs = { backup: e => this.phaseBackup(e), rewrite: e => this.phaseRewrite(e), commit: e => this.phaseCommit(e),
+		const operation = lease => this.#complete(entry, lease);
+		return this.caps.sessionMaintenance ? this.caps.sessionMaintenance(entry.sessionId, operation, { retired: entry.retired }) : operation();
+	}
+
+	async #complete(entry, lease) {
+		if (this.caps.sessionLoaded?.(entry.sessionId) || await this.caps.sessionLive?.(entry.sessionId)) throw new MovePreflightError('session-busy', '会话已被加载或开始运行，请完全退出 DSH 后恢复迁移');
+		const runs = { backup: e => this.phaseBackup(e), rewrite: e => this.phaseRewrite(e), commit: e => this.phaseCommit(e, lease),
 			ledger: e => this.phaseLedger(e), projcache: e => this.phaseProjcache(e), index: e => this.phaseIndex(e) };
 		for (const phase of PHASES) {
 			if (entry.done.includes(phase)) {

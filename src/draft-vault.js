@@ -1,21 +1,11 @@
 /**
  * Draft vault (§4-§9): mirrors image drafts into IndexedDB and replays them
  * through the official paste pipeline. No official internals are touched:
- * capture listens at document-level `paste`/`drop`/file-input `change` (never
- * preventing or stopping the native flow), persistence is browser IndexedDB,
- * and restore re-dispatches a ClipboardEvent carrying a synthetic
- * `clipboardData` (Chromium ignores the ClipboardEventInit clipboardData and
- * exposes it only as a prototype accessor, so the property is shadowed with a
- * defined own property — the official handler only reads `items`/`getData`,
- * verified against the shipped build).
- *
- * Idempotency is DOM-based and safe by construction:
- * - seeding only happens into an EMPTY attachment rail;
- * - a seed is confirmed by the official handler calling preventDefault() (its
- *   documented contract for accepted files);
- * - rail dropping to zero while the session view is mounted means "sent or
- *   user-deleted" (§ FR3: both delete the backups); the view unmounting keeps
- *   them — that is exactly the loss this vault repairs.
+ * the public SessionInput store supplies admitted attachments and remains
+ * observed across navigation. Older hosts fall back to read-only DOM capture.
+ * Browser IndexedDB holds bytes; restore uses the official paste pipeline.
+ * Native attachment ids are checked before DOM thumbnails, which may render
+ * late. No host attachment registry or input method is patched.
  */
 
 export const DB_NAME = 'dsh-session-toolbox-vault';
@@ -65,12 +55,13 @@ function done(request) {
 
 function storeOp(database, mode, run) {
 	return new Promise((resolve, reject) => {
-		let outcome;
+		let outcome, result;
 		const transaction = database.transaction(STORE, mode);
+		transaction.oncomplete = () => resolve(result);
 		transaction.onabort = () => reject(transaction.error ?? new Error('vault transaction aborted'));
 		transaction.onerror = () => reject(transaction.error ?? new Error('vault transaction failed'));
 		try { outcome = run(transaction.objectStore(STORE)); } catch (error) { reject(error); return; }
-		Promise.resolve(outcome).then(resolve, reject);
+		Promise.resolve(outcome).then(value => { result = value; }, reject);
 	});
 }
 
@@ -108,6 +99,17 @@ export function createVault(options = {}) {
 	let started = false;
 	let teardown = null;
 	let hostKey = '';
+	let captureCleanup = () => {};
+	let generation = 0;
+	const inputs = new Map();
+	const seeded = new WeakMap();
+	const seeding = new WeakSet();
+	let storageQueue = Promise.resolve();
+	const serialize = task => {
+		const next = storageQueue.then(task);
+		storageQueue = next.catch(() => {});
+		return next;
+	};
 
 	const db = () => dbPromise ??= openDb();
 	function notice(message) {
@@ -132,17 +134,18 @@ export function createVault(options = {}) {
 	};
 
 	/** Best-effort host manifest mirror (status display only; failures invisible). */
-	async function syncHost() {
+	async function syncHost(attempt = 0) {
 		const endpoint = options.endpoint ?? '/.well-known/dsh-session-toolbox';
 		try {
 			if (hostKey === '') {
 				const probe = await fetchImpl(endpoint, { cache: 'no-store' });
 				hostKey = (await probe.json()).key ?? '';
 			}
-			const records = (await allRecords()).slice(-500).map(({ key, sessionId, attachmentId, name, size, hash, seeded, createdAt, sentAt }) =>
+			const records = (await allRecords()).filter(record => !record.sentAt).slice(-2000).map(({ key, sessionId, attachmentId, name, size, hash, seeded, createdAt, sentAt }) =>
 				({ key, sessionId, attachmentId, name, size, hash, seeded, createdAt, sentAt: sentAt ?? 0 }));
-			await fetchImpl(endpoint, { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json', 'x-session-toolbox-key': hostKey },
+			const response = await fetchImpl(endpoint, { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json', 'x-session-toolbox-key': hostKey },
 				body: JSON.stringify({ type: 'vault.sync', records }) });
+			if (response.status === 401) { hostKey = ''; if (attempt === 0) await syncHost(1); }
 		} catch { /* the manifest is cosmetic; the vault itself is IndexedDB */ }
 	}
 
@@ -167,9 +170,9 @@ export function createVault(options = {}) {
 	}
 
 	// ---- FR1 capture ---------------------------------------------------------
-	async function intake(sessionId, files) {
+	async function intakeImages(sessionId, files) {
 		if (!limits.enabled || sessionId === undefined || sessionId === '') return;
-		const existing = (await allRecords()).filter(record => record.sessionId === sessionId);
+		const existing = (await allRecords()).filter(record => record.sessionId === sessionId && !record.sentAt);
 		const seen = new Set(existing.map(record => record.hash));
 		let added = 0;
 		for (const item of files) {
@@ -184,14 +187,18 @@ export function createVault(options = {}) {
 			await putRecord(record);
 			added += 1;
 		}
+		await sweep();
 		if (added > 0) notice(`已备份 ${added} 张草稿图片（会话 ${sessionId.slice(-6)}）`);
-		void syncHost();
+		await syncHost();
+		changed();
 	}
+
+	const intake = (sessionId, files) => serialize(() => intakeImages(sessionId, files));
 
 	const readImages = event => [...(event.clipboardData?.files ?? event.dataTransfer?.files ?? [])].filter(isImageFile);
 	const fileInputImages = event => {
 		const target = event.target;
-		if (!(target instanceof HTMLInputElement) || target.type !== 'file' || target.files === null) return [];
+		if (typeof HTMLInputElement === 'undefined' || !(target instanceof HTMLInputElement) || target.type !== 'file' || target.files === null) return [];
 		return [...target.files].filter(isImageFile);
 	};
 
@@ -222,41 +229,88 @@ export function createVault(options = {}) {
 		});
 	}
 
+	// Observe the public SessionInput state, whose lifetime spans navigation.
+	// DOM thumbnails can lag behind admission and disappear on unmount; neither
+	// event means that the native input has lost its attachments.
+	function inputFor(sessionId) {
+		try { return options.getInput?.(sessionId); }
+		catch (error) { log('warn', `native input unavailable: ${error.message}`); return undefined; }
+	}
+	function observeInput(sessionId) {
+		const input = inputFor(sessionId);
+		if (!input?.store?.subscribe) return false;
+		if (inputs.get(sessionId)?.store === input.store) return true;
+		inputs.get(sessionId)?.dispose();
+		const observation = { store: input.store, dispose: () => {} };
+		const current = () => inputs.get(sessionId) === observation;
+		let previous = new Set();
+		const update = () => {
+			if (!current()) return;
+			// Copy descriptors synchronously: the host releases them after sending.
+			const ids = input.store.getSnapshot()?.attachmentIds ?? [];
+			const files = input.resolve(ids).filter(a => a.kind === 'image' && isImageFile(a.file)).map(a => a.file);
+			void serialize(async () => {
+				if (!current()) return;
+				const active = new Set(await Promise.all(files.map(contentHash)));
+				if (!current()) return;
+				let retired = false;
+				for (const record of await allRecords()) {
+					if (!current()) return;
+					if (record.sessionId === sessionId && !record.sentAt && previous.has(record.hash) && !active.has(record.hash)) {
+						await putRecord({ ...record, sentAt: now() });
+						retired = true;
+					}
+				}
+				previous = active;
+				if (!current()) return;
+				if (files.length) await intakeImages(sessionId, files);
+				else if (retired) { await syncHost(); changed(); }
+			}).catch(error => log('warn', `native draft sync failed: ${error.message}`));
+		};
+		// A remount creates a new native binding. Already queued callbacks from
+		// its predecessor must never re-capture files after the new input sends.
+		inputs.set(sessionId, observation);
+		observation.dispose = input.store.subscribe(update);
+		update();
+		return true;
+	}
+
 	// ---- FR2 restore -----------------------------------------------------------
 	async function seedSession(sessionId = currentSession()) {
-		if (sessionId === undefined || sessionId === '' || !limits.enabled) return false;
+		if (!sessionId || !limits.enabled || sessionId !== currentSession()) return false;
 		const editor = composerRoot();
-		if (editor === undefined) return false;
+		if (editor === undefined || seeding.has(editor)) return false;
 		const rail = attachmentRail(editor);
 		if (rail === undefined) return false;
-		if (rail.length > 0) return true; // non-empty: official still holds them (or was seeded before)
-		// Never resurrect images that already travelled with a sent message. Two
-		// independent guards: an explicit sent flag, and a "already handed back to
-		// the composer" flag so a single batch is dispatched at most once even if
-		// the rail probe misses the cards.
-		const pending = (await allRecords()).filter(record => record.sessionId === sessionId && !record.sentAt && !record.delivered);
-		if (pending.length === 0) return true;
-		const files = [];
-		for (const record of pending) {
-			try { files.push(await blobToFile(record)); }
-			catch { await dropRecord(record.key); } // unreadable backup — drop and move on
-		}
-		if (files.length === 0) { changed(); return false; }
-		const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
-		Object.defineProperty(event, 'clipboardData', { value: fakeClipboardData(files) });
-		// Mark as a restore so our own intake (which observes the same event)
-		// never stores the replayed images as a second fresh draft.
-		try { Object.defineProperty(event, SEED_MARKER, { value: true }); } catch { /* ignore */ }
-		try { editor.focus?.(); } catch { /* ignore */ }
-		editor.dispatchEvent(event);
-		const accepted = event.defaultPrevented === true;
-		if (accepted) notice(`已恢复 ${files.length} 张草稿图片（会话 ${sessionId.slice(-6)}）`);
-		else log('warn', 'synthetic paste was not accepted; vault stays idle for this session');
-		// A restore hands the images back to the official composer; they now live
-		// there (and will be retired when sent), so keep a single copy in the vault.
-		if (accepted) for (const record of pending) await putRecord({ ...record, seeded: true, delivered: now() });
-		changed();
-		return accepted;
+		if (rail.length > 0 || (inputFor(sessionId)?.store.getSnapshot()?.attachmentIds?.length ?? 0) > 0) return true;
+		seeding.add(editor);
+		try {
+			const delivered = seeded.get(editor) ?? new Set();
+			const hashes = new Set();
+			const pending = (await allRecords()).filter(record => {
+				if (record.sessionId !== sessionId || record.sentAt || delivered.has(record.hash) || hashes.has(record.hash)) return false;
+				hashes.add(record.hash);
+				return true;
+			});
+			if (pending.length === 0) return true;
+			const files = [];
+			for (const record of pending) files.push(await blobToFile(record));
+			// IndexedDB/blob reads may outlive a switch to another conversation.
+			if (!limits.enabled || sessionId !== currentSession() || editor !== composerRoot() || editor.isConnected === false) return false;
+			if ((attachmentRail(editor)?.length ?? 0) > 0 || (inputFor(sessionId)?.store.getSnapshot()?.attachmentIds?.length ?? 0) > 0) return true;
+			const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+			Object.defineProperty(event, 'clipboardData', { value: fakeClipboardData(files) });
+			Object.defineProperty(event, SEED_MARKER, { value: true });
+			editor.dispatchEvent(event);
+			const accepted = event.defaultPrevented === true;
+			if (accepted) {
+				for (const record of pending) delivered.add(record.hash);
+				seeded.set(editor, delivered);
+				notice(`已恢复 ${files.length} 张草稿图片（会话 ${sessionId.slice(-6)}）`);
+			} else log('warn', 'synthetic paste was not accepted; backup retained for retry');
+			changed();
+			return accepted;
+		} finally { seeding.delete(editor); }
 	}
 
 	// ---- FR3 lifecycle ---------------------------------------------------------
@@ -296,7 +350,7 @@ export function createVault(options = {}) {
 			if (rail > 0 && next === 0 && scope?.isConnected === true) {
 				// Cards disappeared while the composer was mounted: the message was
 				// sent (or the user removed them), so retire the backups for good.
-				await retireSession(sessionId, 'sent');
+				await serialize(() => retireSession(sessionId, 'sent'));
 			}
 			rail = next;
 			changed();
@@ -305,36 +359,29 @@ export function createVault(options = {}) {
 		const observer = new MutationObserver(() => void check());
 		observer.observe(scope, { subtree: true, childList: true });
 
-		// Belt and braces: listen for the send gesture itself, so a fast unmount
-		// (enter then immediately switch away) still retires the drafts.
-		const onKeyDown = event => {
-			if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
-			const target = event.target;
-			if (target?.closest?.('[data-conversation-session]') === null || target?.closest?.('[data-conversation-session]') === undefined) return;
-			if ((attachmentRail(editor)?.length ?? 0) > 0) void retireSession(sessionId, 'sent');
-		};
-		document.addEventListener('keydown', onKeyDown, true);
-		return () => { observer.disconnect(); document.removeEventListener('keydown', onKeyDown, true); };
+		return () => observer.disconnect();
 	}
 
 	function watchMounts() {
-		let boundSession = '', dispose = () => {};
-		const sync = async () => {
-			const sessionId = currentSession();
-			const editor = composerRoot();
-			if (sessionId === '' || editor === undefined) return;
-			if (sessionId === boundSession && editor.isConnected !== false) return;
-			boundSession = sessionId;
+		let boundSession = '', boundEditor, dispose = () => {}, timer;
+		const sync = () => {
+			const sessionId = currentSession(), editor = composerRoot();
+			if (sessionId === boundSession && editor === boundEditor) return;
+			clearTimeout(timer);
 			dispose();
-			dispose = watchSession(sessionId, editor);
-			setTimeout(() => void seedSession(sessionId).catch(error => log('warn', `vault seed failed: ${error.message}`)), 120);
+			if (boundEditor) seeded.delete(boundEditor);
+			boundSession = sessionId;
+			boundEditor = editor;
+			if (!sessionId || !editor) return;
+			dispose = observeInput(sessionId) ? () => {} : watchSession(sessionId, editor);
+			timer = setTimeout(() => void seedSession(sessionId).catch(error => log('warn', `vault seed failed: ${error.message}`)), 120);
 			void sweep().catch(() => {});
 		};
-		const interval = setInterval(() => void sync(), 5000);
-		if (typeof MutationObserver !== 'function') return () => clearInterval(interval);
-		const observer = new MutationObserver(() => void sync());
-		observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-conversation-session'] });
-		return () => { observer.disconnect(); clearInterval(interval); dispose(); };
+		sync();
+		const interval = setInterval(sync, 1000);
+		const observer = typeof MutationObserver === 'function' ? new MutationObserver(sync) : null;
+		observer?.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-conversation-session'] });
+		return () => { observer?.disconnect(); clearInterval(interval); clearTimeout(timer); dispose(); };
 	}
 
 	return {
@@ -344,11 +391,12 @@ export function createVault(options = {}) {
 		records: allRecords,
 		countFor: async sessionId => {
 			const records = await allRecords();
-			return sessionId === undefined || sessionId === '' ? records.length : records.filter(record => record.sessionId === sessionId).length;
+			return records.filter(record => !record.sentAt && (!sessionId || record.sessionId === sessionId)).length;
 		},
 		start: async ({ limits: override } = {}) => {
 			if (started || typeof document === 'undefined') return false;
 			started = true;
+			const startGeneration = ++generation;
 			if (override !== undefined) limits = { ...limits, ...override };
 			else {
 				try {
@@ -357,27 +405,41 @@ export function createVault(options = {}) {
 					limits = { ...limits, ...(next.settings?.draftVault ?? {}) };
 				} catch { /* defaults hold */ }
 			}
+			if (!started || generation !== startGeneration) return false;
 			const capture = event => {
-				if (event[SEED_MARKER] === true) return;
+				if (event[SEED_MARKER] === true || observeInput(currentSession())) return;
 				void intake(currentSession(), readImages(event)).catch(() => {});
 			};
 			document.addEventListener('paste', capture, true);
 			document.addEventListener('drop', capture, true);
-			document.addEventListener('change', event => void intake(currentSession(), fileInputImages(event)).catch(() => {}), true);
+			const change = event => { if (!observeInput(currentSession())) void intake(currentSession(), fileInputImages(event)).catch(() => {}); };
+			document.addEventListener('change', change, true);
+			captureCleanup = () => {
+				document.removeEventListener('paste', capture, true);
+				document.removeEventListener('drop', capture, true);
+				document.removeEventListener('change', change, true);
+			};
 			teardown = watchMounts();
 			void sweep().catch(() => {});
 			log('info', 'draft vault started');
 			return true;
 		},
-		stop: () => { if (started) { started = false; teardown?.(); teardown = null; } },
+		stop: () => {
+			started = false; generation++; captureCleanup(); teardown?.(); teardown = null;
+			for (const input of inputs.values()) input.dispose();
+			inputs.clear();
+		},
 		setLimits: next => {
-			limits = { ...limits, ...next };
-			if (limits.enabled === false) void (async () => { for (const record of await allRecords()) await dropRecord(record.key); notice('草稿保险箱已停用，存量已清空'); })();
+			const updated = { ...limits, ...next };
+			if (JSON.stringify(updated) === JSON.stringify(limits)) return;
+			limits = updated;
+			void serialize(sweep).then(syncHost).catch(error => log('warn', error.message));
 		},
 		sweep,
 		seedSession,
 		/** Retire a session's unsent drafts (called when its images were sent). */
-		retire: async (sessionId = currentSession(), reason = 'sent') => retireSession(sessionId, reason),
+		retire: (sessionId = currentSession(), reason = 'sent') => serialize(() => retireSession(sessionId, reason)),
+		syncHost,
 		intake,
 		watchMounts,
 	};

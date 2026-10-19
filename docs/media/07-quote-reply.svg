@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="590" viewBox="0 0 1120 590" role="img" aria-labelledby="title desc">
+<title id="title">会话引用回复示意</title><desc id="desc">虚构会话中点击引用回复，在输入框上方预览原文，保留草稿并填写补充问题后发送。</desc>
+<rect width="1120" height="590" rx="20" fill="#171717"/>
+<g font-family="system-ui,-apple-system,'PingFang SC',sans-serif" fill="#ececec">
+<text x="48" y="56" font-size="24" font-weight="600">引用回复</text><text x="48" y="88" font-size="15" fill="#a8a8a8">功能示意 · 全部使用虚构内容</text>
+<rect x="220" y="132" width="740" height="80" rx="22" fill="#292929"/>
+<text x="248" y="179" font-size="19">先修复登录问题，再整理界面样式。</text>
+<rect x="973" y="155" width="40" height="36" rx="7" fill="#333" stroke="#888"/>
+<path d="m994 164-7 6 7 6m-6-6h10a5 5 0 0 1 0 10" stroke="#eee" fill="none" stroke-width="1.6"/>
+<text x="788" y="244" font-size="15" fill="#bbb">① 点击消息旁的「引用回复」</text>
+<rect x="96" y="304" width="928" height="210" rx="24" fill="#242424" stroke="#484848"/>
+<rect x="118" y="324" width="883" height="78" rx="12" fill="#292929"/>
+<path d="M136 339v48" stroke="#888" stroke-width="2"/>
+<text x="151" y="351" font-size="14" fill="#aaa">引用回复 · 用户</text><text x="151" y="380" font-size="17" fill="#ccc">先修复登录问题，再整理界面样式。</text>
+<text x="972" y="351" font-size="23" fill="#aaa">×</text><text x="120" y="442" font-size="18">登录问题已经修复，接下来请检查分组菜单。</text>
+<text x="120" y="486" font-size="14" fill="#aaa">② 保留已有草稿和附件 · 可取消或更换引用</text>
+<circle cx="976" cy="478" r="21" fill="#e8e8e8"/><path d="M976 487v-18m-7 7 7-7 7 7" stroke="#222" fill="none" stroke-width="2"/>
+<text x="96" y="556" font-size="15" fill="#aaa">③ 按原有方式发送；完整原文与新问题一起提交，运行中的任务继续执行。</text>
+</g></svg>

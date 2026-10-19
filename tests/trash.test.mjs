@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TrashEngine, TrashError } from '../src/trash.mjs';
+import { registryAdapter } from '../src/index.mjs';
 import { JsonDocument, guardLedger } from '../src/store.mjs';
 import { encodeSegment, projectKey } from '../src/paths.mjs';
 import { sessionArtifact } from './helpers/zstd-frames.mjs';
@@ -38,9 +39,9 @@ function fakeRegistry({ workspaces, archived = [], pinned = [] }) {
 		},
 		insertBefore: async (id, beforeId) => {
 			const at = rows.findIndex(r => r.id === id);
-			const anchor = rows.findIndex(r => r.id === beforeId);
-			if (at < 0 || anchor < 0 || id === beforeId) return;
+			if (at < 0 || id === beforeId) return;
 			const [row] = rows.splice(at, 1);
+			const anchor = beforeId === undefined ? rows.length : rows.findIndex(r => r.id === beforeId);
 			rows.splice(anchor, 0, row);
 		},
 	};
@@ -48,12 +49,12 @@ function fakeRegistry({ workspaces, archived = [], pinned = [] }) {
 		return {
 			id: row.id, path: row.path, title: row.title,
 			get sessionIds() { return row.sessionIds.filter(id => state.rowsFor(id)?.path === row.path); },
-			attachSession: async id => { const owner = state.rowsFor(id); if (owner !== undefined && owner !== row) await owner.detachSession(id); if (!row.sessionIds.includes(id)) row.sessionIds.unshift(id); },
+			attachSession: async id => { const owner = state.rowsFor(id); if (owner !== undefined && owner !== row) owner.sessionIds = owner.sessionIds.filter(x => x !== id); if (!row.sessionIds.includes(id)) row.sessionIds.unshift(id); },
 			detachSession: async id => { row.sessionIds = row.sessionIds.filter(x => x !== id); },
 			insertSessionBefore: async (id, beforeId) => {
-				if (!row.sessionIds.includes(id) || !row.sessionIds.includes(beforeId) || id === beforeId) return;
+				if (!row.sessionIds.includes(id) || (beforeId !== undefined && !row.sessionIds.includes(beforeId)) || id === beforeId) return;
 				const without = row.sessionIds.filter(x => x !== id);
-				const at = without.indexOf(beforeId);
+				const at = beforeId === undefined ? without.length : without.indexOf(beforeId);
 				row.sessionIds = [...without.slice(0, at), id, ...without.slice(at)];
 			},
 		};
@@ -61,53 +62,7 @@ function fakeRegistry({ workspaces, archived = [], pinned = [] }) {
 	return state;
 }
 
-/** The same surface src/index.mjs registryAdapter(ctx) exposes over the fake. */
-function adapterFor(registry) {
-	return {
-		sessionKnown: id => registry.sessionKnown(id),
-		archivedSet: async () => new Set(registry.archivedSessionIds),
-		pinnedSet: async () => new Set(registry.pinnedSessionIds),
-		locateSession: async sessionId => {
-			for (const entity of registry.list()) {
-				const ids = entity.sessionIds;
-				if (!ids.includes(sessionId)) continue;
-				const at = ids.indexOf(sessionId);
-				return { workspaceId: entity.id, beforeId: at + 1 < ids.length ? ids[at + 1] : null, title: null };
-			}
-			return { workspaceId: null, beforeId: null, title: null };
-		},
-		workspaceSnapshot: async workspaceId => {
-			const entity = registry.get(workspaceId);
-			if (entity === undefined) return undefined;
-			const ids = entity.sessionIds;
-			const archived = new Set(registry.archivedSessionIds);
-			const pinned = new Set(registry.pinnedSessionIds);
-			const order = registry.list().map(row => row.id);
-			const at = order.indexOf(entity.id);
-			return { workspaceId: entity.id, path: entity.path, title: entity.title, beforeId: at > 0 ? order[at - 1] : null,
-				sessions: ids.map((sessionId, index) => ({ sessionId, previouslyArchived: archived.has(sessionId), previouslyPinned: pinned.has(sessionId), beforeId: index + 1 < ids.length ? ids[index + 1] : null })) };
-		},
-		archiveSession: (id, opts) => registry.archiveSession(id, opts),
-		unarchiveSession: id => registry.unarchiveSession(id),
-		pinSession: id => registry.pinSession(id),
-		unpinSession: id => registry.unpinSession(id),
-		deleteWorkspace: id => registry.delete(id),
-		repairSlot: async (sessionId, workspaceId, beforeId) => {
-			const entity = registry.get(workspaceId);
-			if (entity === undefined) return;
-			if (!entity.sessionIds.includes(sessionId)) await entity.attachSession(sessionId);
-			if (beforeId !== null && entity.sessionIds.includes(beforeId)) await entity.insertSessionBefore(sessionId, beforeId);
-		},
-		restoreWorkspace: async snapshot => {
-			let entity = registry.list().find(row => row.path === snapshot.path);
-			if (entity === undefined) entity = await registry.create(snapshot.path, snapshot.title);
-			for (const s of [...snapshot.sessions].reverse()) await entity.attachSession(s.sessionId).catch(() => {});
-			if (snapshot.beforeId !== null && snapshot.beforeId !== entity.id) await registry.insertBefore(entity.id, snapshot.beforeId);
-			return entity;
-		},
-		purgeSession: async () => 'unavailable',
-	};
-}
+const adapterFor = registry => registryAdapter({ get: name => name === 'workspaceRegistry' ? registry : undefined });
 
 async function world(t) {
 	const base = await mkdtemp(join(tmpdir(), 'sk-trash-'));
@@ -148,6 +103,39 @@ test('trashSession archives + records snapshot; restore reverses both', async t 
 	assert.equal(w.registry.archivedSessionIds.includes(S1), false);
 	assert.equal((await w.engine.items()).length, 0);
 	assert.deepEqual(w.registry.get('ws-a').sessionIds, [S1, S2], 'position restored');
+});
+
+test('native archives appear without duplication and restore through the pool', async t => {
+	const w = await world(t);
+	await w.registry.archiveSession(S1);
+	const items = await w.engine.items();
+	assert.equal(items.length, 1, 'the native archive button must populate the pool');
+	assert.equal(items[0].targetId, S1);
+	assert.equal(items[0].source, 'native');
+	assert.equal(items[0].trashedAt, null, 'the original archive time is unknown');
+	assert.equal((await w.ledger.read()).items.length, 0, 'native archives are not enrolled in automatic deletion');
+	await w.engine.restore(items[0].itemId);
+	assert.equal(w.registry.archivedSessionIds.includes(S1), false);
+	assert.equal((await w.engine.items()).length, 0);
+	const item = await w.engine.trashSession(S2);
+	assert.equal((await w.engine.items()).length, 1, 'plugin archives must not appear twice');
+	await w.engine.restore(item.itemId);
+	await w.engine.trashWorkspace('ws-a');
+	assert.equal((await w.engine.items()).length, 1, 'project members must not appear as separate native archives');
+});
+
+test('native archives stay outside TTL deletion and can be explicitly purged', async t => {
+	const w = await world(t);
+	await w.registry.archiveSession(S1);
+	const item = (await w.engine.items())[0];
+	w.settings.autoPurge = true;
+	w.advance(100);
+	assert.deepEqual((await w.engine.sweep()).purged, []);
+	assert.equal((await w.engine.items()).length, 1);
+	await w.engine.purge(item.itemId);
+	assert.equal((await w.engine.items()).length, 0);
+	assert.equal(await stat(join(w.sessionsRoot, projectKey(w.a), encodeSegment(S1))).then(() => true, () => false), false);
+	assert.ok(await stat(join(w.sessionsRoot, projectKey(w.a), encodeSegment(S2))));
 });
 
 test('pinned sessions stay pinned across trash/restore; archive drops pin per official rules', async t => {
@@ -241,4 +229,55 @@ test('sweep reports expired items; autoPurge purges them', async t => {
 	report = await w.engine.sweep();
 	assert.deepEqual(report.purged, [res.itemId]);
 	assert.equal((await w.engine.items()).length, 0);
+});
+
+test('all archive-pool mutations respect an unresolved move, including an empty workspace', async t => {
+	const w = await world(t);
+	const archived = await w.engine.trashSession(S1);
+	const empty = await w.registry.create(join(w.a, 'empty'), 'empty');
+	const blocked = new TrashEngine({ ...w.engine.deps, journal: async () => ({ sessionId: S2 }) });
+	await assert.rejects(blocked.trashWorkspace(empty.id), error => error.code === 'journal-active');
+	await assert.rejects(blocked.restore(archived.itemId), error => error.code === 'journal-active');
+});
+
+test('purge bookkeeping failure retains staged bytes and can be retried', async t => {
+	const w = await world(t);
+	const item = await w.engine.trashSession(S1);
+	const adapter = { ...w.engine.deps.adapter, purgeSession: async () => { throw new Error('registry unavailable'); } };
+	const engine = new TrashEngine({ ...w.engine.deps, adapter });
+	await assert.rejects(engine.purge(item.itemId), /registry unavailable/);
+	const pending = (await w.ledger.read()).items[0];
+	assert.ok((await readFile(join(pending.purge[0].staged, 'session.v4.jsonl.zstd'))).length > 0);
+	adapter.purgeSession = async () => {};
+	await engine.purge(item.itemId);
+	assert.equal((await engine.items()).length, 0);
+	assert.equal(await stat(pending.purge[0].staged).then(() => true, () => false), false);
+});
+
+test('a failed restore keeps its ledger entry for a later retry', async t => {
+	const w = await world(t);
+	const item = await w.engine.trashWorkspace('ws-a');
+	const adapter = { ...w.engine.deps.adapter, restoreWorkspace: async () => { throw new Error('attach rejected'); } };
+	const engine = new TrashEngine({ ...w.engine.deps, adapter });
+	await assert.rejects(engine.restore(item.itemId), /attach rejected/);
+	assert.equal((await engine.items()).length, 1);
+});
+
+test('archive is not applied if its recovery snapshot cannot be written', async t => {
+	const w = await world(t);
+	w.engine.ledger.write = async () => { throw new Error('disk full'); };
+	await assert.rejects(w.engine.trashSession(S1), /disk full/);
+	assert.equal(w.registry.archivedSessionIds.includes(S1), false);
+});
+
+test('native archive labels read the public title snapshot for placed and orphaned sessions', async () => {
+	const registry = fakeRegistry({ workspaces: [{ id: 'ws-a', path: '/a', title: 'A', sessionIds: [S1] }] });
+	const adapter = registryAdapter({ get: name => name === 'workspaceRegistry' ? registry : name === 'sessionQuery'
+		? { readTitle: async id => ({ title: id === S1 ? '已归档的会话' : '原项目已删除的会话', eventSeq: 7, source: { kind: 'user' } }) } : undefined });
+	const placed = await adapter.locateSession(S1);
+	assert.equal(placed.title, '已归档的会话');
+	assert.equal(placed.workspaceId, 'ws-a');
+	const orphaned = await adapter.locateSession(S2);
+	assert.equal(orphaned.title, '原项目已删除的会话');
+	assert.equal(orphaned.workspaceId, null);
 });

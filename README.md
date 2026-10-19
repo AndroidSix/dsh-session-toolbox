@@ -1,164 +1,123 @@
 # DSH Session Toolbox
 
-草稿保险箱 · 会话切换项目 · 回收站 —— 三个 DeepSeek Harness（DSH）会话管理增强，装进同一个插件。
+给 DeepSeek Harness（DSH）补上图片草稿备份、会话迁移、归档池、项目分组、队列引导与引用回复。
 
-创建于 2026-10-17 · MIT · 只作为第三方插件运行，**不修改官方安装包**。
+第三方插件 · MIT · 不修改 DSH 官方安装包 · 数据保存在本机。
 
-DSH 0.2.0-rc.2 的会话有三个「官方没做」的缺口：粘贴的截图草稿只活在内存里（切会话/刷新/重启即丢）；会话与项目在创建时绑死（聊到一半发现该在别的项目里继续，只能重开）；「删除」没有后悔药（归档不是回收站，删掉的项目注册表找不回标题与顺序）。Session Toolbox 用运行时探测 + 官方公开服务面补齐这三块，全部数据只存本机。
+[使用指南](docs/usage.md) · [图文导览视频](docs/media/session-toolbox-tour.mp4) · [更新日志](CHANGELOG.md) · [架构说明](docs/architecture.md)
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  DSH Web UI                                                │
-│  ├ 输入区徽标：🛟 草稿备份 N ── 图片草稿已镜像到 IndexedDB │
-│  ├ 会话右键：切换到其它项目… / 移入回收站                  │
-│  └ 插件页：工具箱（开关、迁移向导、回收站列表）            │
-├────────────────────────────────────────────────────────────┤
-│  dsh-session-toolbox (client bundle)                            │
-│        │  /.well-known/dsh-session-toolbox (loopback, 随机密钥) │
-│  dsh-session-toolbox (host plugin, cordis)                      │
-│    ├ draft manifest mirror  ~/.dsh/session-toolbox/             │
-│    ├ move journal + trash ledger                            │
-│    ├ 会话日志 zstd 帧手术（仅重写 header 帧）               │
-│    └ 官方服务：workspaceRegistry / sessionPersistence /     │
-│        sessions / webServer —— 全部 ctx.get 运行时探测      │
-└────────────────────────────────────────────────────────────┘
-```
+[加入 QQ 交流群](https://qm.qq.com/q/eQC7OQXQe4) · 群号 **1124103038**。插件页面顶部也有入口。
 
-## 功能
+![插件总览：顶部交流群入口、图片草稿备份、项目分组和迁移入口](docs/media/01-overview.png)
 
-### 1. 草稿保险箱（draft-vault）
+> 本文截图使用插件 **0.1.23**、DSH **0.2.1-rc.2** 界面，项目、会话、数量及路径均为虚构演示数据。账号、真实侧栏和本机目录未收入素材。视频是带中文说明的图文导览，不是连续操作录屏。
 
-粘贴 / 拖拽 / 文件选择器进入输入框的图片，会同步镜像一份到浏览器 IndexedDB（默认 7 天、200MB，超限按最旧清理）。切换会话、刷新页面、重启 DSH 后回到该会话，文本草稿（官方本就持久化）和图片草稿一起回来，走的是官方粘贴管线重建——删除、发送行为与手动重新粘贴完全等价。
+## 能做什么
 
-- 捕获在 capture 阶段只读旁观，从不拦截官方事件；
-- 恢复是向编辑器重放一个携带合成 `clipboardData` 的 `paste` 事件，官方处理器的 `preventDefault` 即接受回执；
-- 只在附件栏为空时重放，天然幂等；发送成功或手动删光后，备份随附件栏清空一并回收。
+| 功能 | 用法与结果 |
+| --- | --- |
+| 图片草稿保险箱 | 备份输入框里尚未发送的图片；切换会话后恢复，发送或删除后清理对应备份，避免旧图反复出现。 |
+| 会话切换项目 | 从会话菜单选择目标项目，保留历史消息，更新项目归属；完成后刷新列表和数量。 |
+| 归档池 | 同时查看 DSH 原生归档与工具箱归档，支持还原；彻底删除需要再次确认。 |
+| 项目分组 | 侧栏按“分组 → 项目 → 会话”显示并可折叠；项目菜单「移入分组…」可直接归组，也可拖到目标分组标题；「编辑项目」可修改分组、名称和路径。 |
+| 项目路径编辑 | 修改项目名称与目录，把该项目的全部已有会话迁到新路径，保留顺序、归档、置顶和分组。 |
+| 队列手动引导 | 在原生队列每条消息旁点击「引导」，选中的消息在下一可用步骤加入当前轮次，当前工具继续执行。 |
+| 引用回复 | 点击用户消息或助手回复旁的「引用回复」，在输入框上方预览、取消；保留已有草稿及附件，发送时附完整原文。 |
 
-### 2. 会话切换项目（session-move）
+**迁移前提：会话空闲且没有待发送的排队消息。** 在已验证的 DSH 0.2.1-rc.2 中，插件会完成该会话的写入和生命周期清理，取得写锁后迁移；已打开过的会话也可立即迁回，无需重启 DSH。宿主清理接口或布局不匹配时会拒绝写入。
 
-把任意**空闲**会话（完整历史）从项目 A 迁到项目 B：会话日志头部的 `cwd`、`~/.dsh/sessions/` 的物理目录、Workspace 归属账本、投影缓存与检索索引一次收敛，迁移后会话出现在 B 里，继续对话时工具、沙箱根、AGENTS.md 都按 B 生效。
+## 安装与更新
 
-- **只重写 zstd 首帧**：DSH 的会话日志是「header 帧 + 每个事件一帧」的多帧结构，迁移仅重编码 header 帧并原样搬运其余全部帧——200MB 的日志也是秒级，且事件字节逐帧保持不变；
-- **journal 崩溃安全**：备份→重写→发布→账本→缓存分步落账，任何一步被打断，重启后插件能检出并「完成」或「回滚」，回滚逐字节恢复原文件；
-- **体检 fail-closed**：忙会话、归档会话、重复布局、编码规则漂移（官方升级改了目录编码）都会明确拒绝，不动任何文件；
-- 已知语义：历史消息里写死的绝对路径仍指向 A（不重写过往内容）。
+兼容范围以 [package.json](package.json) 中的 `engines` 为准；当前声明支持 `^0.2.0-rc.2 || ^0.2.1-rc.2`，本机验收基线为 DSH 0.2.1-rc.2。Node 版本要求为 `^22.19.0 || >=24.0.0`。
 
-### 3. 回收站（trash-bin）
+**当前版本：0.1.24。** 在 DSH 插件安装页输入 `dsh-session-toolbox` 安装或更新，并核对安装页显示的版本；也可使用 GitHub Release 中的同版本安装包。
 
-- **删除会话** = 官方归档 + 记账。归档保留列表位置，取消归档原位恢复——这些官方语义直接复用；回收站只认「自己放进去的」，你手动归档的收藏区永远不会被误弹出来。还原时连 pin 状态一起恢复。
-- **删除项目** = 官方 delete（本就只删注册、保留全部会话日志）+ 标题/顺序快照，一键还原。
-- **彻底删除**：官方没有硬删命令，插件分两段执行（先原子移入 `pending-purge/`，清缓存/清账本，再落刀），中断可检出；共享附件库（内容寻址）不动。
-
-## 安装
-
-要求：DSH ≥ 0.2.0-rc.2（Node 22.19+ / 24 由 DSH 自带）。
-
-**方式一：npm（首选）**
-
-```bash
-npm install -g dsh-session-toolbox   # 或在 DSH 插件页输入包名安装
-```
-
-DSH 内：侧栏 → 插件 → 安装 → `dsh-session-toolbox`，启用后即时生效（HMR 可用时热载，否则重启一次）。
-
-**方式二：GitHub 链接**
-
-```
-https://github.com/AndroidSix/dsh-session-toolbox.git
-```
-
-`lib/` 随发布分支提交，DSH 直接加载构建产物，无需本地构建。
-
-**方式三：本地构建**
+### 当前源码：构建本地安装包
 
 ```bash
 git clone https://github.com/AndroidSix/dsh-session-toolbox.git
-cd dsh-session-toolbox && npm ci && npm run build
-# DSH 插件页 → 本地目录 → 选择该仓库目录
+cd dsh-session-toolbox
+npm ci
+npm run check
+npm pack --ignore-scripts
 ```
 
-安装后打开 侧栏 → 插件 → Session Toolbox 详情 即为工具箱页面；会话行的「⋯」菜单出现「切换到其它项目…」与「移入回收站」；输入区出现 🛟 徽标。
+在 DSH **侧栏 → 插件 → 安装** 中选择生成的 `dsh-session-toolbox-0.1.24.tgz` 并启用。后续版本的文件名随版本号变化。
 
-### 生效时机（需要重启吗）
+通过 Plugin Manager 安装、更新或启停，宿主支持 HMR 时可直接生效，无需主动重启 DSH。若安装结果明确报告 `restart-required`，再按提示重启；首次安装后菜单或页面没有出现，也可完全退出后重开一次。不要直接覆盖 DSH 的 `node_modules` 来代替插件管理器更新。
 
-**从插件页安装或启停，不需要重启。** DSH 桌面版默认启用 HMR：Plugin Manager 执行的操作会重新组合 profile，并在重新组合时替换磁盘上已变化的插件文件，结果即时生效。
+### 通过 npm 安装
 
-只有安装结果报告 `restart-required` 时才需要重启，`restartReason` 会说明原因：
+在 DSH 插件安装页输入 `dsh-session-toolbox`，安装并启用。
 
-| `restartReason` | 含义 |
-|---|---|
-| `no-hmr` | 当前环境没有 HMR（如 headless / SDK） |
-| `package-moved` | 包被解析到了别的目录 |
-| `host-module` | 新模块被宿主静态引用，只能下次启动加载 |
-| `unmanaged-plugin` | 插件不归 Plugin Manager 管理 |
+`npm install -g dsh-session-toolbox` 只用于安装命令行工具，不能代替在 DSH 内安装插件。
 
-**首次安装后如果界面没有变化，请完全退出 DSH 再打开一次。** 原因在宿主侧：客户端模块的包元数据（包括"这个包不是客户端包"的否定判定）按 Loader specifier 缓存到重启，且扫描是逐包增量的、没有全量重扫路径。如果 DSH 启动时本插件尚未装好或不完整，这个否定结论会一直保留到下次启动——代价是宿主半边可能已经能工作（`~/.dsh/session-toolbox/` 会被创建），但菜单项与面板不会出现。
+## 从这里开始
 
-同样地，**手工改动安装目录**（直接覆盖 `node_modules/dsh-session-toolbox`、手工编辑 `package.json` 的 `dsh.profile.bundles`）也不经过 Plugin Manager；这类改动后请直接重启。
+1. 打开 **侧栏 → 插件 → dsh-session-toolbox**，进入工具箱；标题下方可以加入 QQ 交流群。
+2. 查看「草稿保险箱」开关。默认保留 7 天、上限 200 MB；在会话中放入一张未发送的示例图片，切走再回来检查恢复。
+3. 点击「管理项目与分组」，创建分组并为项目选择归属；回到侧栏展开分组，项目显示在分组下；项目的「… → 编辑项目」可直接修改归属。
+4. 需要移动会话时，使用会话菜单「切换到其它项目…」；DSH 原生归档按钮产生的条目也能在工具箱归档池里找到。
 
-> 提示：`lib/` 已随包提交，GitHub 与 npm 安装都不需要本地构建。
+分步说明、限制和排错见 [使用指南](docs/usage.md)。
 
-## 数据放在哪
+## 项目分组与路径编辑
 
-| 内容 | 位置 |
-|---|---|
-| 图片草稿字节 | 浏览器 IndexedDB（`dsh-session-toolbox-vault`，仅 DSH Web 视图可见） |
-| 草稿清单镜像 / 设置 / 迁移 journal / 回收站账本 | `~/.dsh/session-toolbox/`（0600/0700，原子写 + 文件锁） |
-| 会话日志与项目账本 | 官方原位置（`~/.dsh/sessions/…`、`workspace.json`），插件仅在迁移/彻底删除时按其格式改写 |
+![管理项目与分组：两个分组、三个虚构项目及归组选择器](docs/media/02-project-groups.png)
 
-隐私：全部本机，无任何外部上传；loopback 端点仅接受 127.0.0.1/::1、校验 Host/Origin/Sec-Fetch-Site，写操作需每次 GET 下发的随机密钥（timing-safe 比对）。
+侧栏分组只改变显示范围，原生搜索仍搜索全部会话。每个项目可归入一个分组；删除分组后，其中的项目回到「未分组」。
 
-## 配置
+在管理页点击「编辑项目」可同时修改名称和路径。选择的是**已经存在的新代码目录**；保存时迁移全部已有会话，**代码文件本身不会搬动**，历史消息中的旧绝对路径也不会改写。中断后可点击「继续迁移」。
 
-`~/.dsh/session-toolbox/session-toolbox.json`（也可在工具箱页面里改，改文件需重启 DSH）：
+![编辑项目：将虚构项目目录从 /demo/projects/shop 改为 /demo/projects/shop-next](docs/media/03-project-path.png)
 
-```jsonc
-{
-  "version": 1,
-  "draftVault": { "enabled": true, "maxSizeBytes": 209715200, "ttlDays": 7 },
-  "trash": { "ttlDays": 30, "autoPurge": false },
-  "move": { "enabled": true }
-}
-```
+## 引用回复
 
-宿主插件入参（`cordis.patch.yml` 的 `options`）：`configFile`（数据目录覆盖）、`dshHome`（多实例/测试环境用）。
+消息操作栏中的回复箭头支持引用用户消息与助手最终答复。点击后在输入框上方显示引用预览，并在原生输入框中保留一个引用标记；可继续填写问题，或点「×」取消引用。再次引用另一条会替换当前引用，已有问题和附件会保留。
 
-## CLI
+![引用回复操作示意：选中消息、预览原文、填写补充问题](docs/media/07-quote-reply.svg)
 
-`dsh-session-toolbox` 命令面向「DSH 已停止」的离线维护与救援：
+引用随该会话的原生草稿保存，刷新或切回会话可以恢复。发送、排队或引导均沿用 DSH 原生行为；发送后引用原文会作为 Markdown 引用与新问题一起交给当前会话的模型。推理过程、工具结果及图片字节不作为文字引用复制。此图为虚构示意，现有视频仍演示 0.1.23 的功能。
+
+## 归档与还原
+
+![归档池：原生归档与工具箱归档同时展示，每条均有还原及彻底删除入口](docs/media/04-archive-pool.png)
+
+原生归档会显示「会话（原生归档）」。工具箱归档额外保存项目、顺序和置顶快照；原生归档无法补回过去的归档时间和置顶状态，也不参与插件的到期自动删除。
+
+「还原」让记录回到对应项目；「彻底删除」会删除日志等本地记录，无法通过归档池撤销。默认关闭自动清理。
+
+## 数据与隐私
+
+| 数据 | 保存位置 |
+| --- | --- |
+| 图片草稿字节 | 当前浏览器的 IndexedDB：`dsh-session-toolbox-vault` |
+| 设置、草稿清单、分组、迁移进度、归档账本 | `~/.dsh/session-toolbox/` |
+| 会话日志与工作区账本 | DSH 原有数据目录：`~/.dsh/sessions/`、`~/.dsh/storages/workspace.json` |
+
+插件不主动上传会话和草稿；本机管理接口校验来源与写入密钥。点击 QQ 或 GitHub 链接会打开对应外部站点。IndexedDB 随浏览器配置隔离，换浏览器或清除站点数据可能使图片备份不可用。
+
+反馈问题时只需附版本、复现步骤和脱敏报错；请勿直接公开完整会话、`status` 输出、凭据文件、写入密钥或带账号与路径的截图。本文公开素材的处理说明见 [素材说明](docs/media/README.md)。
+
+## 视频导览
+
+[![点击观看 50 秒图文导览：1080p，中文画面说明，使用虚构演示数据](docs/media/video-poster.png)](docs/media/session-toolbox-tour.mp4)
+
+[下载 / 播放 MP4](docs/media/session-toolbox-tour.mp4) · [字幕 VTT](docs/media/session-toolbox-tour.vtt)。视频无音轨，中文操作说明已放入画面；覆盖插件入口、分组、路径编辑、会话迁移、归档池与队列引导。若 Markdown 阅读器不能内嵌播放，可下载后观看。
+
+## 开发与维护
 
 ```bash
-dsh-session-toolbox status                                   # 当前设置/journal/回收站
-dsh-session-toolbox move --session <id> --to <绝对路径> [--create] [--dry-run]
-dsh-session-toolbox recover                                  # 检出中断迁移并前滚，失败则回滚
-dsh-session-toolbox rollback
-dsh-session-toolbox trash-purge --item <itemId>
+npm ci
+npm run check   # 构建、单元/集成测试、包形态检查
 ```
 
-CLI 直写 `~/.dsh/storages/workspace.json` 的离线镜像；日常操作请优先在 DSH 面板里做（宿主内存索引同步更准确）。执行 CLI move 前请完全退出 DSH（关窗口不等于退出），完成后重启。
+0.1.24 的检查包含 130 项测试；默认 128 项通过，另 2 项真实日志只读检查需显式启用。本机已启用并通过全部 130 项。测试覆盖截图恢复、原生归档、迁移中断恢复、项目分组、队列引导和引用回复等行为。
 
-## 工作原理（为什么敢动官方文件）
+更多配置、离线 CLI 与实现细节见 [架构说明](docs/architecture.md)，提交约定见 [贡献指南](CONTRIBUTING.md)。
 
-迁移的时序设计（§10 MN1）：备份 → 生成「头已改好」的新日志并 fsync → **旧目录整体退役** → 新目录发布 → 账本 detach/create/attach → 删投影缓存（官方缓存语义：过期记录只会多一次重放，绝不产生错误值）→ 检索索引自愈。全程任何时刻 `sessions/` 下同一个会话 id 至多出现在一个项目目录里，官方扫描看不到半迁移态；`attachSession` 的「header cwd 必须等于 workspace path」校验在发布之后天然成立。
+## 反馈与许可
 
-同进程内 header 缓存来不及刷新时（迁移刚完成立刻 attach 会撞上旧 cwd），账本步骤标记为 deferred、journal 保留为收敛标记——下次启动或点「完成」时冷缓存下重跑一遍即收敛。
+[QQ 交流群](https://qm.qq.com/q/eQC7OQXQe4)（**1124103038**） · [GitHub Issues](https://github.com/AndroidSix/dsh-session-toolbox/issues)
 
-## 开发与验证
-
-```bash
-npm ci && npm run check     # build + 58 项测试 + 包形态门禁
-```
-
-测试不需要 DSH 运行：会话日志用真实格式的**多帧带校验和 zstd** 合成夹具（`tests/fixtures/`），路径编码直接从官方 `dsh-session-persistence-jsonl` 逐字复刻并对样本自校验；`tests/kernel.test.mjs` 在**真实 cordis v4 内核**里加载插件走完整生命周期（provide/inject/effect/dispose）；`tests/draft-vault.test.mjs` 用「官方处理器契约双身」（读 `clipboardData.items`→`getAsFile`→`preventDefault`）验证合成粘贴的接受性。
-
-## 失效模式
-
-官方升级导致探测不到必需服务时：对应功能在面板里显示「不可用」并给出原因，其余功能与官方原生行为照常——插件不会让输入区或列表变白屏。卸载插件同样安全：已迁移的会话不依赖插件存在，回收站里未处理的项目降级为「官方归档/未注册」状态且数据无损。
-
-## 许可与免责声明
-
-MIT。与 DeepSeek 官方无关；不修改官方安装包，只读写 DSH 自己的用户数据目录。删除类操作请先阅读 [DISCLAIMER.md](DISCLAIMER.md)。上游设计参考与第三方代码声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-## 致谢与来源
-
-需求分析与官方实现证据整理自会话内调研（DSH 0.2.0-rc.2 安装包代码核对）。工程形态（cordis 双产物、版本化入口热替换、loopback 信任模型、发布流程）参考并致谢 [dsh-multi-router](https://github.com/AndroidSix/dsh-multi-router)，本项目与其同作者、同许可。
+MIT；与 DeepSeek 官方无隶属或背书关系。删除与迁移相关风险见 [免责声明](DISCLAIMER.md)，上游参考与代码来源见 [第三方声明](THIRD_PARTY_NOTICES.md)。工程形态参考同作者的 [dsh-multi-router](https://github.com/AndroidSix/dsh-multi-router)。

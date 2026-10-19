@@ -72,12 +72,48 @@ test('happy path: artifact relocates, header rewrites, ledger + caches updated, 
 	assert.equal((await w.journalDoc.read()).active, null);
 });
 
+test('an idle loaded session moves without a DSH restart using a scoped maintenance lease', async t => {
+	const w = await world(t);
+	let loaded = true, leases = 0;
+	w.capabilities.sessionLoaded = () => loaded;
+	w.capabilities.sessionMaintenance = async (sessionId, operation) => {
+		assert.equal(sessionId, ID);
+		leases++;
+		loaded = false; // host flushes and closes the writer before file placement changes
+		try { return await operation(); }
+		finally { loaded = true; } // subsequent opens use the migrated header
+	};
+	const before = await readFile(join(w.dir, 'session.v4.jsonl.zstd'));
+	await w.engine.move(await w.engine.preflight({ sessionId: ID, toCwd: w.toCwd }));
+	assert.equal(leases, 1);
+	assert.equal(loaded, true);
+	const after = await readFile(join(w.sessionsRoot, projectKey(w.toCwd), encodeSegment(ID), 'session.v4.jsonl.zstd'));
+	assert.equal(readHeader(after).header.cwd, w.toCwd);
+	assert.deepEqual(eventPayloads(after), eventPayloads(before));
+});
+
 test('a freshly-written (churning) log is refused to avoid orphaning appends', async t => {
 	const w = await world(t);
 	// Leave the log at now (default harness backdates it); re-touch to simulate an active appender.
 	const now = new Date();
 	await utimes(join(w.dir, 'session.v4.jsonl.zstd'), now, now);
 	await assert.rejects(w.engine.preflight({ sessionId: ID, toCwd: w.toCwd }), e => e.code === 'session-churning');
+});
+
+test('a session can move A → B → A immediately, including after the engine restarts', async t => {
+	const w = await world(t);
+	const original = await readFile(join(w.dir, 'session.v4.jsonl.zstd'));
+	let cwd = w.fromCwd;
+	w.capabilities.listHeaders = async () => [{ id: ID, cwd, version: 4 }, { id: OTHER, cwd: w.fromCwd, version: 4 }];
+	w.capabilities.moveLedger = async (_id, _from, to) => { cwd = to; };
+	await w.engine.move(await w.engine.preflight({ sessionId: ID, toCwd: w.toCwd }));
+	const restarted = new MoveEngine({ root: w.root, sessionsRoot: w.sessionsRoot, projcacheRoot: w.projcacheRoot, journal: w.journalDoc, capabilities: w.capabilities });
+	await restarted.move(await restarted.preflight({ sessionId: ID, toCwd: w.fromCwd }));
+	assert.equal(cwd, w.fromCwd);
+	assert.deepEqual(await readFile(join(w.dir, 'session.v4.jsonl.zstd')), original);
+	const now = new Date();
+	await utimes(join(w.dir, 'session.v4.jsonl.zstd'), now, now);
+	await assert.rejects(restarted.preflight({ sessionId: ID, toCwd: w.toCwd }), e => e.code === 'session-churning', 'external writes after a move must still block relocation');
 });
 
 test('preflight fails closed on busy / unknown / same-target / missing-target / bad id', async t => {
@@ -143,6 +179,7 @@ test('persistently failing ledger keeps the journal and backups alive for rollba
 	assert.notEqual((await w.journalDoc.read()).active, null);
 	assert.ok((await stat(join(w.root, 'backups', `${ID}.orig`))).isFile(), 'original backup kept while unresolved');
 	// rollback from the deferred state converges fully: artifact back, journal + backups gone
+	sick.caps.moveLedger = async () => {}; // source ledger repair is now required too
 	const rolled = await sick.rollback();
 	assert.equal(rolled.ok, true);
 	assert.ok((await stat(join(w.dir, 'session.v4.jsonl.zstd'))).isFile());
@@ -196,4 +233,77 @@ test('rollback before commit simply discards staged work', async t => {
 	assert.equal(rolled.ok, true);
 	assert.ok((await stat(join(w.dir, 'session.v4.jsonl.zstd'))).isFile());
 	assert.equal((await w.journalDoc.read()).active, null);
+});
+
+test('async idle check does not reject an idle session as busy', async t => {
+	const w = await world(t);
+	w.capabilities.sessionLive = async () => false;
+	assert.equal((await w.engine.preflight({ sessionId: ID, toCwd: w.toCwd })).sessionId, ID);
+});
+
+test('commit interruption before its journal mark rolls back placement', async t => {
+	const w = await world(t);
+	const plan = await w.engine.preflight({ sessionId: ID, toCwd: w.toCwd });
+	const original = await readFile(join(w.dir, 'session.v4.jsonl.zstd'));
+	const entry = { ...plan, done: [], backup: join(w.root, 'original'), stagedNew: join(w.root, 'new'), retired: join(w.root, 'retired') };
+	await w.engine.writeJournal(entry);
+	await w.engine.phaseBackup(entry);
+	await w.engine.phaseRewrite(entry);
+	await rename(entry.dir, entry.retired); // crash immediately after retiring source
+	await w.engine.rollback();
+	assert.deepEqual(await readFile(join(w.dir, 'session.v4.jsonl.zstd')), original);
+});
+
+test('rollback after publication retains session-local sidecar files', async t => {
+	const w = await world(t);
+	await writeFile(join(w.dir, 'notes.txt'), 'keep me');
+	const plan = await w.engine.preflight({ sessionId: ID, toCwd: w.toCwd });
+	const entry = { ...plan, done: [], backup: join(w.root, 'original'), stagedNew: join(w.root, 'new'), retired: join(w.root, 'retired') };
+	await w.engine.writeJournal(entry);
+	await w.engine.phaseBackup(entry);
+	await w.engine.phaseRewrite(entry);
+	await w.engine.phaseCommit(entry);
+	await w.engine.rollback();
+	assert.equal(await readFile(join(w.dir, 'notes.txt'), 'utf8'), 'keep me');
+});
+
+test('rollback repairs a partially detached deferred ledger and can retry after ledger failure', async t => {
+	const w = await world(t, { ledgerError: new Error('attach target rejected after detach') });
+	await w.engine.move(await w.engine.preflight({ sessionId: ID, toCwd: w.toCwd }));
+	let fail = true;
+	w.engine.caps.moveLedger = async (...args) => { w.ledgerCalls.push(args); if (fail) throw new Error('temporary registry error'); };
+	await assert.rejects(w.engine.rollback(), /temporary registry error/);
+	assert.equal(readHeader(await readFile(join(w.dir, 'session.v4.jsonl.zstd'))).header.cwd, w.fromCwd);
+	assert.notEqual(await w.engine.readJournal(), null);
+	fail = false;
+	await w.engine.rollback();
+	assert.deepEqual(w.ledgerCalls.at(-1), [ID, w.toCwd, w.fromCwd]);
+	assert.equal(await w.engine.readJournal(), null);
+});
+
+test('commit rejects a session log modified after backup', async t => {
+	const w = await world(t);
+	const plan = await w.engine.preflight({ sessionId: ID, toCwd: w.toCwd });
+	const entry = { ...plan, done: [], backup: join(w.root, 'orig'), stagedNew: join(w.root, 'new'), retired: join(w.root, 'retired') };
+	await w.engine.phaseBackup(entry);
+	await w.engine.phaseRewrite(entry);
+	await writeFile(join(w.dir, entry.logName), Buffer.concat([await readFile(entry.backup), Buffer.from('new append')]));
+	await assert.rejects(w.engine.phaseCommit(entry), e => e.code === 'source-changed');
+	assert.equal(await stat(w.dir).then(() => true), true);
+});
+
+test('online move takes its backup after the host drained final writes and locks the target before publishing',async t=>{
+ const w=await world(t);let drained;
+ w.capabilities.sessionMaintenance=async(id,operation)=>{
+  drained=sessionArtifact({type:'session',version:4,id:ID,createdAt:5,cwd:w.fromCwd,isSeeded:false},['{"seq":1,"type":"session/title","data":{"title":"final drained write"}}\n']);
+  await writeFile(join(w.dir,'session.v4.jsonl.zstd'),drained);
+  return operation({protectDirectory:async path=>{
+   assert.equal(await stat(join(path,'session.v4.jsonl.zstd')).then(()=>true,()=>false),false,'lock before publishing header');
+   await writeFile(join(path,'session.lock'),'kernel lease fixture');
+  }});
+ };
+ await w.engine.move(await w.engine.preflight({sessionId:ID,toCwd:w.toCwd}));
+ const target=join(w.sessionsRoot,projectKey(w.toCwd),encodeSegment(ID));
+ assert.deepEqual(eventPayloads(await readFile(join(target,'session.v4.jsonl.zstd'))),eventPayloads(drained));
+ assert.equal(await readFile(join(target,'session.lock'),'utf8'),'kernel lease fixture');
 });

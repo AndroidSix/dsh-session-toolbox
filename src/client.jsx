@@ -5,17 +5,21 @@
  * Every official surface is probed (`ctx.get?.`, guarded registrations); no
  * path here may take the native composer down with it (NFR3).
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState, useRef, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import pkg from '../package.json' with { type: 'json' };
 const pluginVersion = pkg.version;
+import { MenuItemButton, Modal, Button, Tooltip, IconFolderOpenOutlineRegular, IconArchiveOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives';
+import { REPLY_SOURCE, readReply, withReply, withoutReply, messageReply, replySource, installReplyNodes } from './reply.mjs';
 import { createVault } from './draft-vault.js';
+import { filterSidebar, installSidebar, mirroredSlot, sidebarLayout, installQueueSteering, protectProjectMenu } from './sidebar.mjs';
 
 export const name = 'dsh-session-toolbox-client';
 // `locale` is a real service, so it must be injected before use: cordis throws
 // on property access for a service that was never injected (it does not return
 // undefined), which is what surfaced as "cannot get property \"locale\" without
 // inject" on the plugin page.
-export const inject = ['slots', 'locale', 'sessions'];
+export const inject = ['slots', 'locale', 'sessions', 'conversation'];
 export const NS = 'dsh-session-toolbox';
 const ENDPOINT = `/.well-known/${NS}`;
 
@@ -33,10 +37,13 @@ function dispatchNotice(message) {
 
 let vault; // browser-side singleton (IndexedDB + host manifest)
 let directoryPicker; // ctx.get('directoryPicker') probed at apply time
+let conversationService;
+let replyAvailable = false;
 let sessionsService; // ctx.sessions — injected above, used by the manual refresh
 /** @type {{ running: boolean }} */
 export const refreshState = { running: false };
-const store = { state: null, error: '', listeners: new Set() };
+const store = { state: null, error: '', overlay: null, listeners: new Set() };
+function showOverlay(request) { store.overlay = request; for (const listener of store.listeners) listener(); }
 
 async function readResponse(res) {
 	let next;
@@ -49,23 +56,39 @@ async function readResponse(res) {
 
 /** GET the shared snapshot; also (re)binds the write key the host rotates. */
 export let sessionKey = '';
+let stateRequest = 0;
 export async function loadState() {
+	const request = ++stateRequest;
 	try {
 		const next = await readResponse(await fetch(ENDPOINT, { cache: 'no-store' }));
+		if (request !== stateRequest) return store.state;
 		store.state = next; store.error = ''; sessionKey = next.key ?? sessionKey;
-	} catch (error) { store.error = error.message; }
+		vault?.setLimits(next.settings?.draftVault ?? {});
+	} catch (error) { if (request !== stateRequest) return store.state; store.error = error.message; }
 	for (const listener of store.listeners) listener();
 	return store.state;
 }
 export async function callHost(input) {
+	if (input.type === 'vault.sweep') {
+		if (!vault) throw new Error('草稿保险箱尚未就绪');
+		const report = await vault.sweep();
+		await vault.syncHost();
+		return report;
+	}
 	if (!sessionKey) await loadState();
-	const res = await readResponse(await fetch(ENDPOINT, {
+	const post = () => fetch(ENDPOINT, {
 		method: 'POST', cache: 'no-store',
 		headers: { 'content-type': 'application/json', 'x-session-toolbox-key': sessionKey },
 		body: JSON.stringify(input),
-	}));
+	});
+	let response = await post();
+	if (response.status === 401) { await loadState(); response = await post(); }
+	const res = await readResponse(response);
 	sessionKey = res.key ?? sessionKey;
-	for (const listener of store.listeners) listener();
+	if (['move', 'move.complete', 'move.rollback', 'workspace.edit', 'workspace.complete', 'trash.session', 'trash.workspace', 'trash.restore', 'trash.purge'].includes(input.type)) {
+		try { await refreshSessionList(); }
+		catch (error) { dispatchNotice(`操作已完成，但列表刷新失败：${error.message}`); }
+	}
 	return res;
 }
 
@@ -92,29 +115,62 @@ export function apply(ctx) {
 	// Injected service: `refresh()` re-pulls the session list baseline from the
 	// host, which is what makes a moved/restored row appear without a restart.
 	sessionsService = ctx.sessions;
-	const vaultInstance = vault ??= createVault({
+ conversationService = ctx.conversation;
+	// Native archive/membership changes arrive on the public Workspace store.
+	// Keep counts and the archive pool current even when our own menu was not used.
+	const workspaceList = ctx.get?.('workspaces')?.list;
+	if (typeof workspaceList?.subscribe === 'function') ctx.effect(() => workspaceList.subscribe(() => { void loadState(); }));
+	const vaultInstance = vault = createVault({
 		endpoint: ENDPOINT,
+		getInput: sessionId => {
+			const binding = sessionsService?.binding?.(sessionId);
+			const conversation = ctx.conversation;
+			if (!binding || !conversation?.input?.for) return undefined;
+			return { store: conversation.input.for(binding.ctx).state, resolve: ids => conversation.resolveDraftAttachments(ids) };
+		},
 		log: (level, message) => { try { (level === 'error' ? console.warn : console.log)(`[${NS}]`, message); } catch {} },
 	});
 	void loadState();
 	const timer = setInterval(() => void loadState(), 30000);
-	ctx.effect?.(() => () => clearInterval(timer));
-	vaultInstance.on('change', () => void loadState());
-	void vaultInstance.start();
+	const onVaultChange = () => { void loadState(); };
+	vaultInstance.on('change', onVaultChange);
+	ctx.effect(() => () => { clearInterval(timer); vaultInstance.off('change', onVaultChange); vaultInstance.stop(); });
+	void vaultInstance.start().catch(error => sayRow(`草稿保险箱启动失败：${error.message}`));
 	// `locale` is injected above, so the service is guaranteed here; registering
 	// inside ctx.effect keeps the dictionaries disposable across hot reloads
 	// (same shape as the official client plugins).
 	ctx.effect(() => ctx.locale.register(NS, {
-		zh: { 'menu.move': '切换到其它项目…', 'menu.trash': '归档到归档池' },
-		en: { 'menu.move': 'Move to another project…', 'menu.trash': 'Archive' },
+		zh: { 'menu.move': '切换到其它项目…', 'menu.trash': '归档到归档池', ...workspaceChinese },
+		en: { 'menu.move': 'Move to another project…', 'menu.trash': 'Archive', ...workspaceEnglish },
 	}), 'session-toolbox: dictionaries');
 
+ if (typeof ctx.inject === 'function') ctx.inject(['inputTriggers'], scope => scope.effect(() => {
+  const triggers = scope.get?.('inputTriggers');
+  if (typeof triggers?.registerSource !== 'function') return;
+  const release = triggers.registerSource(replySource()); replyAvailable = true;
+  return () => { replyAvailable = false; release(); };
+ }));
+ installReplyNodes(ctx, (native, mirrors) => props => <ReplyMessage {...props} Native={native.component} mirrors={mirrors} toolboxT={ctx.locale.bind?.(NS)} />);
+ ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({ name: 'conversation.input.dock', id: 'session-toolbox-reply', order: 1, locale: NS }, ReplyPreview));
+
+	installSidebar(ctx, native => props => <GroupedSidebar {...props} toolboxT={ctx.locale.bind?.(NS)} Native={native.component} />);
+	installQueueSteering(ctx, native => props => <NativeSteerQueue {...props} Native={native.component} toolboxT={ctx.locale.bind?.(NS)} />);
+	ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+		name: 'conversation.input.dock', id: 'session-toolbox-steer', order: 15, locale: NS,
+		inject: sessionId => {
+			const scope = ctx.sessions?.scope?.(sessionId);
+			const conversation = scope?.get('conversation');
+			return { updateQueue: typeof conversation?.updateQueue === 'function' ? (id, action) => conversation.updateQueue(id, action) : undefined };
+		},
+	}, SteerQueueButton));
+
 	// Keyed slot (one occupant = package name): the plugin settings page.
-	ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({ name: 'plugins.bundle.config', key: NS }, KitPage));
+	ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({ name: 'plugins.bundle.config', key: NS, locale: NS }, KitPage));
 	// Session context menu: move + trash entries beside the official four.
 	ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({ name: 'sidebar.workspaces.session.menu.item', id: 'session-toolbox-move', order: 500, locale: NS }, MoveSessionMenuItem));
 	ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({ name: 'sidebar.workspaces.session.menu.item', id: 'session-toolbox-trash', order: 600, locale: NS }, TrashSessionMenuItem));
 	// Input dock badge (§4 FR5): how many image drafts are backed up here.
+	ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'session-toolbox-dialog', order: 500, locale: NS }, ToolboxOverlay));
 	ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({ name: 'conversation.input.dock', id: 'session-toolbox-vault-badge', order: 5, locale: NS }, VaultBadge));
 }
 
@@ -133,7 +189,8 @@ const styles = `
 .sk{--sk-accent:var(--dsw-alias-state-active-primary,#3a71db);--sk-border:var(--dsw-alias-border-l2,#444);--sk-bg:var(--dsw-alias-bg-layer-1,#202020);--sk-card:var(--dsw-alias-bg-module-platform,#282828);--sk-text:var(--dsw-alias-label-primary,#f4f4f4);--sk-muted:var(--dsw-alias-label-secondary,#b0b0b0);color:var(--sk-text);font:inherit;font-size:14px;line-height:1.6;max-width:1120px}
 .sk *{box-sizing:border-box}.sk h2,.sk h3,.sk p{margin:0}.sk h2{font-size:22px}.sk h3{font-size:16px}.sk .muted,.sk small{color:var(--sk-muted)}
 .sk .box{border:1px solid var(--sk-border);border-radius:12px;padding:18px 20px;background:var(--sk-card);display:flex;flex-direction:column;gap:14px}
-.sk .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.sk .stack{display:flex;flex-direction:column;gap:16px}
+.sk .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.sk.stack,.sk .stack{display:flex;flex-direction:column;gap:16px}
+.sk .community{padding:10px 14px;border:1px solid var(--sk-border);border-radius:8px;background:var(--sk-card)}.sk .community a{color:var(--sk-accent);font-weight:500;text-decoration:underline;text-underline-offset:3px}.sk .community a:hover{opacity:.8}.sk .community a:focus-visible{outline:2px solid var(--sk-accent);outline-offset:4px;border-radius:2px}
 .sk button,.sk input,.sk select{font:inherit;color:inherit;border:1px solid var(--sk-border);border-radius:8px;background:var(--sk-bg);min-height:36px;padding:7px 12px}
 .sk button{cursor:pointer}.sk button:hover{background:var(--sk-card)}.sk button:disabled{opacity:.45;cursor:default}
 .sk button.primary{background:var(--sk-accent);color:#fff;border-color:transparent}
@@ -141,13 +198,11 @@ const styles = `
 .sk .error{color:var(--dsw-alias-state-error-primary,#ef9393)}.sk .good{color:var(--dsw-alias-state-success-primary,#77ca9d)}
 .sk .pill{border:1px solid var(--sk-border);border-radius:100px;padding:2px 10px;font-size:12px;background:var(--sk-bg);display:inline-block}
 .sk .mono{font:12px ui-monospace,monospace;overflow-wrap:anywhere}
-.sk dialog{color:var(--sk-text);background:var(--sk-bg);border:1px solid var(--sk-border);border-radius:14px;width:min(560px,calc(100vw - 32px));padding:0}
-.sk dialog::backdrop{background:#0007}.sk .modal-head{padding:16px 20px;border-bottom:1px solid var(--sk-border);display:flex;justify-content:space-between;align-items:center}
-.sk .modal-body{padding:20px;display:flex;flex-direction:column;gap:14px}
 .sk input.grow{flex:1;min-width:0}
+.sk-dialog-body{max-height:calc(100dvh - 160px);overflow-y:auto;overscroll-behavior:contain;padding-right:4px}.sk-dialog-body>*{flex-shrink:0}
 `;
 
-export function KitPage() {
+export function KitPage({ t } = {}) {
 	const { state, error } = useKit();
 	const [busy, setBusy] = useState(false);
 	const [refreshing, setRefreshing] = useState(false);
@@ -167,14 +222,18 @@ export function KitPage() {
 	}, []);
 	const act = async (input, ok) => {
 		setBusy(true);
-		try { const result = await callHost(input); if (ok) say(ok); await loadState(); setBusy(false); return result; }
+		try { const result = await callHost(input); if (result.deferred) say(result.note ?? '迁移账本尚待完成，请在恢复区继续处理'); else if (ok) say(ok); await loadState(); setBusy(false); return result; }
 		catch (err) { say(`失败：${err.message}`); setBusy(false); throw err; }
 	};
 	const settings = state?.settings;
 	return (
-		<div className="sk">
+		<div className="sk stack">
 			<style>{styles}</style>
 			<h2>会话工具箱</h2>
+			<div className="row community">
+				<a href="https://qm.qq.com/q/eQC7OQXQe4" target="_blank" rel="noopener noreferrer">{text(t, 'community.join')}</a>
+				<span className="muted">{text(t, 'community.name')} · {text(t, 'community.number')} <strong>1124103038</strong></span>
+			</div>
 			<p className="muted">草稿保险箱 · 会话切换项目 · 归档池 — v{pluginVersion}。数据仅存本机（浏览器 IndexedDB + ~/.dsh/session-toolbox/）。</p>
 			<div className="row">
 				<button disabled={busy || refreshing} onClick={() => {
@@ -194,18 +253,19 @@ export function KitPage() {
 					<>
 						<div className="row">
 							<label className="row"><input type="checkbox" checked={settings.draftVault?.enabled !== false} disabled={busy}
-								onChange={e => void act({ type: 'settings.update', patch: { draftVault: { ...settings.draftVault, enabled: e.target.checked } } }, e.target.checked ? '已启用草稿保险箱' : '已停用草稿保险箱（浏览器侧即时生效）').catch(() => {})} /> 启用</label>
+								onChange={e => void act({ type: 'settings.update', patch: { draftVault: { ...settings.draftVault, enabled: e.target.checked } } }, e.target.checked ? '已启用草稿保险箱' : '已停用草稿保险箱（保留已有备份）').catch(() => {})} /> 启用</label>
 							<span className="pill">容量 {Math.round((settings.draftVault?.maxSizeBytes ?? 0) / 1048576)} MB</span>
 							<span className="pill">保留 {settings.draftVault?.ttlDays ?? 7} 天</span>
 						</div>
 						<div className="row">
 							<span className="muted">清单：已备份 {state?.vault?.records ?? 0} 项 · 约 {fmtBytes(state?.vault?.bytes ?? 0)}（图片字节在 IndexedDB，超出上限按最旧清理，事件会显示在这里）</span>
 						</div>
-						{state?.vault?.notice ? <p className="muted">{state.vault.notice}</p> : null}
+						{vault?.lastNotice ? <p className="muted">{vault.lastNotice}</p> : null}
 						<div className="row"><button disabled={busy} onClick={() => void act({ type: 'vault.sweep' }, '已按 TTL/容量清理').catch(() => {})}>立即整理</button></div>
 					</>
 				) : <p className="muted">等待后台数据…</p>}
 			</section>
+			<WorkspaceSection state={state} t={t} />
 			<MoveSection act={act} busy={busy} say={say} state={state} />
 			<TrashSection act={act} busy={busy} say={say} state={state} />
 		</div>
@@ -266,16 +326,15 @@ function MoveSection({ act, busy, say, state }) {
 						: <><strong>{fromProject.title}</strong>{' '}<span className="mono">{fromProject.path}</span></>}
 				</p>
 			)}
-			<label className="row"><input type="checkbox" checked={createTarget} onChange={e => setCreateTarget(e.target.checked)} /> 目标不存在时创建</label>
+			<label className="row"><input type="checkbox" checked={createTarget} onChange={e => { setCreateTarget(e.target.checked); setPlan(null); }} /> 目标不存在时创建</label>
 			<div className="row">
-				<button disabled={busy || !sessionId || !toCwd} onClick={() => { setBusy(true); setPlan(null); void callHost({ type: 'preflight', sessionId, toCwd, createTarget })
-					.then(result => setPlan(result)).catch(error => say(`体检失败：${error.message}`)).finally(() => setBusy(false)); }}>体检</button>
-				<button className="primary" disabled={busy || plan?.toProject === undefined} onClick={() => void act({ type: 'move', sessionId, toCwd, createTarget }, '迁移完成；其它窗口请重开该会话').catch(() => {})}>迁移</button>
+				<button disabled={busy || !sessionId || !toCwd} onClick={() => { setPlan(null); void act({ type: 'preflight', sessionId, toCwd, createTarget }).then(setPlan).catch(() => {}); }}>体检</button>
+				<button className="primary" disabled={busy || plan?.toProject === undefined} onClick={() => void act({ type: 'move', sessionId, toCwd, createTarget }, '迁移完成，已刷新会话列表').catch(() => {})}>迁移</button>
 			</div>
 			{plan?.toProject && (
 				<pre className="mono muted" style={{ whiteSpace: 'pre-wrap' }}>{JSON.stringify({ 从: plan.fromCwd, 到: plan.toCwd, 原目录: plan.fromProject, 新目录: plan.toProject, 日志文件: plan.logName }, null, 2)}</pre>
 			)}
-			<p className="muted">只改 DSH 内部归属与会话头；历史不变，旧消息中的绝对路径仍指向原项目（已知语义）。迁移前请关闭该会话。</p>
+			<p className="muted">只改 DSH 内部归属与会话头；历史不变，旧消息中的绝对路径仍指向原项目（已知语义）。会话空闲且无排队消息时，自动释放写入句柄后迁移，无需重启 DSH。</p>
 		</section>
 	);
 }
@@ -286,7 +345,7 @@ function TrashSection({ act, busy, say, state }) {
 		<section className="box">
 			<h3>归档池</h3>
 			<p className="muted">
-				DSH 没有独立的「删除会话」——会话只能<b>归档</b>。这里就是官方的归档池：入池的会话仍然是官方归档状态（侧栏的归档视图里同样能看到），本插件额外记录了它入池时的<b>项目归属、列表位置与置顶状态</b>，因此可以一键还原到原位。
+				这里同时显示 DSH 原生归档和通过工具箱归档的会话。工具箱归档额外保存<b>项目归属、列表位置与置顶状态</b>；原生归档按当前项目归属还原，原始归档时间和归档前置顶状态不可追溯，也不参与到期自动删除。
 				归档项目则保留全部会话日志，只移除项目注册表项。彻底删除会先移入暂存目录再清理，中断可用 CLI 检出。
 			</p>
 			{items.length === 0 ? <p className="muted">（空）</p> : (
@@ -294,13 +353,13 @@ function TrashSection({ act, busy, say, state }) {
 					<thead><tr><th>类型</th><th>对象</th><th>标题 / 路径</th><th>入池时间</th><th /></tr></thead>
 					<tbody>{items.map(item => (
 						<tr key={item.itemId}>
-							<td>{item.kind === 'session' ? '会话' : '项目'}</td>
+							<td>{item.source === 'native' ? '会话（原生归档）' : item.kind === 'session' ? '会话' : '项目'}</td>
 							<td className="mono">{shortId(item.targetId)}</td>
 							<td className="mono">{item.kind === 'session' ? item.snapshot.title || '（无标题）' : item.snapshot.path}</td>
-							<td>{new Date(item.trashedAt).toLocaleString('zh-CN', { hour12: false })}</td>
+							<td>{item.trashedAt ? new Date(item.trashedAt).toLocaleString('zh-CN', { hour12: false }) : '未知（原生归档）'}</td>
 							<td className="row">
 								<button disabled={busy} onClick={() => void act({ type: 'trash.restore', itemId: item.itemId }, '已还原到原位').catch(() => {})}>还原</button>
-								<button disabled={busy} onClick={() => void act({ type: 'trash.purge', itemId: item.itemId }, '已彻底删除').catch(() => {})}>彻底删除</button>
+								<button disabled={busy} onClick={() => showOverlay({ kind: 'purge', itemId: item.itemId, title: item.snapshot.title || item.snapshot.path || item.targetId })}>彻底删除</button>
 							</td>
 						</tr>))}
 					</tbody>
@@ -319,47 +378,67 @@ const shortId = id => String(id).length > 18 ? `${String(id).slice(0, 8)}…${St
 const fmtBytes = n => n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`;
 
 /** Menu entry: move this session to another project (§10 MR6). */
-export function MoveSessionMenuItem({ sessionId, t }) {
-	const [open, setOpen] = useState(false);
-	return (
-		<>
-			<button role="menuitem" onClick={() => setOpen(true)} style={menuItemStyle}>{t ? t('menu.move') : '切换到其它项目…'}</button>
-			{open ? <MoveDialog sessionId={sessionId} close={() => setOpen(false)} /> : null}
-		</>
-	);
+export function MoveSessionMenuItem({ sessionId, useMenuOpenState, t }) {
+	const [, setMenuOpen] = useMenuOpenState?.() ?? [false, () => {}];
+	return <MenuItemButton separatorBefore icon={<IconFolderOpenOutlineRegular size={14} />} onSelect={() => {
+		setMenuOpen(false);
+		showOverlay({ kind: 'move', sessionId });
+	}}>{t ? t('menu.move') : '切换到其它项目…'}</MenuItemButton>;
 }
 
-export function TrashSessionMenuItem({ sessionId, t }) {
-	const [confirm, setConfirm] = useState(false);
-	const [busy, setBusy] = useState(false);
-	if (confirm) {
-		return <button role="menuitem" disabled={busy} style={menuItemStyle} onClick={async () => {
-			setBusy(true);
-			try { await callHost({ type: 'trash.session', sessionId }); setConfirm(false); }
-			catch { sayRow(`回收失败`); setConfirm(false); }
-			setBusy(false);
-		}}>确认归档？（会话将进入归档池）</button>;
-	}
-	return <button role="menuitem" style={menuItemStyle} onClick={() => setConfirm(true)}>{t ? t('menu.trash') : '归档到归档池'}</button>;
+export function TrashSessionMenuItem({ sessionId, displayTitle, useMenuOpenState, t }) {
+	const [, setMenuOpen] = useMenuOpenState?.() ?? [false, () => {}];
+	return <MenuItemButton icon={<IconArchiveOutlineRegular size={14} />} onSelect={() => {
+		setMenuOpen(false);
+		showOverlay({ kind: 'archive', sessionId, title: displayTitle || sessionId });
+	}}>{t ? t('menu.trash') : '归档到归档池'}</MenuItemButton>;
 }
 function sayRow(message) { store.error = message; for (const listener of store.listeners) listener(); }
 
-const menuItemStyle = { background: 'transparent', border: 'none', color: 'inherit', font: 'inherit', padding: '6px 10px', textAlign: 'left', cursor: 'pointer', width: '100%' };
+/** Keep dialogs in the shell: menu rows are unmounted as soon as the menu closes. */
+export function ToolboxOverlay({ t } = {}) {
+	const { overlay } = useKit();
+	if (!overlay) return null;
+	const close = () => showOverlay(null);
+	if (overlay.kind === 'groups') return <GroupsDialog close={close} t={t} />;
+	if (overlay.kind === 'group-move') return <MoveGroupDialog key={overlay.workspaceId} workspaceId={overlay.workspaceId} close={close} t={t} />;
+	if (overlay.kind === 'workspace') return <WorkspaceDialog key={overlay.workspaceId} workspaceId={overlay.workspaceId} close={close} t={t} />;
+	if (overlay.kind === 'move') return <MoveDialog key={overlay.sessionId} sessionId={overlay.sessionId} close={close} />;
+	return <TrashDialog key={overlay.itemId || overlay.sessionId} request={overlay} close={close} />;
+}
+
+function TrashDialog({ request, close }) {
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState('');
+	const purge = request.kind === 'purge';
+	const dismiss = () => { if (!busy) close(); };
+	const submit = async () => {
+		setBusy(true); setError('');
+		try {
+			await callHost(purge ? { type: 'trash.purge', itemId: request.itemId } : { type: 'trash.session', sessionId: request.sessionId });
+			await loadState();
+			close();
+		} catch (reason) { setError(reason.message); setBusy(false); }
+	};
+	return <Modal open onClose={dismiss} closeLabel="关闭" title={purge ? '彻底删除' : '归档到归档池'}
+		description={purge ? `将永久删除「${request.title}」的会话记录，此操作无法还原。` : `归档「${request.title}」后，可在工具箱归档池中还原。`}
+		footer={<><Button variant="outline" disabled={busy} onClick={dismiss}>取消</Button><Button variant="outline" disabled={busy} onClick={() => void submit()}>{busy ? '处理中…' : purge ? '确认彻底删除' : '确认归档'}</Button></>}>
+		{error ? <p role="alert">{error}</p> : null}
+	</Modal>;
+}
 
 export function MoveDialog({ sessionId, close }) {
-	const ref = useRef(null);
 	const [toCwd, setToCwd] = useState('');
 	const [createTarget, setCreateTarget] = useState(false);
 	const [error, setError] = useState('');
 	const [busy, setBusy] = useState(false);
 	// Same project picker as the panel: the dialog is what the context menu opens,
 	// so it must not fall back to typing a path by hand.
-	const [projects, setProjects] = useState([]);
+	const { state } = useKit();
+	const projects = state?.projects ?? [];
 	const [fromProject, setFromProject] = useState(null);
-	useEffect(() => { const dialog = ref.current; dialog?.showModal(); return () => { try { dialog?.close(); } catch {} }; }, []);
 	useEffect(() => {
 		let alive = true;
-		void loadState().then(next => { if (alive) setProjects(next?.projects ?? []); }).catch(() => {});
 		void callHost({ type: 'project.of', sessionId })
 			.then(result => { if (alive) setFromProject(result?.project ?? null); })
 			.catch(() => { if (alive) setFromProject(null); });
@@ -374,41 +453,30 @@ export function MoveDialog({ sessionId, close }) {
 			// that plainly instead of closing on a silent success.
 			close();
 			dispatchNotice(result?.deferred
-				? '文件已迁移；DSH 账本将在下次启动时收敛，刷新侧栏后可见'
-				: '迁移完成；刷新侧栏后该会话就会出现在目标项目下');
+				? '文件已迁移，但项目账本尚未完成；请在工具箱点击完成或回滚'
+				: '迁移完成，已刷新会话列表');
 		}
 		catch (err) { setError(err.message); setBusy(false); }
 	};
 	const valid = /^\/|^[A-Za-z]:[\\/]/.test(toCwd);
 	return (
-		<div className="sk"><style>{styles}</style>
-			<dialog ref={ref} onCancel={e => { e.preventDefault(); if (!busy) close(); }}>
-				<div className="modal-head"><strong>会话切换到其它项目</strong><button onClick={close} disabled={busy}>关闭</button></div>
-				<div className="modal-body">
-					<p className="muted mono">{sessionId}</p>
-					<p className="muted">
-						当前项目：{fromProject === null ? '（未找到，或不属于任何项目）'
-						: <><strong>{fromProject.title}</strong>{' '}<span className="mono">{fromProject.path}</span></>}
-					</p>
-					{projects.length > 0 && (
-						<select className="grow" value={projects.some(p => p.path === toCwd) ? toCwd : ''}
-							onChange={e => setToCwd(e.target.value)}>
-							<option value="">选择目标项目…</option>
-							{projects.map(project => (
-								<option key={project.id} value={project.path} disabled={fromProject?.path === project.path}>
-									{project.title}（{project.sessions} 个会话）{fromProject?.path === project.path ? ' — 当前项目' : ''}
-								</option>
-							))}
-						</select>
-					)}
-					<input className="grow mono" placeholder="目标项目绝对路径" value={toCwd} onChange={e => setToCwd(e.target.value)} />
-					<label className="row"><input type="checkbox" checked={createTarget} onChange={e => setCreateTarget(e.target.checked)} /> 目录不存在时创建</label>
-					{error ? <p className="error">{error}</p> : null}
-					<div className="row"><button className="primary" disabled={busy || !valid} onClick={() => void submit()}>体检并迁移</button>
-						<span className="muted">会话需空闲；迁移在后台离线完成。</span></div>
-				</div>
-			</dialog>
-		</div>
+		<Modal open onClose={() => { if (!busy) close(); }} closeLabel="关闭" title="会话切换到其它项目"
+			footer={<><Button variant="outline" disabled={busy} onClick={close}>取消</Button><Button variant="primary" disabled={busy || !valid || fromProject?.path === toCwd} onClick={() => void submit()}>{busy ? '迁移中…' : '体检并迁移'}</Button></>}>
+			<div className="sk stack"><style>{styles}</style>
+				<p className="muted mono">{sessionId}</p>
+				<p className="muted">当前项目：{fromProject ? <><strong>{fromProject.title}</strong> <span className="mono">{fromProject.path}</span></> : '（未找到项目）'}</p>
+				{projects.length > 0 && <label className="stack">目标项目
+					<select value={projects.some(p => p.path === toCwd) ? toCwd : ''} onChange={e => setToCwd(e.target.value)} disabled={busy}>
+						<option value="">选择目标项目…</option>
+						{projects.map(project => <option key={project.id} value={project.path} disabled={fromProject?.path === project.path}>{project.title}（{project.sessions} 个会话）{fromProject?.path === project.path ? ' — 当前项目' : ''}</option>)}
+					</select>
+				</label>}
+				<label className="stack">目标目录<input className="mono" value={toCwd} onChange={e => setToCwd(e.target.value)} disabled={busy} placeholder="目标项目绝对路径" /></label>
+				<label className="row"><input type="checkbox" checked={createTarget} onChange={e => setCreateTarget(e.target.checked)} disabled={busy} /> 目录不存在时创建</label>
+				{error ? <p className="error" role="alert">{error}</p> : null}
+				<p className="muted">会话需空闲且没有排队消息。插件会完成写入并释放句柄后迁移，无需重启 DSH。</p>
+			</div>
+		</Modal>
 	);
 }
 
@@ -433,4 +501,311 @@ export function VaultBadge({ sessionId }) {
 	}, [sessionId]);
 	if (count === 0) return null; // the notice channel serves the panel; the badge anchors per-session counts
 	return <span className="sk"><span className="pill" title={`本会话有 ${count} 张图片草稿已备份（切换会话/刷新/重启后可恢复）${notice ? `｜最近：${notice}` : ''}`}>🛟 草稿备份 {count}</span></span>;
+}
+
+const workspaceChinese = {
+ 'reply.action': '引用回复', 'reply.cancel': '取消引用', 'reply.user': '用户', 'reply.assistant': '助手', 'reply.unavailable': '当前输入框暂不支持引用回复',
+ 'community.join': '加入 QQ 交流群 ↗', 'community.name': 'AndroidSix 的开源项目交流群', 'community.number': '群号',
+ 'groups.title': '项目分组', 'groups.all': '全部项目', 'groups.none': '未分组', 'groups.manage': '管理项目与分组',
+ 'groups.move': '移入分组…', 'groups.drop': '可将项目拖到分组标题，或从项目菜单选择“移入分组”。', 'groups.name': '分组名称', 'groups.create': '新建分组', 'groups.rename': '重命名', 'groups.delete': '删除分组',
+ 'groups.help': '每个项目可归入一个分组；删除分组会将其中项目恢复为未分组。侧栏按“分组 → 项目 → 会话”展开，原生搜索仍搜索全部会话。',
+ 'project.groupHelp': '分组选择后立即保存；名称和路径点击“保存”后生效。', 'project.editGroup': '编辑项目', 'queue.rowSteer': '引导', 'project.edit': '编辑项目', 'project.title': '项目名称', 'project.path': '项目目录', 'project.browse': '浏览…',
+ 'project.help': '选择已有代码目录。保存后，将该项目的全部已有会话一起迁入新路径，保留顺序、归档及置顶状态；代码文件不会搬动，历史消息中的路径保持原样。会话必须空闲且没有排队消息。',
+ 'project.resume': '继续迁移', 'project.pending': '项目迁移尚未完成，请继续迁移。',
+ 'common.save': '保存', 'common.cancel': '取消', 'common.close': '关闭', 'common.busy': '处理中…', 'common.loading': '正在加载项目…',
+ 'queue.steer': '引导下一条', 'queue.help': '将队列第一条交给当前运行轮次，在下一可用步骤接收，当前工具继续执行。也可在原生队列每条消息旁点击“引导”。',
+};
+const workspaceEnglish = {
+ 'reply.action': 'Quote reply', 'reply.cancel': 'Cancel quote', 'reply.user': 'User', 'reply.assistant': 'Assistant', 'reply.unavailable': 'Quote reply is unavailable for this composer',
+ 'community.join': 'Join the QQ community ↗', 'community.name': 'AndroidSix open-source projects', 'community.number': 'Group',
+ 'groups.title': 'Project groups', 'groups.all': 'All projects', 'groups.none': 'Ungrouped', 'groups.manage': 'Manage projects and groups',
+ 'groups.move': 'Move to group…', 'groups.drop': 'Drag a project onto a group heading, or choose Move to group from its menu.', 'groups.name': 'Group name', 'groups.create': 'New group', 'groups.rename': 'Rename', 'groups.delete': 'Delete group',
+ 'groups.help': 'Each project belongs to one group. Deleting a group leaves its projects ungrouped. The sidebar nests projects under collapsible groups; native search still searches all chats.',
+ 'project.groupHelp': 'Group changes save immediately. Name and directory changes apply when you click Save.', 'project.editGroup': 'Edit project', 'queue.rowSteer': 'Steer', 'project.edit': 'Edit project', 'project.title': 'Project name', 'project.path': 'Project directory', 'project.browse': 'Browse…',
+ 'project.help': 'Choose an existing code directory. Saving moves all existing chats to the new path and keeps their order, archive and pin state. Code files and paths in past messages stay as they are. Chats must be idle with no queued messages; the host releases their writer before migration.',
+ 'project.resume': 'Resume migration', 'project.pending': 'Project migration is incomplete. Resume it to continue.',
+ 'common.save': 'Save', 'common.cancel': 'Cancel', 'common.close': 'Close', 'common.busy': 'Working…', 'common.loading': 'Loading projects…',
+ 'queue.steer': 'Steer next message', 'queue.help': 'Send the first queued message into the running turn at its next available step. Current tools keep running. Use the native queue to steer another message.',
+};
+const text = (t, key) => t ? t(key) : workspaceChinese[key];
+
+/** Keep native rows mounted. Portals add group headings and menu entries to public DOM seats. */
+export function GroupedSidebar({ Native, ...props }) {
+ const { state } = useKit();
+ const root = useRef(null), projectMenu = useRef(null);
+ const [list, setList] = useState(null), [menu, setMenu] = useState(null), [collapsed, setCollapsed] = useState({});
+ const [dropGroup, setDropGroup] = useState(null), [groupError, setGroupError] = useState('');
+ const movingGroup = useRef(false);
+ const groups = state?.groups ?? [];
+ const workspaces = props.useWorkspaces(value => value);
+ const view = props.useStore(value => value.groupBy);
+ const grouped = props.wide && view !== 'flat' && groups.length > 0;
+ const layout = useMemo(() => sidebarLayout(workspaces.items, groups), [workspaces, groups]);
+ useEffect(() => {
+  const discover = () => {
+   const row = root.current?.querySelector('[data-row-key^="workspace:"]');
+   setList(row?.closest('[role="tree"]') ?? null);
+   const seat = projectMenu.current;
+   const nativeMenu = seat?.button?.isConnected && [...document.querySelectorAll('[role="menu"]')].find(element => element.textContent.includes(props.t('delete.workspace')));
+   const visible = nativeMenu?.querySelector('[role="presentation"]');
+   setMenu(previous => {
+    if (visible) return previous?.target === visible && previous.workspaceId === seat.workspaceId ? previous : { ...seat, target: visible };
+    return null;
+   });
+  };
+  const observer = new MutationObserver(discover);
+  observer.observe(document.body, { childList: true, subtree: true }); discover();
+  return () => observer.disconnect();
+ }, []);
+ const capture = event => {
+  const button = event.target.closest?.('button');
+  const row = button?.closest('[data-row-key^="workspace:"]');
+  if (!row) return;
+  const workspaceId = row.getAttribute('data-row-key').slice('workspace:'.length);
+  const workspace = workspaces.items.find(item => item.workspaceId === workspaceId);
+  if (workspace && button.getAttribute('aria-label') === props.t('actions.workspace.aria', { name: row.textContent.trim() })) projectMenu.current = { workspaceId, button };
+ };
+ useEffect(() => {
+  if (!menu) return;
+  const element = menu.target.closest('[role="menu"]');
+  if (!element) return;
+  element.setAttribute('data-toolbox-project-menu', '');
+  const release = protectProjectMenu(document, menu.button, element, () => { if (element.isConnected) menu.button.click(); });
+  return () => { release(); element.removeAttribute('data-toolbox-project-menu'); };
+ }, [menu]);
+ const moveGroup = async (workspaceId, groupId) => {
+  if (movingGroup.current || state?.workspaceMove || !workspaces.items.some(row => row.workspaceId === workspaceId)) return;
+  movingGroup.current = true; setGroupError('');
+  try { await callHost({ type: 'group.assign', workspaceId, groupId: groupId === 'ungrouped' ? '' : groupId }); await loadState(); }
+  catch (error) { setGroupError(error.message); }
+  finally { movingGroup.current = false; setDropGroup(null); }
+ };
+ const openEditor = (kind = 'workspace') => {
+  const id = menu.workspaceId;
+  menu.button.click(); projectMenu.current = null; setMenu(null);
+  showOverlay({ kind, workspaceId: id });
+ };
+ const projectedWorkspaces = useMemo(() => grouped ? { ...workspaces, items: layout.map(row => row.workspace) } : workspaces, [grouped, workspaces, layout]);
+ const nativeProps = { ...props,
+  useWorkspaces: selector => selector(projectedWorkspaces),
+  useStore: selector => props.useStore(value => selector(grouped && value.groupBy === 'workspace-tree' ? { ...value, groupBy: 'workspace' } : value)),
+  renderSlot: (name, ...args) => props.renderSlot(mirroredSlot(name), ...args),
+ };
+ const headings = [...groups, { id: 'ungrouped', title: text(props.toolboxT, 'groups.none') }];
+ const rules = grouped && list ? layout.map(({ workspace, group }) => {
+  const selector = `.sk-sidebar [role="tree"]>div:has([data-row-key=${JSON.stringify('workspace:' + workspace.workspaceId)}])`;
+  return `${selector}{order:${group * 2 + 1};padding-left:12px;${collapsed[headings[group].id] ? 'display:none!important;' : ''}}`;
+ }).join('') : '';
+ return <div className="sk-sidebar" ref={root} onClickCapture={capture} onDragStartCapture={event => {
+   const row = event.target.closest?.('[data-row-key^="workspace:"]');
+   const id = row?.getAttribute('data-row-key').slice('workspace:'.length);
+   if (workspaces.items.some(item => item.workspaceId === id)) event.dataTransfer.setData('application/x-dsh-toolbox-workspace', id);
+  }} onDragEndCapture={() => setDropGroup(null)}>
+  <style>{`.sk-sidebar{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}.sk-groupbar{display:flex;gap:4px;padding:4px 12px;align-items:center;color:var(--dsw-alias-label-secondary);font-size:12px}.sk-groupbar span{flex:1}.sk-group-heading{display:flex;align-items:center;gap:6px;min-height:32px;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;padding:0 8px}[data-toolbox-project-menu]{min-width:172px!important}[data-toolbox-project-menu] [role="menuitem"]>span:last-child{white-space:nowrap;overflow:visible}.sk-group-heading[data-drop="true"]{background:var(--dsw-alias-interactive-bg-hover);outline:1px solid var(--dsw-alias-state-active-primary);border-radius:6px}.sk-group-heading>button:first-child{flex:1;text-align:left}.sk-group-heading button{background:transparent;color:inherit;border:0;border-radius:6px;cursor:pointer;padding:5px}.sk-group-heading button:hover{background:var(--dsw-alias-interactive-bg-hover)}${rules}`}</style>
+  <div className="sk-groupbar"><span>{text(props.toolboxT, 'groups.title')}</span><Button variant="ghost" title={text(props.toolboxT, 'groups.manage')} aria-label={text(props.toolboxT, 'groups.manage')} onClick={() => showOverlay({ kind: 'groups' })}>…</Button></div>
+  {groupError && <p role="alert">{groupError}</p>}
+  <Native {...nativeProps} />
+  {grouped && list && createPortal(<>
+   <style>{`.sk-sidebar div:has(>.sk-group-heading){display:flex;flex-direction:column}.sk-sidebar [role="tree"]>div:has([data-row-key="workspace:"]){order:${groups.length * 2 + 1};${collapsed.ungrouped ? 'display:none!important;' : ''}}`}</style>
+   {headings.map((group, index) => <div className="sk-group-heading" key={group.id} style={{ order: index * 2 }} data-toolbox-group={group.id} data-drop={dropGroup === group.id} title={text(props.toolboxT, 'groups.drop')}
+    onDragOver={event => { if (!state?.workspaceMove && event.dataTransfer.types.includes('application/x-dsh-toolbox-workspace')) { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; setDropGroup(group.id); } }}
+    onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDropGroup(null); }}
+    onDrop={event => { const id = event.dataTransfer.getData('application/x-dsh-toolbox-workspace'); if (!id) return; event.preventDefault(); event.stopPropagation(); void moveGroup(id, group.id); }}>
+    <button aria-expanded={!collapsed[group.id]} onClick={() => setCollapsed(value => ({ ...value, [group.id]: !value[group.id] }))}>{collapsed[group.id] ? '▸' : '▾'} {group.title} <span>({layout.filter(row => row.group === index).length})</span></button>
+    <button aria-label={`${group.title} — ${text(props.toolboxT, 'groups.manage')}`} onClick={() => showOverlay({ kind: 'groups' })}>…</button>
+   </div>)}
+  </>, list)}
+  {menu && createPortal(<div data-toolbox-project-actions style={{ display: 'contents' }}>
+   <MenuItemButton onSelect={() => openEditor()} icon={<IconFolderOpenOutlineRegular />}>{text(props.toolboxT, 'project.editGroup')}</MenuItemButton>
+   <MenuItemButton onSelect={() => openEditor('group-move')} icon={<IconFolderOpenOutlineRegular />}>{text(props.toolboxT, 'groups.move')}</MenuItemButton>
+  </div>, menu.target)}
+ </div>;
+}
+
+function replyInput(sessionId) {
+ try {
+  const binding = sessionsService?.binding?.(sessionId);
+  if (!binding || typeof conversationService?.input?.for !== 'function') return;
+  return conversationService.input.for(binding.ctx);
+ } catch { return undefined; }
+}
+function useReplyInput(sessionId, phaseOnly = false) {
+ const input = replyInput(sessionId);
+ const read = () => { const value = input?.state?.getSnapshot?.(); return phaseOnly ? value?.phase : value; };
+ const [snapshot, setSnapshot] = useState(read);
+ useEffect(() => {
+  const sync = () => setSnapshot(read()); sync();
+  return input?.state?.subscribe?.(sync);
+ }, [input, phaseOnly]);
+ return [input, snapshot];
+}
+const replyStyle = `.sk-reply-button{display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;padding:5px;background:transparent;border:0;border-radius:var(--dsw-radius-sm,6px);color:var(--dsw-alias-label-tertiary);cursor:pointer}.sk-reply-button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.sk-reply-button:disabled{opacity:.4;cursor:default}.sk-reply-preview{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,12px);color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;background:var(--dsw-alias-bg-module-platform)}.sk-reply-preview>div{min-width:0;flex:1;border-left:2px solid var(--dsw-alias-label-tertiary);padding-left:10px}.sk-reply-preview p{margin:4px 0 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:pre-wrap;overflow-wrap:anywhere}.sk-reply-preview strong{font-size:12px;font-weight:500}`;
+export function ReplyMessage({ Native, mirrors, toolboxT, ...props }) {
+ const root = useRef(null), [target, setTarget] = useState(null), [error, setError] = useState('');
+ const [input, phase] = useReplyInput(props.sessionId, true);
+ const quote = messageReply(props.node);
+ const canWrite = props.useSession ? props.useSession(value => !value.removed && (value.subagent === null || value.subagent?.address?.mode === 'continuable')) : false;
+ useEffect(() => {
+  const discover = () => setTarget(root.current?.querySelector('[data-clock]') ?? null);
+  const observer = new MutationObserver(discover); if (root.current) observer.observe(root.current, { childList: true, subtree: true }); discover();
+  return () => observer.disconnect();
+ }, []);
+ const label = text(toolboxT, 'reply.action');
+ const reply = () => {
+  try {
+   if (!replyAvailable || !input || !canWrite) throw new Error(text(toolboxT, 'reply.unavailable'));
+   input.setDraft(withReply(input.state.getSnapshot(), quote, `${label} · ${text(toolboxT, quote.role === 'user' ? 'reply.user' : 'reply.assistant')}`));
+   input.persistCurrentDraft?.(); setError('');
+   // Focus the same session's public contenteditable, without changing selection in another chat.
+   const surface = root.current?.closest('[data-conversation-session]');
+   surface?.querySelector('[data-composer-card] [contenteditable="true"]')?.focus();
+  } catch (reason) { setError(reason.message); }
+ };
+ const nativeProps = { ...props, renderSlot: (name, ...args) => props.renderSlot(mirrors.get(name) ?? name, ...args) };
+ return <div ref={root} style={{ display: 'contents' }}><Native {...nativeProps} /><style>{replyStyle}</style>
+  {quote && target && createPortal(<Tooltip label={label} side="bottom"><button type="button" className="sk-reply-button" aria-label={label} disabled={!replyAvailable || !input || !canWrite || phase !== 'plain'} onClick={reply}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><path d="M6 3 2 6.5 6 10M2.5 6.5H10a4 4 0 0 1 0 8H8" /></svg></button></Tooltip>, target)}
+  {error && <span role="alert">{error}</span>}
+ </div>;
+}
+export function ReplyPreview({ sessionId, t }) {
+ const [input, snapshot] = useReplyInput(sessionId);
+ const [error, setError] = useState('');
+ const occurrence = snapshot?.occurrences?.find(row => row.source === REPLY_SOURCE);
+ let quote; try { if (occurrence) quote = readReply(occurrence.ref); } catch { /* host marks invalid chips; do not take down the composer */ }
+ if (!quote) return null;
+ const cancel = () => { try { input.setDraft(withoutReply(input.state.getSnapshot())); input.persistCurrentDraft?.(); setError(''); } catch (reason) { setError(reason.message); } };
+ return <div><style>{replyStyle}</style><div className="sk-reply-preview" data-toolbox-reply role="region" aria-label={text(t, 'reply.action')}>
+  <div><strong>{text(t, 'reply.action')} · {text(t, quote.role === 'user' ? 'reply.user' : 'reply.assistant')}</strong><p>{quote.text}</p></div>
+  <button type="button" className="sk-reply-button" aria-label={text(t, 'reply.cancel')} disabled={snapshot.phase !== 'plain'} onClick={cancel}>×</button>
+ </div>{error && <p role="alert">{error}</p>}</div>;
+}
+
+export function NativeSteerQueue({ Native, toolboxT, ...props }) {
+ const label = text(toolboxT, 'queue.rowSteer');
+ return <><style>{`[data-queue-dock] button[aria-label="引导"],[data-queue-dock] button[aria-label="Steer"]{display:inline-flex;align-items:center;justify-content:center;width:auto;min-width:56px;gap:4px;padding:0 8px;font:inherit;font-size:12px}[data-queue-dock] button[aria-label="引导"]::after,[data-queue-dock] button[aria-label="Steer"]::after{content:attr(aria-label)}`}</style><Native {...props} t={(key, ...args) => key === 'queue.steer' ? label : props.t(key, ...args)} /></>;
+}
+
+function WorkspaceSection({ state, t }) {
+ const [busy, setBusy] = useState(false), [error, setError] = useState('');
+ const resume = async () => {
+  setBusy(true); setError('');
+  try { await callHost({ type: 'workspace.complete' }); }
+  catch (reason) { setError(reason.message); }
+  finally { await loadState(); setBusy(false); }
+ };
+ return <section className="box"><h3>项目分组与路径 / Projects</h3>
+  <p className="muted">{state?.groups?.length ?? 0} 个分组 · {state?.projects?.length ?? 0} 个项目。侧栏按分组展开项目，项目菜单可编辑名称、路径和分组。</p>
+  <div><Button variant="outline" onClick={() => showOverlay({ kind: 'groups' })}>{text(t, 'groups.manage')}</Button></div>
+  {state?.workspaceMove && <p role="status">{text(t, 'project.pending')}<br /><span className="mono">{state.workspaceMove.fromCwd} → {state.workspaceMove.toCwd}</span><br />{state.workspaceMove.moved.length} / {state.workspaceMove.sessionIds.length} <Button variant="outline" disabled={busy} onClick={() => void resume()}>{text(t, busy ? 'common.busy' : 'project.resume')}</Button></p>}
+  {error && <p className="error" role="alert">{error}</p>}
+ </section>;
+}
+
+export function GroupsDialog({ close, t }) {
+ const { state } = useKit();
+ const [name, setName] = useState(''), [editing, setEditing] = useState(''), [busy, setBusy] = useState(false), [error, setError] = useState('');
+ const groups = state?.groups ?? [];
+ const run = async input => {
+  if (busy) return;
+  setBusy(true); setError('');
+  try { await callHost(input); await loadState(); setName(''); setEditing(''); }
+  catch (reason) { setError(reason.message); }
+  finally { setBusy(false); }
+ };
+ return <Modal open title={text(t, 'groups.manage')} closeLabel={text(t, 'common.close')} onClose={() => { if (!busy) close(); }}>
+  <div className="sk stack sk-dialog-body"><style>{styles}</style><p className="muted">{text(t, 'groups.help')}</p>
+   <form className="row" onSubmit={event => { event.preventDefault(); void run({ type: editing ? 'group.rename' : 'group.create', groupId: editing, title: name }); }}>
+    <input className="grow" aria-label={text(t, 'groups.name')} placeholder={text(t, 'groups.name')} maxLength={80} value={name} disabled={busy} onChange={event => setName(event.target.value)} />
+    <Button type="submit" variant="outline" disabled={busy || !name.trim()}>{text(t, editing ? 'common.save' : 'groups.create')}</Button>
+    {editing && <Button type="button" variant="ghost" disabled={busy} onClick={() => { setEditing(''); setName(''); }}>{text(t, 'common.cancel')}</Button>}
+   </form>
+   {groups.map(group => <div className="row" key={group.id}><strong style={{ flex: 1 }}>{group.title}</strong>
+    <Button variant="ghost" disabled={busy || !!state.workspaceMove} onClick={() => { setEditing(group.id); setName(group.title); }}>{text(t, 'groups.rename')}</Button>
+    <Button variant="ghost" disabled={busy || !!state.workspaceMove} onClick={() => void run({ type: 'group.delete', groupId: group.id })}>{text(t, 'groups.delete')}</Button>
+   </div>)}
+   {!state ? <p role="status">{text(t, 'common.loading')}</p> : state.projects.map(project => <div className="box" key={project.id}>
+    <div><strong>{project.title}</strong> · {project.sessions}<p className="muted mono">{project.path}</p></div>
+    <div className="row"><select aria-label={`${project.title} — ${text(t, 'groups.title')}`} disabled={busy || !!state.workspaceMove} value={groups.find(group => group.workspaceIds.includes(project.id))?.id ?? ''} onChange={event => void run({ type: 'group.assign', workspaceId: project.id, groupId: event.target.value })}>
+     <option value="">{text(t, 'groups.none')}</option>{groups.map(group => <option key={group.id} value={group.id}>{group.title}</option>)}
+    </select><Button variant="outline" disabled={busy || !!state.workspaceMove} onClick={() => showOverlay({ kind: 'workspace', workspaceId: project.id })}>{text(t, 'project.edit')}</Button></div>
+   </div>)}
+   {state?.workspaceMove && <WorkspaceSection state={state} t={t} />}
+   {error && <p role="alert" className="error">{error}</p>}
+  </div>
+ </Modal>;
+}
+
+export function MoveGroupDialog({ workspaceId, close, t }) {
+ const { state } = useKit();
+ const [busy, setBusy] = useState(false), [error, setError] = useState('');
+ const assign = async groupId => {
+  if (busy) return;
+  setBusy(true); setError('');
+  try { await callHost({ type: 'group.assign', workspaceId, groupId }); await loadState(); close(); }
+  catch (reason) { setError(reason.message); setBusy(false); }
+ };
+ const selected = state?.groups?.find(group => group.workspaceIds.includes(workspaceId))?.id ?? '';
+ return <Modal open title={text(t, 'groups.move')} onClose={() => { if (!busy) close(); }} closeLabel={text(t, 'common.close')}>
+  <div className="sk stack"><style>{styles}</style><strong>{state?.projects?.find(project => project.id === workspaceId)?.title}</strong>
+   {[...(state?.groups ?? []), { id: '', title: text(t, 'groups.none') }].map(group => <Button key={group.id} variant="outline" disabled={busy || !state || !!state.workspaceMove} aria-pressed={selected === group.id} onClick={() => void assign(group.id)}>{selected === group.id ? '✓ ' : ''}{group.title}</Button>)}
+   <Button variant="ghost" disabled={busy} onClick={() => showOverlay({ kind: 'groups' })}>{text(t, 'groups.create')}</Button>
+   {error && <p role="alert" className="error">{error}</p>}
+  </div>
+ </Modal>;
+}
+
+export function WorkspaceDialog({ workspaceId, close, t }) {
+ const { state } = useKit();
+ const project = state?.projects?.find(row => row.id === workspaceId);
+ const [title, setTitle] = useState(project?.title ?? ''), [path, setPath] = useState(project?.path ?? '');
+ const [busy, setBusy] = useState(false), [error, setError] = useState('');
+ const initializedProject = useRef(project?.id);
+ useEffect(() => { if (project && initializedProject.current !== project.id) { initializedProject.current = project.id; setTitle(project.title); setPath(project.path); } }, [project]);
+ const submit = async () => {
+  setBusy(true); setError('');
+  try { await callHost({ type: 'workspace.edit', workspaceId, title, path }); await loadState(); close(); }
+  catch (reason) { setError(reason.message); await loadState(); setBusy(false); }
+ };
+ const browse = async () => {
+  try { const picked = await directoryPicker?.pick?.(); if (picked?.ok && typeof picked.value === 'string') setPath(picked.value); }
+  catch (reason) { setError(reason.message); }
+ };
+ return <Modal open title={text(t, 'project.edit')} closeLabel={text(t, 'common.close')} onClose={() => { if (!busy) close(); }} footer={<><Button variant="outline" disabled={busy} onClick={close}>{text(t, 'common.cancel')}</Button><Button variant="primary" disabled={busy || !project || !title.trim() || !path.trim()} onClick={() => void submit()}>{text(t, busy ? 'common.busy' : 'common.save')}</Button></>}>
+  <div className="sk stack"><style>{styles}</style>
+   <label className="stack">{text(t, 'groups.title')}<select aria-label={text(t, 'groups.title')} disabled={busy || !!state?.workspaceMove} value={state?.groups?.find(group => group.workspaceIds.includes(workspaceId))?.id ?? ''} onChange={async event => { setBusy(true); setError(''); try { await callHost({ type: 'group.assign', workspaceId, groupId: event.target.value }); await loadState(); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }}><option value="">{text(t, 'groups.none')}</option>{state?.groups?.map(group => <option key={group.id} value={group.id}>{group.title}</option>)}</select></label>
+   <p className="muted">{text(t, 'project.groupHelp')}</p>
+   <Button variant="ghost" disabled={busy} onClick={() => showOverlay({ kind: 'groups' })}>{text(t, 'groups.manage')}</Button>
+   <label className="stack">{text(t, 'project.title')}<input value={title} maxLength={80} disabled={busy} onChange={event => setTitle(event.target.value)} /></label>
+   <label className="stack">{text(t, 'project.path')}<input className="mono" value={path} disabled={busy} onChange={event => setPath(event.target.value)} /></label>
+   {directoryPicker?.pick && <Button variant="outline" disabled={busy} onClick={() => void browse()}>{text(t, 'project.browse')}</Button>}
+   <p className="muted">{text(t, 'project.help')}</p>
+   {error && <p className="error" role="alert">{error}</p>}
+   {state?.workspaceMove && <WorkspaceSection state={state} t={t} />}
+  </div>
+ </Modal>;
+}
+
+/** Native steer moves the same inbox row to next-step; it never cancels the running tools. */
+export function SteerQueueButton({ useSession, useProjection, updateQueue, phase, readOnly, t }) {
+ const inbox = useProjection('inbox');
+ const running = useSession(state => state.running);
+ const mutable = useSession(state => state.subagent === null || state.subagent?.address?.mode === 'continuable');
+ const submissions = useSession(state => state.pendingSubmissions ?? []);
+ const inChat = new Set(submissions.filter(row => row.placement === 'transcript').map(row => row.requestId));
+ const queue = (inbox?.['next-turn'] ?? []).filter(row => row.source?.kind !== 'user' || !inChat.has(row.source.rpcId));
+ const [busy, setBusy] = useState(false), [error, setError] = useState('');
+ const sending = useRef(false);
+ if (!queue.length) return null;
+ const disabled = busy || !running || !mutable || readOnly === true || phase !== undefined && phase !== 'ready' || typeof updateQueue !== 'function';
+ const steer = async () => {
+  if (disabled || sending.current) return;
+  sending.current = true; setBusy(true); setError('');
+  try { await updateQueue(queue[0].id, { kind: 'steer' }); }
+  catch (reason) { setError(reason.message); }
+  finally { sending.current = false; setBusy(false); }
+ };
+ return <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+  <Button variant="outline" disabled={disabled} title={text(t, 'queue.help')} onClick={steer}>{text(t, busy ? 'common.busy' : 'queue.steer')} ({queue.length})</Button>
+  {error && <span role="alert">{error}</span>}
+ </div>;
 }

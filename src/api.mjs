@@ -6,6 +6,7 @@
  * host wires it into `ctx.webServer.register` and the CLI can call it directly.
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 
 export const API_PATH = '/.well-known/dsh-session-toolbox';
 const MAX_BODY = 4 * 1024 * 1024;
@@ -21,8 +22,11 @@ const json = (res, status, value) => {
 };
 
 const hostIsLoopback = host => {
-	const name = String(host ?? '').split(':')[0];
-	return ['localhost', '127.0.0.1', '::1', '[::1]', ''].includes(name) || name.startsWith('127.');
+	if (!/^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d{1,5})?$/i.test(String(host ?? ''))) return false;
+	try {
+		const { hostname } = new URL(`http://${host}`);
+		return hostname === 'localhost' || hostname === '[::1]' || isIP(hostname) === 4 && hostname.startsWith('127.');
+	} catch { return false; }
 };
 
 /**
@@ -56,7 +60,19 @@ export function apiHandler(kit) {
 
 /** Shared dispatch so the host, the CLI and tests all speak one vocabulary. */
 export async function dispatch(kit, input) {
+	if (['preflight', 'move'].includes(input.type) && (await kit.settings?.read())?.move?.enabled === false) {
+		throw Object.assign(new Error('会话迁移功能已停用'), { code: 'feature-disabled' });
+	}
 	switch (input.type) {
+		case 'group.create': return await kit.workspace.createGroup(input.title);
+		case 'group.rename': return await kit.workspace.renameGroup(String(input.groupId ?? ''), input.title);
+		case 'group.delete': return await kit.workspace.deleteGroup(String(input.groupId ?? ''));
+		case 'group.assign': return await kit.workspace.assignGroup(String(input.workspaceId ?? ''), String(input.groupId ?? ''));
+		case 'workspace.edit': {
+			if ((await kit.settings?.read())?.move?.enabled === false && kit.workspace.row(input.workspaceId).path !== input.path) throw Object.assign(new Error('会话迁移功能已停用'), { code: 'feature-disabled' });
+			return await kit.workspace.edit({ workspaceId: String(input.workspaceId ?? ''), path: input.path, title: input.title });
+		}
+		case 'workspace.complete': return await kit.workspace.complete();
 		case 'preflight': return await kit.move.preflight({ sessionId: String(input.sessionId ?? ''), toCwd: String(input.toCwd ?? ''), createTarget: input.createTarget === true });
 		case 'move': return await kit.move.move(await kit.move.preflight({ sessionId: String(input.sessionId ?? ''), toCwd: String(input.toCwd ?? ''), createTarget: input.createTarget === true }));
 		case 'move.rollback': return await kit.move.rollback();

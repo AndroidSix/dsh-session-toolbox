@@ -179,8 +179,88 @@ test('end-to-end loopback move rewrites real files through the registered route'
 	await w.cleanup();
 });
 
+test('project counts reflect both halves of an immediate round-trip move', async t => {
+	const w = await boot(t);
+	t.after(w.cleanup);
+	const registry = fakeRegistry();
+	await registry.delete('ws-a');
+	const a = await registry.create(w.from, 'A');
+	await a.attachSession(ID); await a.attachSession(S2);
+	await registry.create(w.to, 'B');
+	const list = async () => {
+		for (const cwd of [w.from, w.to]) {
+			const bytes = await readFile(join(w.sessionsRoot, projectKey(cwd), encodeSegment(ID), 'session.v4.jsonl.zstd')).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+			if (bytes) return [{ header: readHeader(bytes).header }];
+		}
+		return [];
+	};
+	registry.listStoredHeaders = async () => (await list()).map(row => row.header);
+	const ctx = fakeCtx({ workspaceRegistry: registry, sessions: { list: () => [] }, sessionPersistence: { list } });
+	t.after(() => ctx.disposeAll());
+	await apply(ctx, { configFile: w.root, dshHome: w.dshHome });
+	const kit = ctx.get('sessionToolbox');
+	const counts = async () => (await kit.state()).projects.map(row => row.sessions);
+	assert.deepEqual(await counts(), [2, 0]);
+	assert.equal((await kit.action({ type: 'move', sessionId: ID, toCwd: w.to })).deferredLedger, false);
+	assert.deepEqual(await counts(), [1, 1]);
+	assert.equal((await kit.action({ type: 'move', sessionId: ID, toCwd: w.from })).deferredLedger, false);
+	assert.deepEqual(await counts(), [2, 0]);
+});
+
 function capture() {
 	return { status: 0, body: '', headers: {},
 		writeHead(status, headers) { this.status = status; Object.assign(this.headers, headers ?? {}); },
 		end(text) { this.body = text; } };
 }
+
+test('async official activity check detects a running turn', async () => {
+	const { hostCapabilities } = await import('../src/index.mjs');
+	const ctx = fakeCtx();
+	ctx.waterfall = async () => [{ kind: 'turn' }];
+	assert.equal(await hostCapabilities(ctx).sessionLive(ID), true);
+});
+
+test('loaded but idle sessions can enter the archive pool', async t => {
+	const w = await boot(t, { files: false });
+	t.after(w.cleanup);
+	const registry = fakeRegistry([{ id: ID, cwd: '/project-a' }]);
+	const ctx = fakeCtx({ workspaceRegistry: registry, sessions: { list: () => [{ header: { id: ID } }] } });
+	ctx.waterfall = async () => [];
+	await apply(ctx, { configFile: w.root, dshHome: w.dshHome });
+	await ctx.get('sessionToolbox').action({ type: 'trash.session', sessionId: ID });
+	assert.equal(registry.archivedSessionIds.includes(ID), true);
+});
+
+test('host ledger rollback can detach a session back into the no-cwd bucket', async () => {
+	const { hostCapabilities } = await import('../src/index.mjs');
+	let detached = false;
+	const registry = { resolveByPath: async path => {
+		assert.equal(path, '/previous-target');
+		return { detachSession: async () => { detached = true; } };
+	} };
+	await hostCapabilities(fakeCtx({ workspaceRegistry: registry })).moveLedger(ID, '/previous-target', undefined);
+	assert.equal(detached, true);
+});
+
+test('group state persists and pending project moves block competing mutations', async t => {
+ const w = await boot(t, { files: false, services: { workspaceRegistry: fakeRegistry() } });
+ t.after(w.cleanup);
+ await apply(w.ctx, { configFile: w.root, dshHome: w.dshHome });
+ const kit = w.ctx.get('sessionToolbox');
+ const group = await kit.action({ type: 'group.create', title: 'Work' });
+ await kit.action({ type: 'group.assign', workspaceId: 'ws-a', groupId: group.id });
+ assert.deepEqual((await kit.state()).groups[0].workspaceIds, ['ws-a']);
+ await writeFile(join(w.root, 'workspace-journal.json'), JSON.stringify({ version: 1, active: { workspaceId: 'ws-a', fromCwd: '/old', toCwd: '/new', title: 'New', sessionIds: [], moved: [] } }));
+ await assert.rejects(kit.action({ type: 'trash.workspace', workspaceId: 'ws-a' }), /继续迁移|pending/);
+ await assert.rejects(kit.action({ type: 'move.rollback' }), /继续迁移|pending/);
+ assert.equal((await kit.state()).workspaceMove.toCwd, '/new');
+});
+
+test('host ledger detaches the registered old path even when its directory no longer exists', async () => {
+ const { hostCapabilities } = await import('../src/index.mjs');
+ const calls = [];
+ const rows = [{ path: '/missing-old-project', detachSession: async id => calls.push(['detach', id]) }];
+ const registry = { list: () => rows, resolveByPath: async path => { if (path === rows[0].path) throw new Error('ENOENT'); return { attachSession: async id => calls.push(['attach', id]) }; } };
+ await hostCapabilities({ get: () => registry }).moveLedger(ID, rows[0].path, '/new');
+ assert.deepEqual(calls, [['detach', ID], ['attach', ID]]);
+});

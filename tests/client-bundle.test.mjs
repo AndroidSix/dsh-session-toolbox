@@ -54,7 +54,9 @@ test('client plugin exports name/inject/apply and registers the expected slots',
 	assert.equal(entry.id, 'dsh-session-toolbox');
 	const react = { createElement: () => null, Fragment: 'Fragment', useState: () => [null, () => {}], useEffect: () => {}, useRef: () => ({ current: null }) };
 	const plugin = entry.factory(id => {
+		if (id === '@deepseek-ai/dsh-client-ui-primitives') return {};
 		if (id === 'react') return react;
+		if (id === 'react-dom') return { createPortal: (children, target) => ({ type: 'Portal', props: { children, target } }) };
 		if (id === 'react/jsx-runtime') return { jsx: () => null, jsxs: () => null, Fragment: 'Fragment' };
 		throw new Error(`unexpected require: ${id}`);
 	});
@@ -89,7 +91,7 @@ test('client plugin exports name/inject/apply and registers the expected slots',
 	});
 	plugin.apply(ctx);
 	const names = new Set(registered.map(row => row.name));
-	assert.deepEqual(names, new Set(['plugins.bundle.config', 'sidebar.workspaces.session.menu.item', 'conversation.input.dock']));
+	assert.deepEqual(names, new Set(['plugins.bundle.config', 'sidebar.workspaces.session.menu.item', 'conversation.input.dock', 'shell.overlay']));
 	assert.ok(registered.some(r => r.name === 'sidebar.workspaces.session.menu.item' && r.id === 'session-toolbox-move'));
 	assert.ok(registered.some(r => r.name === 'sidebar.workspaces.session.menu.item' && r.id === 'session-toolbox-trash'));
 	assert.ok(registered.some(r => r.name === 'plugins.bundle.config' && r.key === 'dsh-session-toolbox'));
@@ -103,5 +105,5 @@ test('client bundle never references Node-only globals', async () => {
 	assert.equal(/require\(["']node:/.test(source), false, 'no node: specifiers');
 	// Only the two browser-safe externals may be required; assert exact set.
 	const required = [...source.matchAll(/require\("([^"]+)"\)/g)].map(match => match[1]);
-	assert.deepEqual([...new Set(required)].sort(), ['react', 'react/jsx-runtime']);
+	assert.deepEqual([...new Set(required)].sort(), ['@deepseek-ai/dsh-client-ui-primitives', 'react', 'react-dom', 'react/jsx-runtime']);
 });
