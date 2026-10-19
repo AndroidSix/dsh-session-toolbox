@@ -12,7 +12,7 @@ const pluginVersion = pkg.version;
 import { MenuItemButton, Modal, Button, Tooltip, IconFolderOpenOutlineRegular, IconArchiveOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives';
 import { REPLY_SOURCE, readReply, withReply, withoutReply, messageReply, replySource, installReplyNodes } from './reply.mjs';
 import { createVault } from './draft-vault.js';
-import { filterSidebar, installSidebar, mirroredSlot, sidebarLayout, installQueueSteering, protectProjectMenu } from './sidebar.mjs';
+import { filterSidebar, installSidebar, mirroredSlot, sidebarLayout, installQueueSteering, protectProjectMenu, sessionProjectDrag } from './sidebar.mjs';
 
 export const name = 'dsh-session-toolbox-client';
 // `locale` is a real service, so it must be injected before use: cordis throws
@@ -535,9 +535,16 @@ export function GroupedSidebar({ Native, ...props }) {
  const root = useRef(null), projectMenu = useRef(null);
  const [list, setList] = useState(null), [menu, setMenu] = useState(null), [collapsed, setCollapsed] = useState({});
  const [dropGroup, setDropGroup] = useState(null), [groupError, setGroupError] = useState('');
+ const [sessionFeedback, setSessionFeedback] = useState(null);
  const movingGroup = useRef(false);
  const groups = state?.groups ?? [];
  const workspaces = props.useWorkspaces(value => value);
+ const sessions = props.useSessions(value => value);
+ const dragSnapshot = useRef(null);
+ dragSnapshot.current = { workspaces: workspaces.items, projects: state?.projects ?? [], sessions,
+  archived: workspaces.archivedSessionIds, blocked: !!state?.journal || !!state?.workspaceMove || state?.settings?.move?.enabled === false || typeof props.actions?.setSessionOrder !== 'function' };
+ const sessionDrag = useMemo(() => sessionProjectDrag({ read: () => dragSnapshot.current, move: callHost, report: setSessionFeedback }), []);
+ useEffect(() => () => sessionDrag.dispose(), [sessionDrag]);
  const view = props.useStore(value => value.groupBy);
  const grouped = props.wide && view !== 'flat' && groups.length > 0;
  const layout = useMemo(() => sidebarLayout(workspaces.items, groups), [workspaces, groups]);
@@ -587,6 +594,7 @@ export function GroupedSidebar({ Native, ...props }) {
  };
  const projectedWorkspaces = useMemo(() => grouped ? { ...workspaces, items: layout.map(row => row.workspace) } : workspaces, [grouped, workspaces, layout]);
  const nativeProps = { ...props,
+  actions: props.actions && { ...props.actions, setSessionOrder: (...args) => { if (!sessionDrag.suppressOrder) return props.actions.setSessionOrder(...args); } },
   useWorkspaces: selector => selector(projectedWorkspaces),
   useStore: selector => props.useStore(value => selector(grouped && value.groupBy === 'workspace-tree' ? { ...value, groupBy: 'workspace' } : value)),
   renderSlot: (name, ...args) => props.renderSlot(mirroredSlot(name), ...args),
@@ -597,13 +605,18 @@ export function GroupedSidebar({ Native, ...props }) {
   return `${selector}{order:${group * 2 + 1};padding-left:12px;${collapsed[headings[group].id] ? 'display:none!important;' : ''}}`;
  }).join('') : '';
  return <div className="sk-sidebar" ref={root} onClickCapture={capture} onDragStartCapture={event => {
+   sessionDrag.start(event);
+   if (event.target.closest?.('[data-row-key^="session:"]')) return;
    const row = event.target.closest?.('[data-row-key^="workspace:"]');
    const id = row?.getAttribute('data-row-key').slice('workspace:'.length);
    if (workspaces.items.some(item => item.workspaceId === id)) event.dataTransfer.setData('application/x-dsh-toolbox-workspace', id);
-  }} onDragEndCapture={() => setDropGroup(null)}>
+  }} onDragOverCapture={sessionDrag.over} onDragLeaveCapture={sessionDrag.leave} onDropCapture={sessionDrag.drop}
+   onDragEndCapture={() => { sessionDrag.end(); setDropGroup(null); }}>
+  <style>{`.sk-sidebar [data-toolbox-session-drop]{background:var(--dsw-alias-interactive-bg-hover);outline:1px solid var(--dsw-alias-state-active-primary);outline-offset:-1px;border-radius:6px}`}</style>
   <style>{`.sk-sidebar{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}.sk-groupbar{display:flex;gap:4px;padding:4px 12px;align-items:center;color:var(--dsw-alias-label-secondary);font-size:12px}.sk-groupbar span{flex:1}.sk-group-heading{display:flex;align-items:center;gap:6px;min-height:32px;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;padding:0 8px}[data-toolbox-project-menu]{min-width:172px!important}[data-toolbox-project-menu] [role="menuitem"]>span:last-child{white-space:nowrap;overflow:visible}.sk-group-heading[data-drop="true"]{background:var(--dsw-alias-interactive-bg-hover);outline:1px solid var(--dsw-alias-state-active-primary);border-radius:6px}.sk-group-heading>button:first-child{flex:1;text-align:left}.sk-group-heading button{background:transparent;color:inherit;border:0;border-radius:6px;cursor:pointer;padding:5px}.sk-group-heading button:hover{background:var(--dsw-alias-interactive-bg-hover)}${rules}`}</style>
   <div className="sk-groupbar"><span>{text(props.toolboxT, 'groups.title')}</span><Button variant="ghost" title={text(props.toolboxT, 'groups.manage')} aria-label={text(props.toolboxT, 'groups.manage')} onClick={() => showOverlay({ kind: 'groups' })}>…</Button></div>
   {groupError && <p role="alert">{groupError}</p>}
+  {sessionFeedback && <p role={sessionFeedback.error ? 'alert' : 'status'} style={{ padding: '0 12px', fontSize: 12 }}>{sessionFeedback.busy ? '正在切换项目…' : sessionFeedback.message}</p>}
   <Native {...nativeProps} />
   {grouped && list && createPortal(<>
    <style>{`.sk-sidebar div:has(>.sk-group-heading){display:flex;flex-direction:column}.sk-sidebar [role="tree"]>div:has([data-row-key="workspace:"]){order:${groups.length * 2 + 1};${collapsed.ungrouped ? 'display:none!important;' : ''}}`}</style>

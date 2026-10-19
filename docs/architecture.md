@@ -47,7 +47,7 @@
 10. **队列引导**：通过原生 `conversation.updateQueue(id, { kind: 'steer' })` 修改原队列项的接收位置，保留消息与附件，不发送取消当前工具的指令；运行状态、可写性和连续性决定按钮是否可用。
 
 11. **在线迁移兼容层**：`session-maintenance.mjs` 探测 DSH 的 `agentLoop.scope(id)` 清理链，以 Cordis 公开 effect 元数据的对象身份校验对应 disposer。当前 Cordis 没有公开 disposer 查询，适配器只读探测 `_disposables`，不修改集合；匹配不唯一或结构变化即拒绝。仅关闭 agent scope fiber 不能关闭持久化 writer，因此不能作为替代。完整清理后以 persistence 写句柄阻止同进程重开，并在目标发布前持有内核写锁。恢复时保护退役目录，结束后释放锁，由原生流程重新加载会话。
-12. **侧栏扩展**：保留原生项目、会话与菜单，在公开 `data-row-key` / `role=tree` DOM 位置用 React portal 增加分组标题和菜单项；不重挂载或搬动原生 DOM。分组投影需保持引用稳定，避免原生 effect 反复更新。队列通过公开插槽同 id 装饰原生组件，仅修改引导文案与样式，保留其原有动作及禁用条件。
+12. **侧栏扩展**：保留原生项目、会话与菜单，在公开 `data-row-key` / `role=tree` DOM 位置用 React portal 增加分组标题和菜单项；不重挂载或搬动原生 DOM。分组投影需保持引用稳定，避免原生 effect 反复更新。会话拖动在 capture 阶段附独立 MIME，仅接管项目标题上的跨项目放下，调用同一 `move` 预检与迁移接口；同项目行间排序仍交给原生。跨项目放下后保留原生 dragend 清理，但暂时抑制遗留排序标记的提交，等整个 DOM 事件分发结束后再解除，不能用可能早于 bubble 阶段执行的微任务解除。队列通过公开插槽同 id 装饰原生组件，仅修改引导文案与样式，保留其原有动作及禁用条件。
 
 ## 测试分层
 
@@ -60,7 +60,7 @@
 | kernel | 真 cordis v4：inject/provide/effect/dispose 全生命周期 |
 | client-bundle | 浏览器 globals-only vm 加载 lib/client.js，断言 __ModuleLoader__ 信封与插槽注册集 |
 | client-actions / draft-vault | 原生菜单与弹窗、快照防覆盖、队列引导防重入、图片恢复与旧绑定迟到通知 |
-| workspace / sidebar | 分组层级与菜单编辑、项目路径迁移、归档与排序保留、崩溃进度恢复、插槽清理 |
+| workspace / sidebar / sidebar-drag | 分组层级与菜单编辑、项目路径迁移、会话拖动跨项目及原生排序隔离、归档与排序保留、崩溃进度恢复、插槽清理 |
 | cli / package-check | 离线账本维护、打包门禁失败时只清理本次拥有的临时目录 |
 | live-artifact | 可选（env）：对 `~/.dsh/sessions` 全部真实日志只读 walk→rewrite→re-walk |
 

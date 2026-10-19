@@ -14,6 +14,71 @@ export function filterSidebar(workspaces, sessions, groups, selected) {
 }
 export const mirroredSlot = name => `session-toolbox.${name}`;
 
+const SESSION_DRAG = 'application/x-dsh-toolbox-session';
+/** Extend native session sorting with project-header drops. Keep native dragend
+ * cleanup, but suppress its last hovered insertion marker after a project drop. */
+export function sessionProjectDrag({ read, move, report }) {
+ let sessionId, highlighted, resetTimer, consumed = false, moving = false;
+ const clear = () => { highlighted?.removeAttribute('data-toolbox-session-drop'); highlighted = undefined; };
+ const projectRow = event => event.target.closest?.('[data-row-key^="workspace:"]');
+ const ours = event => !!sessionId && Array.from(event.dataTransfer?.types ?? []).includes(SESSION_DRAG);
+ const target = row => {
+  const snapshot = read();
+  if (moving || snapshot.blocked) return;
+  const id = row?.getAttribute('data-row-key')?.slice('workspace:'.length);
+  const workspace = snapshot.workspaces.find(item => item.workspaceId === id);
+  const project = snapshot.projects.find(item => item.id === id);
+  if (!workspace || !project?.path || workspace.sessionIds.includes(sessionId)) return;
+  return project;
+ };
+ return {
+  get suppressOrder() { return consumed; },
+  start(event) {
+   clearTimeout(resetTimer); sessionId = undefined; consumed = false; clear();
+   const row = event.target.closest?.('[data-row-key^="session:"]');
+   const snapshot = read();
+   const id = row?.getAttribute('data-row-key')?.slice('session:'.length);
+   const session = snapshot.sessions?.byId[id];
+   if (!row?.draggable || !session || session.blank || snapshot.archived?.includes(id) || snapshot.blocked || moving) return;
+   sessionId = id;
+   event.dataTransfer.setData(SESSION_DRAG, id);
+  },
+  over(event) {
+   if (!ours(event)) return;
+   const row = projectRow(event); clear();
+   if (!row) return;
+   event.preventDefault(); event.stopPropagation();
+   const project = target(row);
+   event.dataTransfer.dropEffect = project ? 'move' : 'none';
+   if (project) { highlighted = row; row.setAttribute('data-toolbox-session-drop', ''); }
+  },
+  leave(event) { if (highlighted && !highlighted.contains(event.relatedTarget)) clear(); },
+  async drop(event) {
+   if (!ours(event)) return;
+   const row = projectRow(event);
+   if (!row) return;
+   event.preventDefault(); event.stopPropagation(); consumed = true; clear();
+   if (event.dataTransfer.getData(SESSION_DRAG) !== sessionId) return;
+   const project = target(row);
+   if (!project) return;
+   const id = sessionId;
+   moving = true; report({ busy: true, message: '' });
+   try {
+    const result = await move({ type: 'move', sessionId: id, toCwd: project.path, createTarget: false });
+    report({ busy: false, message: result?.deferred ? '文件已迁移，但项目账本尚未完成；请在工具箱点击完成或回滚' : `已切换到项目「${project.title}」`, error: false });
+   } catch (error) { report({ busy: false, message: error.message, error: true }); }
+   finally { moving = false; }
+  },
+  end() {
+   sessionId = undefined; clear();
+   // React capture and bubble use separate DOM listeners; a microtask may run
+   // between them. Keep the guard until the entire dragend dispatch finishes.
+   resetTimer = setTimeout(() => { consumed = false; }, 0);
+  },
+  dispose() { clearTimeout(resetTimer); clear(); },
+ };
+}
+
 /** Decorate the public entry; original ownership, store, inject and components stay intact. */
 export function installSidebar(ctx, makeComponent) {
  if (typeof ctx.slots.entries !== 'function' || typeof ctx.slots.subscribe !== 'function') return;
