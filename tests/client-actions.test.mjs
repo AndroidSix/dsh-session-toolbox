@@ -6,11 +6,13 @@ import { readFile } from 'node:fs/promises';
 async function client() {
 	let entry;
 	let values = [];
+	const effects = [], updates = [], timers = new Map();
+	let clock = 0, timerId = 0;
 	const events = new Map();
 	const render = (type, props) => ({ type, props });
 	const native = Object.fromEntries(['MenuItemButton', 'Modal', 'Button', 'IconFolderOpenOutlineRegular', 'IconArchiveOutlineRegular'].map(name => [name, name]));
-	const react = { useState: initial => [values.length ? values.shift() : initial, () => {}], useRef: () => ({ current: null }), useEffect: () => {}, useMemo: fn => fn() };
-	const sandbox = vm.createContext({ console, setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
+	const react = { useState: initial => [values.length ? values.shift() : initial, value => updates.push(value)], useRef: () => ({ current: null }), useEffect: (run, deps) => effects.push({ run, deps }), useMemo: fn => fn() };
+	const sandbox = vm.createContext({ console, setTimeout: (run, delay) => { const id = ++timerId; timers.set(id, { run, at: clock + delay }); return id; }, clearTimeout: id => timers.delete(id), setInterval: () => 0, clearInterval() {},
 		CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } },
 		window: { __ModuleLoader__: { load: value => { entry = value; } }, dispatchEvent(event) { events.get(event.type)?.(event); }, addEventListener: (type, listener) => events.set(type, listener), removeEventListener() {} },
 		fetch: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ key: 'k', projects: [], settings: {} }) }),
@@ -23,7 +25,8 @@ async function client() {
 		if (id === '@deepseek-ai/dsh-client-ui-primitives') return native;
 		throw new Error(id);
 	});
-	return { plugin, states: next => { values = next; }, native, fetch: fn => { sandbox.fetch = fn; } };
+	return { plugin, states: next => { values = next; }, native, fetch: fn => { sandbox.fetch = fn; }, effects, updates,
+		tick: ms => { clock += ms; for (const [id, timer] of timers) if (timer.at <= clock) { timers.delete(id); timer.run(); } } };
 }
 function find(node, predicate) {
 	if (!node || typeof node !== 'object') return undefined;
@@ -151,4 +154,27 @@ test('row steering keeps native queue handlers and localizes the visible action'
  assert.equal(native.props.updateQueue,updateQueue);
  assert.equal(native.props.t('queue.steer'),'引导');
  assert.equal(native.props.t('queue.remove'),'queue.remove');
+});
+
+test('sidebar move feedback expires after completion, keeps busy visible and cancels old notice timers', async () => {
+ const c = await client();
+ const render = feedback => {
+  c.effects.length = 0;
+  c.states([0, null, null, {}, null, '', feedback]);
+  c.plugin.GroupedSidebar({ Native() {}, useWorkspaces: fn => fn({ items: [] }), useSessions: fn => fn({ byId: {} }), useStore: fn => fn({ groupBy: 'workspace' }) });
+  const effect = c.effects.find(effect => effect.deps?.[0] === feedback);
+  assert.ok(effect, 'completed move feedback needs an expiry effect');
+  return effect.run();
+ };
+ render({ busy: true, message: '' }); c.tick(10000); assert.deepEqual(c.updates, []);
+ const first = render({ busy: false, message: '已切换到项目「A」' });
+ c.tick(3000); assert.deepEqual(c.updates, []); first();
+ const second = render({ busy: false, message: '已切换到项目「B」' });
+ c.tick(1000); assert.deepEqual(c.updates, [], 'the old notice must not dismiss the new one');
+ c.tick(3000); assert.deepEqual(c.updates, [null]); second();
+ c.updates.length = 0;
+ const failure = render({ busy: false, message: '迁移失败', error: true });
+ c.tick(7999); assert.deepEqual(c.updates, []); c.tick(1); assert.deepEqual(c.updates, [null]); failure();
+ c.updates.length = 0;
+ const unmount = render({ busy: false, message: '完成' }); unmount(); c.tick(10000); assert.deepEqual(c.updates, []);
 });

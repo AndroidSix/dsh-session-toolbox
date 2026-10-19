@@ -536,6 +536,11 @@ export function GroupedSidebar({ Native, ...props }) {
  const [list, setList] = useState(null), [menu, setMenu] = useState(null), [collapsed, setCollapsed] = useState({});
  const [dropGroup, setDropGroup] = useState(null), [groupError, setGroupError] = useState('');
  const [sessionFeedback, setSessionFeedback] = useState(null);
+ useEffect(() => {
+  if (!sessionFeedback || sessionFeedback.busy) return;
+  const timer = setTimeout(() => setSessionFeedback(null), sessionFeedback.error ? 8000 : 4000);
+  return () => clearTimeout(timer);
+ }, [sessionFeedback]);
  const movingGroup = useRef(false);
  const groups = state?.groups ?? [];
  const workspaces = props.useWorkspaces(value => value);
