@@ -9,10 +9,11 @@ import { useEffect, useState, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import pkg from '../package.json' with { type: 'json' };
 const pluginVersion = pkg.version;
-import { MenuItemButton, Modal, Button, Tooltip, IconFolderOpenOutlineRegular, IconArchiveOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives';
-import { REPLY_SOURCE, readReply, withReply, withoutReply, messageReply, replySource, installReplyNodes } from './reply.mjs';
+import { MenuItemButton, Modal, Button, Tooltip, UserTextRun, IconFolderOpenOutlineRegular, IconArchiveOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives';
+import { REPLY_SOURCE, REPLY_TEXT_NODE, readReply, insertReply, withoutReply, messageReply, messageSequence, replySource, replyTextRule, installReplyNodes, selectedReply } from './reply.mjs';
+import { createCandidateView, candidatesForTurn } from './next-tasks-view.mjs';
 import { createVault } from './draft-vault.js';
-import { filterSidebar, installSidebar, mirroredSlot, sidebarLayout, installQueueSteering, protectProjectMenu, sessionProjectDrag } from './sidebar.mjs';
+import { filterSidebar, installSidebar, mirroredSlot, sidebarLayout, protectProjectMenu, sessionProjectDrag } from './sidebar.mjs';
 
 export const name = 'dsh-session-toolbox-client';
 // `locale` is a real service, so it must be injected before use: cordis throws
@@ -61,12 +62,21 @@ export async function loadState() {
 	const request = ++stateRequest;
 	try {
 		const next = await readResponse(await fetch(ENDPOINT, { cache: 'no-store' }));
+		// Bootstrap authorization even when a concurrent snapshot supersedes this
+		// read. Otherwise every mounting message can retry with an empty key.
+		if (!sessionKey && next.key) sessionKey = next.key;
 		if (request !== stateRequest) return store.state;
 		store.state = next; store.error = ''; sessionKey = next.key ?? sessionKey;
 		vault?.setLimits(next.settings?.draftVault ?? {});
 	} catch (error) { if (request !== stateRequest) return store.state; store.error = error.message; }
 	for (const listener of store.listeners) listener();
 	return store.state;
+}
+let keyRequest;
+function ensureSessionKey(force = false) {
+ if (sessionKey && !force) return Promise.resolve();
+ if (!keyRequest) keyRequest = loadState().finally(() => { keyRequest = null; });
+ return keyRequest;
 }
 export async function callHost(input) {
 	if (input.type === 'vault.sweep') {
@@ -75,14 +85,14 @@ export async function callHost(input) {
 		await vault.syncHost();
 		return report;
 	}
-	if (!sessionKey) await loadState();
+	await ensureSessionKey();
 	const post = () => fetch(ENDPOINT, {
 		method: 'POST', cache: 'no-store',
 		headers: { 'content-type': 'application/json', 'x-session-toolbox-key': sessionKey },
 		body: JSON.stringify(input),
 	});
 	let response = await post();
-	if (response.status === 401) { await loadState(); response = await post(); }
+	if (response.status === 401) { await ensureSessionKey(true); response = await post(); }
 	const res = await readResponse(response);
 	sessionKey = res.key ?? sessionKey;
 	if (['move', 'move.complete', 'move.rollback', 'workspace.edit', 'workspace.complete', 'trash.session', 'trash.workspace', 'trash.restore', 'trash.purge'].includes(input.type)) {
@@ -150,19 +160,17 @@ export function apply(ctx) {
   const release = triggers.registerSource(replySource()); replyAvailable = true;
   return () => { replyAvailable = false; release(); };
  }));
+ if (typeof ctx.inject === 'function') ctx.inject(['uiConversation'], scope => {
+  if (typeof scope.get?.('uiConversation')?.userText?.register !== 'function') return;
+  scope.effect(() => scope.get('uiConversation').userText.register(replyTextRule()));
+  scope.slots.inject('conversation.user.text.node', () => scope.slots.register({ name: 'conversation.user.text.node', key: REPLY_TEXT_NODE, priority: 50, locale: NS }, SentReplyCard));
+ });
  installReplyNodes(ctx, (native, mirrors) => props => <ReplyMessage {...props} Native={native.component} mirrors={mirrors} toolboxT={ctx.locale.bind?.(NS)} />);
  ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({ name: 'conversation.input.dock', id: 'session-toolbox-reply', order: 1, locale: NS }, ReplyPreview));
+ ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({ name: 'conversation.input.dock', id: 'session-toolbox-edit-draft', order: 2, locale: NS }, EditDraftNotice));
+ ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({ name: 'conversation.input.dock', id: 'session-toolbox-next-tasks', order: 20, locale: NS }, NextTaskController));
 
 	installSidebar(ctx, native => props => <GroupedSidebar {...props} toolboxT={ctx.locale.bind?.(NS)} Native={native.component} />);
-	installQueueSteering(ctx, native => props => <NativeSteerQueue {...props} Native={native.component} toolboxT={ctx.locale.bind?.(NS)} />);
-	ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
-		name: 'conversation.input.dock', id: 'session-toolbox-steer', order: 15, locale: NS,
-		inject: sessionId => {
-			const scope = ctx.sessions?.scope?.(sessionId);
-			const conversation = scope?.get('conversation');
-			return { updateQueue: typeof conversation?.updateQueue === 'function' ? (id, action) => conversation.updateQueue(id, action) : undefined };
-		},
-	}, SteerQueueButton));
 
 	// Keyed slot (one occupant = package name): the plugin settings page.
 	ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({ name: 'plugins.bundle.config', key: NS, locale: NS }, KitPage));
@@ -171,6 +179,7 @@ export function apply(ctx) {
 	ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({ name: 'sidebar.workspaces.session.menu.item', id: 'session-toolbox-trash', order: 600, locale: NS }, TrashSessionMenuItem));
 	// Input dock badge (§4 FR5): how many image drafts are backed up here.
 	ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'session-toolbox-dialog', order: 500, locale: NS }, ToolboxOverlay));
+	ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'session-toolbox-selection', order: 510, locale: NS }, SelectionReplyMenu));
 	ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({ name: 'conversation.input.dock', id: 'session-toolbox-vault-badge', order: 5, locale: NS }, VaultBadge));
 }
 
@@ -247,6 +256,7 @@ export function KitPage({ t } = {}) {
 			</div>
 			{error ? <p className="error">后台连接失败：{error}</p> : null}
 			{feedback ? <p className="good">{feedback}</p> : null}
+			<NextTaskSettings state={state} act={act} busy={busy} />
 			<section className="box">
 				<h3>草稿保险箱（图片草稿持久化）</h3>
 				{settings ? (
@@ -404,6 +414,8 @@ export function ToolboxOverlay({ t } = {}) {
 	if (overlay.kind === 'group-move') return <MoveGroupDialog key={overlay.workspaceId} workspaceId={overlay.workspaceId} close={close} t={t} />;
 	if (overlay.kind === 'workspace') return <WorkspaceDialog key={overlay.workspaceId} workspaceId={overlay.workspaceId} close={close} t={t} />;
 	if (overlay.kind === 'move') return <MoveDialog key={overlay.sessionId} sessionId={overlay.sessionId} close={close} />;
+	if (overlay.kind === 'checkpoint') return <CheckpointDialog key={`${overlay.sessionId}:${overlay.seq}`} request={overlay} close={close} t={t} />;
+	if (overlay.kind === 'message-delete') return <DeleteMessageDialog key={`${overlay.sessionId}:${overlay.seq}`} request={overlay} close={close} t={t} />;
 	return <TrashDialog key={overlay.itemId || overlay.sessionId} request={overlay} close={close} />;
 }
 
@@ -504,28 +516,38 @@ export function VaultBadge({ sessionId }) {
 }
 
 const workspaceChinese = {
+ 'message.delete': '删除这条消息', 'message.deleteHelp': '从会话界面和后续 AI 上下文中移除这条消息，不撤销文件修改。其它消息仍可能包含相关信息。原始日志保留用于完整性校验，此操作不提供界面撤销。', 'message.deleteConfirm': '确认删除消息', 'message.deleted': '消息已删除，已从后续 AI 上下文移除',
+ 'reply.selection': '引用所选内容', 'reply.copy': '复制',
+ 'checkpoint.action': '恢复检查点', 'checkpoint.help': '撤销这条消息及之后的文件修改，保留全部聊天记录。仅支持已保存的本地项目文件，忽略 Git 忽略文件、依赖、构建和环境文件。工具运行期间请避免手动修改同一项目，该时段的写入无法区分来源。',
+ 'checkpoint.loading': '正在检查文件…', 'checkpoint.restore': '确认恢复文件', 'checkpoint.conflicts': '以下文件又被修改过，请先处理冲突：', 'checkpoint.empty': '没有需要恢复的文件。', 'checkpoint.done': '文件已恢复，聊天记录已保留。', 'checkpoint.retry': '重新检查',
+ 'nextTasks.title': '接下来', 'nextTasks.dismiss': '收起建议', 'reply.fromUser': '引用用户消息', 'reply.fromAssistant': '引用助手回复', 'nextTasks.generating': '正在生成后续任务候选…', 'nextTasks.failed': '后续任务候选生成失败（不会自动重试）', 'message.inComposer': '历史文字已载入输入框，可编辑并添加截图。', 'message.restoreDraft': '恢复原草稿文字', 'message.edit': '编辑并重新发送',
  'reply.action': '引用回复', 'reply.cancel': '取消引用', 'reply.user': '用户', 'reply.assistant': '助手', 'reply.unavailable': '当前输入框暂不支持引用回复',
  'community.join': '加入 QQ 交流群 ↗', 'community.name': 'AndroidSix 的开源项目交流群', 'community.number': '群号',
  'groups.title': '项目分组', 'groups.all': '全部项目', 'groups.none': '未分组', 'groups.manage': '管理项目与分组',
  'groups.move': '移入分组…', 'groups.drop': '可将项目拖到分组标题，或从项目菜单选择“移入分组”。', 'groups.name': '分组名称', 'groups.create': '新建分组', 'groups.rename': '重命名', 'groups.delete': '删除分组',
  'groups.help': '每个项目可归入一个分组；删除分组会将其中项目恢复为未分组。侧栏按“分组 → 项目 → 会话”展开，原生搜索仍搜索全部会话。',
- 'project.groupHelp': '分组选择后立即保存；名称和路径点击“保存”后生效。', 'project.editGroup': '编辑项目', 'queue.rowSteer': '引导', 'project.edit': '编辑项目', 'project.title': '项目名称', 'project.path': '项目目录', 'project.browse': '浏览…',
+ 'groups.intro': '整理项目归属，侧栏会同步更新。', 'groups.list': '分组', 'groups.projects': '项目', 'groups.empty': '这个分组还没有项目', 'groups.emptyHelp': '在“全部项目”中为项目选择所属分组。', 'groups.saved': '分组变更自动保存', 'groups.sessions': '个会话',
+ 'project.groupHelp': '分组选择后立即保存；名称和路径点击“保存”后生效。', 'project.editGroup': '编辑项目', 'project.edit': '编辑项目', 'project.title': '项目名称', 'project.path': '项目目录', 'project.browse': '浏览…',
  'project.help': '选择已有代码目录。保存后，将该项目的全部已有会话一起迁入新路径，保留顺序、归档及置顶状态；代码文件不会搬动，历史消息中的路径保持原样。会话必须空闲且没有排队消息。',
  'project.resume': '继续迁移', 'project.pending': '项目迁移尚未完成，请继续迁移。',
  'common.save': '保存', 'common.cancel': '取消', 'common.close': '关闭', 'common.busy': '处理中…', 'common.loading': '正在加载项目…',
- 'queue.steer': '引导下一条', 'queue.help': '将队列第一条交给当前运行轮次，在下一可用步骤接收，当前工具继续执行。也可在原生队列每条消息旁点击“引导”。',
 };
 const workspaceEnglish = {
+ 'message.delete': 'Delete this message', 'message.deleteHelp': 'Remove this message from the chat and future AI context. File changes are kept. Other messages may still contain related information. Original logs are retained for integrity; there is no UI undo.', 'message.deleteConfirm': 'Delete message', 'message.deleted': 'Message deleted from the chat and future AI context',
+ 'reply.selection': 'Quote selection', 'reply.copy': 'Copy',
+ 'checkpoint.action': 'Restore checkpoint', 'checkpoint.help': 'Undo file changes from this message onward; keep all chat messages. Saved local project files only; Git-ignored files, dependencies, build output and environment files are excluded. Avoid manual edits while tools run: changes made during execution cannot be attributed separately.',
+ 'checkpoint.loading': 'Checking files…', 'checkpoint.restore': 'Restore files', 'checkpoint.conflicts': 'These files changed again. Resolve conflicts first:', 'checkpoint.empty': 'No files need restoring.', 'checkpoint.done': 'Files restored. Chat history was kept.', 'checkpoint.retry': 'Check again',
+ 'nextTasks.title': 'Next steps', 'nextTasks.dismiss': 'Dismiss suggestions', 'reply.fromUser': 'Quoted message', 'reply.fromAssistant': 'Quoted reply', 'nextTasks.generating': 'Generating next task suggestions…', 'nextTasks.failed': 'Suggestions failed (no automatic retry)', 'message.inComposer': 'History text loaded into the composer. Edit it and add images.', 'message.restoreDraft': 'Restore previous draft text', 'message.edit': 'Edit and resend',
  'reply.action': 'Quote reply', 'reply.cancel': 'Cancel quote', 'reply.user': 'User', 'reply.assistant': 'Assistant', 'reply.unavailable': 'Quote reply is unavailable for this composer',
  'community.join': 'Join the QQ community ↗', 'community.name': 'AndroidSix open-source projects', 'community.number': 'Group',
  'groups.title': 'Project groups', 'groups.all': 'All projects', 'groups.none': 'Ungrouped', 'groups.manage': 'Manage projects and groups',
  'groups.move': 'Move to group…', 'groups.drop': 'Drag a project onto a group heading, or choose Move to group from its menu.', 'groups.name': 'Group name', 'groups.create': 'New group', 'groups.rename': 'Rename', 'groups.delete': 'Delete group',
  'groups.help': 'Each project belongs to one group. Deleting a group leaves its projects ungrouped. The sidebar nests projects under collapsible groups; native search still searches all chats.',
- 'project.groupHelp': 'Group changes save immediately. Name and directory changes apply when you click Save.', 'project.editGroup': 'Edit project', 'queue.rowSteer': 'Steer', 'project.edit': 'Edit project', 'project.title': 'Project name', 'project.path': 'Project directory', 'project.browse': 'Browse…',
+ 'groups.intro': 'Organize your projects. The sidebar updates automatically.', 'groups.list': 'Groups', 'groups.projects': 'Projects', 'groups.empty': 'No projects in this group', 'groups.emptyHelp': 'Choose a group for a project in All projects.', 'groups.saved': 'Group changes save automatically', 'groups.sessions': 'chats',
+ 'project.groupHelp': 'Group changes save immediately. Name and directory changes apply when you click Save.', 'project.editGroup': 'Edit project', 'project.edit': 'Edit project', 'project.title': 'Project name', 'project.path': 'Project directory', 'project.browse': 'Browse…',
  'project.help': 'Choose an existing code directory. Saving moves all existing chats to the new path and keeps their order, archive and pin state. Code files and paths in past messages stay as they are. Chats must be idle with no queued messages; the host releases their writer before migration.',
  'project.resume': 'Resume migration', 'project.pending': 'Project migration is incomplete. Resume it to continue.',
  'common.save': 'Save', 'common.cancel': 'Cancel', 'common.close': 'Close', 'common.busy': 'Working…', 'common.loading': 'Loading projects…',
- 'queue.steer': 'Steer next message', 'queue.help': 'Send the first queued message into the running turn at its next available step. Current tools keep running. Use the native queue to steer another message.',
 };
 const text = (t, key) => t ? t(key) : workspaceChinese[key];
 
@@ -647,61 +669,364 @@ function replyInput(sessionId) {
   return conversationService.input.for(binding.ctx);
  } catch { return undefined; }
 }
+function replyWritable(sessionId) {
+ try {
+  const value = sessionsService?.binding?.(sessionId)?.session?.getSnapshot?.();
+  return Boolean(value && !value.removed && (value.subagent === null || value.subagent?.address?.mode === 'continuable'));
+ } catch { return false; }
+}
 function useReplyInput(sessionId, phaseOnly = false) {
  const input = replyInput(sessionId);
  const read = () => { const value = input?.state?.getSnapshot?.(); return phaseOnly ? value?.phase : value; };
- const [snapshot, setSnapshot] = useState(read);
+ const [snapshot, setSnapshot] = useState(() => ({ input, value: read() }));
  useEffect(() => {
-  const sync = () => setSnapshot(read()); sync();
+  const sync = () => setSnapshot({ input, value: read() }); sync();
   return input?.state?.subscribe?.(sync);
  }, [input, phaseOnly]);
- return [input, snapshot];
+ // A reused composer must never expose the previous chat's draft for one render.
+ return [input, snapshot.input === input ? snapshot.value : read()];
+}
+const editDrafts = new Map();
+const DRAFT_CHANGED = 'dsh-session-toolbox:edit-draft';
+function announceDraft() { window.dispatchEvent(new CustomEvent(DRAFT_CHANGED)); }
+/** Programmatic writes preserve native attachments and semantic reference chips. */
+export function fillComposer(sessionId, value, replace = false) {
+ const input = replyInput(sessionId), snapshot = input?.state?.getSnapshot?.();
+ if (!replyWritable(sessionId) || snapshot?.phase !== 'plain') throw new Error('请等待当前会话输入框就绪');
+ // Image-only history has no text to load. Keep the existing draft intact.
+ if (replace && !value.trim()) { input.focus?.(); return; }
+ const draft = input.draftSnapshot ?? { text: snapshot.draft ?? '', references: (snapshot.occurrences ?? []).map(({ source, ref, offset, length, label, clipboardText, appearance, invalid }) => ({ source, ref, offset, length, label, clipboardText, ...(appearance === undefined ? {} : { appearance }), ...(invalid === undefined ? {} : { invalid }) })) };
+ if (replace) {
+  if (draft.text && !editDrafts.has(sessionId)) editDrafts.set(sessionId, draft);
+  input.setDraft({ text: value, references: [] });
+ } else {
+  input.setDraft({ ...draft, text: draft.text ? `${draft.text}\n\n${value}` : value });
+ }
+ input.persistCurrentDraft?.(); input.focus?.(); announceDraft();
+}
+export function EditDraftNotice({ sessionId, t }) {
+ const [input, snapshot] = useReplyInput(sessionId), [, update] = useState(0);
+ const [error, setError] = useState('');
+ useEffect(() => { const refresh = () => update(value => value + 1); window.addEventListener(DRAFT_CHANGED, refresh); return () => window.removeEventListener(DRAFT_CHANGED, refresh); }, []);
+ useEffect(() => { if (snapshot?.phase === 'plain' && !snapshot.draft && editDrafts.delete(sessionId)) announceDraft(); }, [sessionId, snapshot?.draft, snapshot?.phase]);
+ if (!editDrafts.has(sessionId)) return null;
+ return <div data-toolbox-edit-draft className="sk-reply-preview"><style>{replyStyle}</style><div>{text(t, 'message.inComposer')}</div><Button variant="ghost" disabled={snapshot?.phase !== 'plain'} onClick={() => {
+  try { if (!replyWritable(sessionId) || input.state.getSnapshot().phase !== 'plain') return; input.setDraft(editDrafts.get(sessionId)); input.persistCurrentDraft?.(); input.focus?.(); editDrafts.delete(sessionId); announceDraft(); } catch (reason) { setError(reason.message); }
+ }}>{text(t, 'message.restoreDraft')}</Button>{error && <span role="alert">{error}</span>}</div>;
+}
+const candidateView = createCandidateView({ getItem: key => window.sessionStorage?.getItem(key), setItem: (key, value) => window.sessionStorage?.setItem(key, value) });
+/** Observe only once per composer. Candidate buttons belong to their answer footer. */
+export function NextTaskController({ sessionId, useSession }) {
+ const { state } = useKit();
+ const [, snapshot] = useReplyInput(sessionId);
+ const running = useSession ? useSession(value => value.running) : false;
+ const enabled = state?.settings?.nextTasks?.enabled !== false;
+ const editing = Boolean(snapshot?.draft?.trim() || snapshot?.attachmentIds?.length);
+ const editingRef = useRef(editing); editingRef.current = editing;
+ useEffect(() => { if (editing) candidateView.dismiss(sessionId); }, [sessionId, editing]);
+ useEffect(() => {
+  let live = true, pending = false;
+  if (running || !enabled) candidateView.publish(sessionId, null);
+  const refresh = async () => {
+   if (!enabled || running || pending) return;
+   pending = true;
+   try {
+    const next = await callHost({ type: 'nextTasks.get', sessionId });
+    if (live) { candidateView.publish(sessionId, next); if (editingRef.current) candidateView.dismiss(sessionId); }
+   } catch { if (live) candidateView.publish(sessionId, null); }
+   finally { pending = false; }
+  };
+  void refresh(); const timer = enabled && !running ? setInterval(refresh, 3000) : undefined;
+  return () => { live = false; clearInterval(timer); };
+ }, [sessionId, enabled, running]);
+ return null;
+}
+export function NextTaskCandidates({ sessionId, seq, t }) {
+ const [result, setResult] = useState(() => candidateView.get(sessionId)), [error, setError] = useState('');
+ useEffect(() => { setResult(candidateView.get(sessionId)); return candidateView.subscribe(sessionId, setResult); }, [sessionId]);
+ const candidates = candidatesForTurn(result, seq);
+ if (!candidates.length) return null;
+ return <section data-toolbox-next-tasks className="sk-next-tasks" aria-label={text(t, 'nextTasks.title')}>
+  <style>{conversationExtrasStyle}</style>
+  <div className="sk-next-heading"><span>{text(t, 'nextTasks.title')}</span><button className="sk-extras-close" type="button" aria-label={text(t, 'nextTasks.dismiss')} title={text(t, 'nextTasks.dismiss')} onClick={() => candidateView.dismiss(sessionId)}><CloseIcon /></button></div>
+  <div className="sk-next-options">{candidates.map(value => <button className="sk-next-task" type="button" key={value} onClick={() => { try { fillComposer(sessionId, value); candidateView.dismiss(sessionId); setError(''); } catch (reason) { setError(reason.message); } }}><span>{value}</span><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true"><path d="M3 8h9M8 4l4 4-4 4" strokeLinecap="round" strokeLinejoin="round" /></svg></button>)}</div>
+  {error && <span role="alert">{error}</span>}
+ </section>;
+}
+
+function NextTaskSettings({ state, act, busy }) {
+ const usage = state?.nextTasks, totals = usage?.totals;
+ const number = value => Number(value ?? 0).toLocaleString();
+ return <section className="box" data-toolbox-next-settings><h3>接下来任务联想</h3>
+  <label className="row"><input type="checkbox" checked={state?.settings?.nextTasks?.enabled !== false} disabled={busy || !state?.settings} onChange={event => void act({ type: 'settings.update', patch: { nextTasks: { enabled: event.target.checked } } }, event.target.checked ? '已开启任务联想' : '已关闭任务联想并取消待生成请求').catch(() => {})} /> 问答结束后生成候选（默认开启）</label>
+  <p className="muted">每轮正常结束后额外调用一次该会话的模型；取最近最多 6 条可见文字（不含图片、工具和思考过程），输入上限 12 KB，输出上限 600 token。点击候选填入输入框，已有草稿会保留，由你决定是否发送。失败不自动重试。</p>
+  {usage?.available === false && <p className="error">当前 DSH 未提供模型调用接口，暂不生成。</p>}
+  {totals && <><div className="row"><span className="pill">调用 {number(totals.calls)}</span><span className="pill">成功 {number(totals.completed)}</span><span className="pill">失败 {number(totals.failed)} / 取消 {number(totals.cancelled)}</span><span className="pill">已报告总 token {number(totals.totalTokens)}</span></div>
+   <p className="muted">独立记录本功能的模型用量，不计入会话消息统计。未缓存输入 {number(totals.inputTokens)} · 缓存读取 {number(totals.cacheReadTokens)} · 缓存写入 {number(totals.cacheWriteTokens)} · 输出 {number(totals.outputTokens)}（含思考 {number(totals.reasoningTokens)}）。按服务商报告统计；缺少完整用量 {number(totals.unreported)} 次，尚未结算 {number(usage.pending)} 次，消耗未计入总数。日期按 UTC 记录。</p>
+   {!!usage.models?.length && <div style={{ overflowX: 'auto' }}><table><thead><tr><th>模型</th><th>调用</th><th>未缓存输入</th><th>缓存读 / 写</th><th>输出</th><th>已报告总 token</th></tr></thead><tbody>{usage.models.map(row => <tr key={`${row.provider}:${row.model}`}><td>{row.provider} / {row.model}</td><td>{number(row.calls)}</td><td>{number(row.inputTokens)}</td><td>{number(row.cacheReadTokens)} / {number(row.cacheWriteTokens)}</td><td>{number(row.outputTokens)}</td><td>{number(row.totalTokens)}</td></tr>)}</tbody></table></div>}
+   {!!usage.days?.length && <details><summary>最近 90 天消耗</summary><table><thead><tr><th>日期（UTC）</th><th>调用</th><th>已报告总 token</th><th>缺少用量</th></tr></thead><tbody>{[...usage.days].reverse().map(row => <tr key={row.date}><td>{row.date}</td><td>{number(row.calls)}</td><td>{number(row.totalTokens)}</td><td>{number(row.unreported)}</td></tr>)}</tbody></table></details>}
+  </>}
+ </section>;
+}
+const deletedMessages = new Map();
+function deletedStore(id) {
+ if (!deletedMessages.has(id)) deletedMessages.set(id, { seqs: new Set(), listeners: new Set(), revision: 0 });
+ return deletedMessages.get(id);
+}
+function publishDeleted(id, seqs) {
+ const state = deletedStore(id); state.revision++; state.seqs = new Set(seqs);
+ for (const listener of state.listeners) listener(state.seqs);
+}
+function refreshDeleted(id) {
+ const state = deletedStore(id);
+ if (state.loading) return state.loading;
+ const revision = state.revision;
+ state.loading = callHost({ type: 'message.list', sessionId: id }).then(value => { if (state.revision === revision) publishDeleted(id, value.seqs ?? []); }).catch(() => {
+  if (state.listeners.size && !state.retry) state.retry = setTimeout(() => { state.retry = undefined; void refreshDeleted(id); }, 1500);
+ }).finally(() => { state.loading = null; });
+ return state.loading;
+}
+function useDeletedMessages(id, running) {
+ const state = deletedStore(id), [seqs, setSeqs] = useState(state.seqs);
+ useEffect(() => {
+  state.listeners.add(setSeqs); setSeqs(state.seqs); void refreshDeleted(id);
+  const refresh = () => { void refreshDeleted(id); }; window.addEventListener('focus', refresh);
+  return () => { state.listeners.delete(setSeqs); if (!state.listeners.size) { clearTimeout(state.retry); state.retry = undefined; } window.removeEventListener('focus', refresh); };
+ }, [id, running]);
+ return seqs;
 }
 const replyStyle = `.sk-reply-button{display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;padding:5px;background:transparent;border:0;border-radius:var(--dsw-radius-sm,6px);color:var(--dsw-alias-label-tertiary);cursor:pointer}.sk-reply-button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.sk-reply-button:disabled{opacity:.4;cursor:default}.sk-reply-preview{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,12px);color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;background:var(--dsw-alias-bg-module-platform)}.sk-reply-preview>div{min-width:0;flex:1;border-left:2px solid var(--dsw-alias-label-tertiary);padding-left:10px}.sk-reply-preview p{margin:4px 0 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:pre-wrap;overflow-wrap:anywhere}.sk-reply-preview strong{font-size:12px;font-weight:500}`;
+const replyCarets = new WeakMap();
 export function ReplyMessage({ Native, mirrors, toolboxT, ...props }) {
  const root = useRef(null), [target, setTarget] = useState(null), [error, setError] = useState('');
  const [input, phase] = useReplyInput(props.sessionId, true);
  const quote = messageReply(props.node);
  const canWrite = props.useSession ? props.useSession(value => !value.removed && (value.subagent === null || value.subagent?.address?.mode === 'continuable')) : false;
+ const running = props.useSession ? props.useSession(value => value.running) : false;
+ const seq = messageSequence(props.node), deleted = useDeletedMessages(props.sessionId, running).has(seq);
  useEffect(() => {
+  if (deleted) { setTarget(null); return; }
   const discover = () => setTarget(root.current?.querySelector('[data-clock]') ?? null);
   const observer = new MutationObserver(discover); if (root.current) observer.observe(root.current, { childList: true, subtree: true }); discover();
   return () => observer.disconnect();
- }, []);
+ }, [deleted]);
  const label = text(toolboxT, 'reply.action');
  const reply = () => {
   try {
    if (!replyAvailable || !input || !canWrite) throw new Error(text(toolboxT, 'reply.unavailable'));
-   input.setDraft(withReply(input.state.getSnapshot(), quote, `${label} · ${text(toolboxT, quote.role === 'user' ? 'reply.user' : 'reply.assistant')}`));
-   input.persistCurrentDraft?.(); setError('');
-   // Focus the same session's public contenteditable, without changing selection in another chat.
-   const surface = root.current?.closest('[data-conversation-session]');
-   surface?.querySelector('[data-composer-card] [contenteditable="true"]')?.focus();
+   insertReply(input, quote, `${label} · ${text(toolboxT, quote.role === 'user' ? 'reply.user' : 'reply.assistant')}`, replyCarets.get(input));
+   setError('');
   } catch (reason) { setError(reason.message); }
  };
  const nativeProps = { ...props, renderSlot: (name, ...args) => props.renderSlot(mirrors.get(name) ?? name, ...args) };
+ if (deleted) return null;
  return <div ref={root} style={{ display: 'contents' }}><Native {...nativeProps} /><style>{replyStyle}</style>
-  {quote && target && createPortal(<Tooltip label={label} side="bottom"><button type="button" className="sk-reply-button" aria-label={label} disabled={!replyAvailable || !input || !canWrite || phase !== 'plain'} onClick={reply}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><path d="M6 3 2 6.5 6 10M2.5 6.5H10a4 4 0 0 1 0 8H8" /></svg></button></Tooltip>, target)}
+  {target && createPortal(<>{quote && <Tooltip label={label} side="bottom"><button type="button" className="sk-reply-button" aria-label={label} disabled={!replyAvailable || !input || !canWrite || phase !== 'plain'} onClick={reply}><QuoteIcon /></button></Tooltip>}
+   {['user', 'steering'].includes(props.node?.kind) && Number.isSafeInteger(props.node.anchorSeq) && <MessageAction sessionId={props.sessionId} node={props.node} canWrite={canWrite} running={running} t={toolboxT} />}
+   {seq !== undefined && <Tooltip label={text(toolboxT, 'message.delete')} side="bottom"><button type="button" className="sk-reply-button" aria-label={text(toolboxT, 'message.delete')} disabled={!canWrite || running} onClick={() => showOverlay({ kind: 'message-delete', sessionId: props.sessionId, seq })}><DeleteIcon /></button></Tooltip>}
+  </>, target)}
+  {props.node?.kind === 'turn-tail' && <NextTaskCandidates sessionId={props.sessionId} seq={props.node.data?.seq} t={toolboxT} />}
   {error && <span role="alert">{error}</span>}
  </div>;
 }
-export function ReplyPreview({ sessionId, t }) {
- const [input, snapshot] = useReplyInput(sessionId);
- const [error, setError] = useState('');
- const occurrence = snapshot?.occurrences?.find(row => row.source === REPLY_SOURCE);
- let quote; try { if (occurrence) quote = readReply(occurrence.ref); } catch { /* host marks invalid chips; do not take down the composer */ }
- if (!quote) return null;
- const cancel = () => { try { input.setDraft(withoutReply(input.state.getSnapshot())); input.persistCurrentDraft?.(); setError(''); } catch (reason) { setError(reason.message); } };
- return <div><style>{replyStyle}</style><div className="sk-reply-preview" data-toolbox-reply role="region" aria-label={text(t, 'reply.action')}>
-  <div><strong>{text(t, 'reply.action')} · {text(t, quote.role === 'user' ? 'reply.user' : 'reply.assistant')}</strong><p>{quote.text}</p></div>
-  <button type="button" className="sk-reply-button" aria-label={text(t, 'reply.cancel')} disabled={snapshot.phase !== 'plain'} onClick={cancel}>×</button>
- </div>{error && <p role="alert">{error}</p>}</div>;
+export function QuoteIcon() {
+ return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.15" aria-hidden="true"><circle cx="8" cy="8" r="6" /><path d="M5 8h2v2H5V8c0-1.3.6-2.3 1.6-2.7M9 8h2v2H9V8c0-1.3.6-2.3 1.6-2.7" strokeLinejoin="round" /></svg>;
+}
+function CloseIcon() {
+ return <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" strokeLinecap="round" /></svg>;
+}
+const conversationExtrasStyle = `
+.sk-next-tasks{max-width:640px;min-width:0;margin:18px 0 4px;color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;line-height:20px}
+.sk-next-heading{display:flex;align-items:center;gap:12px;margin-bottom:8px;color:var(--dsw-alias-label-secondary);font-size:12px}.sk-next-heading>span{flex:1}
+.sk-next-options{display:flex;flex-direction:column;align-items:flex-start;gap:7px}
+.sk-next-task{box-sizing:border-box;display:inline-flex;align-items:center;gap:12px;max-width:100%;min-height:34px;padding:7px 11px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;line-height:20px;text-align:left;cursor:pointer;transition:background 120ms,color 120ms,border-color 120ms}
+.sk-next-task>span{min-width:0;overflow-wrap:anywhere}.sk-next-task>svg{flex:none;color:var(--dsw-alias-label-tertiary)}.sk-next-task:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-label-quaternary,var(--dsw-alias-border-l2))}
+.sk-extras-close{display:inline-flex;align-items:center;justify-content:center;flex:none;min-width:26px;width:26px;height:26px;padding:5px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}.sk-extras-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.sk-next-task:focus-visible,.sk-extras-close:focus-visible,.sk-sent-quote-toggle:focus-visible{outline:2px solid var(--dsw-alias-state-active-primary);outline-offset:3px}
+.sk-next-task:disabled,.sk-extras-close:disabled{opacity:.45;cursor:default}
+.sk-quote-list{box-sizing:border-box;order:-1;display:flex;flex-direction:column;gap:6px;min-width:0;max-height:180px;overflow-y:auto;margin:4px 12px 0;padding:3px}
+.sk-quote-draft{display:flex;flex:none;align-items:flex-start;gap:10px;min-width:0;padding:10px 11px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-1);font:inherit;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary);box-sizing:border-box}
+.sk-quote-mark{display:flex;align-items:center;justify-content:center;flex:none;width:24px;height:24px;color:var(--dsw-alias-label-secondary)}
+.sk-quote-copy{flex:1;min-width:0;border-left:2px solid var(--dsw-alias-state-active-primary);padding-left:10px}.sk-quote-label{display:block;font-size:12px;line-height:18px;font-weight:500;color:var(--dsw-alias-label-primary)}
+.sk-quote-excerpt{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere;white-space:pre-wrap;line-height:20px;margin-top:3px}
+.sk-sent-quote{box-sizing:border-box;display:block;min-width:0;margin:0 0 10px;padding:9px 11px;border-radius:9px;border:1px solid var(--dsw-alias-border-l2);border-left:2px solid var(--dsw-alias-state-active-primary);background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px;white-space:normal}
+.sk-sent-quote-toggle{display:flex;align-items:center;gap:7px;width:100%;padding:0;border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:20px;text-align:left;cursor:pointer}.sk-sent-quote-toggle>svg{flex:none}.sk-sent-quote-toggle>span{flex:1}.sk-sent-quote-toggle svg:last-child{color:var(--dsw-alias-label-tertiary);transition:transform 120ms}.sk-sent-quote[data-expanded=true] .sk-sent-quote-toggle svg:last-child{transform:rotate(180deg)}
+.sk-sent-quote .sk-quote-excerpt{-webkit-line-clamp:3}.sk-sent-quote[data-expanded=true] .sk-quote-excerpt{display:block}
+@media(prefers-reduced-motion:reduce){.sk-next-task,.sk-sent-quote-toggle svg:last-child{transition:none}}
+`;
+
+export function SentReplyCard({ node, t }) {
+ const [expanded, setExpanded] = useState(false);
+ const quote = node.data;
+ return <span data-toolbox-sent-reply className="sk-sent-quote" data-expanded={expanded}><style>{conversationExtrasStyle}</style>
+  <button className="sk-sent-quote-toggle" type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}><QuoteIcon /><span>{text(t, quote.role === 'user' ? 'reply.fromUser' : 'reply.fromAssistant')}</span><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true"><path d="m4 6 4 4 4-4" strokeLinecap="round" strokeLinejoin="round" /></svg></button>
+  <span className="sk-quote-excerpt"><UserTextRun text={quote.text} /></span>
+ </span>;
+}
+function RestoreIcon() {
+ return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden="true"><path d="M6 3 2 6.5 6 10M2.5 6.5H10a4 4 0 0 1 0 8H8" /></svg>;
 }
 
-export function NativeSteerQueue({ Native, toolboxT, ...props }) {
- const label = text(toolboxT, 'queue.rowSteer');
- return <><style>{`[data-queue-dock] button[aria-label="引导"],[data-queue-dock] button[aria-label="Steer"]{display:inline-flex;align-items:center;justify-content:center;width:auto;min-width:56px;gap:4px;padding:0 8px;font:inherit;font-size:12px}[data-queue-dock] button[aria-label="引导"]::after,[data-queue-dock] button[aria-label="Steer"]::after{content:attr(aria-label)}`}</style><Native {...props} t={(key, ...args) => key === 'queue.steer' ? label : props.t(key, ...args)} /></>;
+const CHECKPOINT_CHANGED = 'dsh-session-toolbox:checkpoint-changed';
+export function MessageAction({ sessionId, node, canWrite, running, t }) {
+ const [status, setStatus] = useState(null), [error, setError] = useState(''), [busy, setBusy] = useState(false);
+ const locked = useRef(false);
+ useEffect(() => {
+  let live = true, revision = 0;
+  setStatus(null); setError('');
+  const refresh = () => {
+   const request = ++revision;
+   return callHost({ type: 'checkpoint.status', sessionId, seq: node.anchorSeq }).then(value => { if (live && request === revision) { setStatus(value); setError(''); } }).catch(reason => { if (live && request === revision) { setStatus(null); setError(reason.message); } });
+  };
+  void refresh();
+  window.addEventListener(CHECKPOINT_CHANGED, refresh); window.addEventListener('focus', refresh);
+  const timer = running ? setInterval(refresh, 3000) : undefined;
+  return () => { live = false; revision++; clearInterval(timer); window.removeEventListener(CHECKPOINT_CHANGED, refresh); window.removeEventListener('focus', refresh); };
+ }, [sessionId, node.anchorSeq, running]);
+ const edit = status?.action === 'edit';
+ const label = text(t, edit ? 'message.edit' : status ? 'checkpoint.action' : 'checkpoint.loading');
+ const open = async () => {
+  if (locked.current || !canWrite) return;
+  locked.current = true; setBusy(true); setError('');
+  try {
+   const latest = await callHost({ type: 'checkpoint.status', sessionId, seq: node.anchorSeq }); setStatus(latest);
+   if (latest.action === 'pending') return;
+   if (latest.action === 'edit') fillComposer(sessionId, messageReply(node)?.text ?? '', true);
+   else showOverlay({ kind: 'checkpoint', sessionId, seq: latest.seq ?? node.anchorSeq });
+  } catch (reason) { setError(reason.message); }
+  finally { locked.current = false; setBusy(false); }
+ };
+ return <><Tooltip label={error || label} side="bottom"><button type="button" className="sk-reply-button" aria-label={label} disabled={!canWrite || busy || (!status && !error) || status?.action === 'pending'} onClick={() => void open()}>{edit ? <EditIcon /> : <RestoreIcon />}</button></Tooltip>{error && <span role="alert">{error}</span>}</>;
 }
+function EditIcon() {
+ return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true"><path d="m10.5 2.5 3 3M3 10l7.7-7.7a1.4 1.4 0 0 1 2 2L5 12l-3 1 1-3Z" strokeLinejoin="round" /></svg>;
+}
+function DeleteIcon() {
+ return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true"><path d="M2.5 4.5h11M6 4V2.5h4V4M4 4.5l.7 9h6.6l.7-9M6.5 6.5v5M9.5 6.5v5" strokeLinejoin="round" /></svg>;
+}
+export function DeleteMessageDialog({ request, close, t }) {
+ const [busy, setBusy] = useState(false), [error, setError] = useState('');
+ const locked = useRef(false);
+ const remove = async () => {
+  if (locked.current) return;
+  locked.current = true; setBusy(true); setError('');
+  try {
+   if (!replyWritable(request.sessionId)) throw new Error(text(t, 'reply.unavailable'));
+   const result = await callHost({ type: 'message.delete', sessionId: request.sessionId, seq: request.seq });
+   if (!result.removedFromContext) throw new Error('宿主尚未确认移除上下文，请重试');
+   publishDeleted(request.sessionId, result.seqs); close(); dispatchNotice(text(t, 'message.deleted'));
+  } catch (reason) { setError(reason.message); }
+  finally { locked.current = false; setBusy(false); }
+ };
+ const dismiss = () => { if (!locked.current) close(); };
+ return <Modal open title={text(t, 'message.delete')} description={text(t, 'message.deleteHelp')} closeLabel={text(t, 'common.close')} onClose={dismiss}
+  footer={<><Button variant="outline" disabled={busy} onClick={dismiss}>{text(t, 'common.cancel')}</Button><Button variant="primary" style={{ background: 'var(--dsw-alias-state-error-primary,#c93636)', color: '#fff', borderColor: 'transparent' }} disabled={busy} onClick={() => void remove()}>{text(t, busy ? 'common.busy' : 'message.deleteConfirm')}</Button></>}>
+  {error && <p role="alert">{error}</p>}
+ </Modal>;
+}
+
+export function CheckpointDialog({ request, close, t }) {
+ const [preview, setPreview] = useState(null), [busy, setBusy] = useState(false), [error, setError] = useState(''), [done, setDone] = useState(false), [revision, setRevision] = useState(0);
+ useEffect(() => {
+  let live = true; setPreview(null); setError('');
+  callHost({ type: 'checkpoint.preview', sessionId: request.sessionId, seq: request.seq }).then(value => { if (live) setPreview(value); }).catch(reason => { if (live) setError(reason.message); });
+  return () => { live = false; };
+ }, [request.sessionId, request.seq, revision]);
+ const restore = async () => {
+  if (busy || !preview || preview.conflicts.length || !preview.files.length) return;
+  setBusy(true); setError('');
+  try { await callHost({ type: 'checkpoint.restore', sessionId: request.sessionId, seq: request.seq, id: preview.id }); setDone(true); window.dispatchEvent(new CustomEvent(CHECKPOINT_CHANGED)); }
+  catch (reason) { setError(reason.message); setPreview(null); }
+  finally { setBusy(false); }
+ };
+ const dismiss = () => { if (!busy) close(); };
+ return <Modal open title={text(t, 'checkpoint.action')} description={text(t, 'checkpoint.help')} closeLabel={text(t, 'common.close')} onClose={dismiss}
+  footer={<><Button variant="outline" disabled={busy} onClick={dismiss}>{text(t, done ? 'common.close' : 'common.cancel')}</Button>{!done && <><Button variant="outline" disabled={busy} onClick={() => setRevision(value => value + 1)}>{text(t, 'checkpoint.retry')}</Button><Button disabled={busy || !preview?.files.length || preview?.conflicts.length > 0} onClick={() => void restore()}>{text(t, busy ? 'common.busy' : 'checkpoint.restore')}</Button></>}</>}>
+  <div className="sk"><style>{styles}</style>
+   {done ? <p role="status">{text(t, 'checkpoint.done')}</p> : <>{!preview && !error && <p role="status">{text(t, 'checkpoint.loading')}</p>}
+    {preview && (preview.files.length ? <ul style={{ maxHeight: '40vh', overflow: 'auto', overflowWrap: 'anywhere' }}>{preview.files.map(file => <li key={file.path}><code>{file.path}</code> <span className="muted">{({ modify: '↶', restore: '+', delete: '−' })[file.action]}</span></li>)}</ul> : <p>{text(t, 'checkpoint.empty')}</p>)}
+    {preview?.conflicts.length > 0 && <div role="alert"><p>{text(t, 'checkpoint.conflicts')}</p><ul>{preview.conflicts.map(path => <li key={path}><code>{path}</code></li>)}</ul></div>}</>}
+   {error && <p role="alert">{error}</p>}
+  </div>
+ </Modal>;
+}
+
+export function SelectionReplyMenu({ t }) {
+ const [menu, setMenu] = useState(null), [error, setError] = useState('');
+ const root = useRef(null);
+ useEffect(() => {
+  const open = event => {
+   const selected = selectedReply(window.getSelection?.());
+   if (!selected || !selected.surface.contains(event.target) || event.target.closest?.('input,textarea,[contenteditable="true"]')) return;
+   event.preventDefault(); event.stopPropagation(); setError('');
+   setMenu({ ...selected, x: Math.max(8, Math.min(event.clientX, window.innerWidth - 208)), y: Math.max(8, Math.min(event.clientY, window.innerHeight - 110)) });
+  };
+  document.addEventListener('contextmenu', open, true);
+  return () => document.removeEventListener('contextmenu', open, true);
+ }, []);
+ useEffect(() => {
+  if (!menu) return;
+  root.current?.querySelector('button')?.focus();
+  const dismiss = event => { if (!root.current?.contains(event.target)) setMenu(null); };
+  const close = () => setMenu(null);
+  document.addEventListener('pointerdown', dismiss, true); window.addEventListener('scroll', close, true); window.addEventListener('resize', close);
+  return () => { document.removeEventListener('pointerdown', dismiss, true); window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+ }, [menu]);
+ if (!menu) return null;
+ const input = replyInput(menu.sessionId), available = replyAvailable && replyWritable(menu.sessionId) && input?.state.getSnapshot()?.phase === 'plain';
+ const quote = () => {
+  try {
+   if (!available || !replyWritable(menu.sessionId) || !menu.surface.isConnected) throw new Error(text(t, 'reply.unavailable'));
+   window.getSelection()?.removeAllRanges();
+   insertReply(input, { role: menu.role, text: menu.text }, text(t, 'reply.selection'), replyCarets.get(input));
+   setMenu(null);
+  } catch (reason) { setError(reason.message); }
+ };
+ const keyboard = event => {
+  if (event.key === 'Escape') { event.preventDefault(); setMenu(null); }
+  if (['ArrowDown', 'ArrowUp'].includes(event.key)) { event.preventDefault(); const buttons = [...root.current.querySelectorAll('button:not(:disabled)')]; const index = buttons.indexOf(document.activeElement); buttons[(index + (event.key === 'ArrowDown' ? 1 : buttons.length - 1)) % buttons.length]?.focus(); }
+ };
+ return createPortal(<div ref={root} data-toolbox-selection-menu role="menu" aria-label={text(t, 'reply.selection')} onKeyDown={keyboard} style={{ position: 'fixed', left: menu.x, top: menu.y, zIndex: 10000, width: 200, padding: 5, borderRadius: 'var(--dsw-radius-md,8px)', background: 'var(--dsw-alias-bg-module-platform,#303030)', border: '1px solid var(--dsw-alias-border-l2,#484848)', boxShadow: '0 6px 24px #0005', color: 'var(--dsw-alias-label-primary)', fontSize: 13 }}>
+  <style>{`.sk-selection-item{display:flex;align-items:center;gap:8px;width:100%;padding:7px 9px;background:transparent;color:inherit;border:0;border-radius:var(--dsw-radius-sm,6px);font:inherit;text-align:left;cursor:pointer}.sk-selection-item:hover,.sk-selection-item:focus-visible{outline:none;background:var(--dsw-alias-interactive-bg-hover,#ffffff14)}.sk-selection-item:disabled{opacity:.4;cursor:default}`}</style>
+  <button className="sk-selection-item" role="menuitem" type="button" onClick={async () => { try { await navigator.clipboard.writeText(menu.text); setMenu(null); } catch (reason) { setError(reason.message); } }}>{text(t, 'reply.copy')}</button>
+  <button className="sk-selection-item" role="menuitem" type="button" disabled={!available} onClick={quote}><QuoteIcon />{text(t, 'reply.selection')}</button>
+  {error && <p role="alert">{error}</p>}
+ </div>, document.body);
+}
+export function ReplyPreview({ sessionId, t, renderFactorySlot }) {
+ const [input, snapshot] = useReplyInput(sessionId);
+ const [error, setError] = useState(''), [target, setTarget] = useState(null), anchor = useRef(null);
+ useEffect(() => {
+  if (!input?.actions?.captureInsertion) return;
+  const capture = () => {
+   const editor = anchor.current?.closest('[data-conversation-session]')?.querySelector('[data-composer-card] [contenteditable="true"]');
+   if (editor && editor.contains(document.activeElement)) replyCarets.set(input, input.actions.captureInsertion());
+  };
+  // Capture before a message button or text selection takes focus away from the composer.
+  document.addEventListener('pointerdown', capture, true); document.addEventListener('focusout', capture, true);
+  return () => { document.removeEventListener('pointerdown', capture, true); document.removeEventListener('focusout', capture, true); replyCarets.delete(input); };
+ }, [input, sessionId]);
+ const quotes = (snapshot?.occurrences ?? []).filter(row => row.source === REPLY_SOURCE).flatMap(occurrence => {
+  try { return [{ occurrence, quote: readReply(occurrence.ref) }]; } catch { return []; /* invalid chips remain native */ }
+ });
+ useEffect(() => {
+  if (!quotes.length) { setTarget(null); return; }
+  const surface = anchor.current?.closest('[data-conversation-session]');
+  const find = () => { const card = surface?.querySelector('[data-composer-card]'); if (card) { setTarget({ sessionId, card }); return true; } return false; };
+  if (find() || !surface) return;
+  const observer = new MutationObserver(() => { if (find()) observer.disconnect(); }); observer.observe(surface, { childList: true, subtree: true });
+  return () => observer.disconnect();
+ }, [sessionId, Boolean(quotes.length)]);
+ const cancel = occurrence => { try { input.setDraft(withoutReply(input.state.getSnapshot(), occurrence)); input.persistCurrentDraft?.(); input.focus?.(); setError(''); } catch (reason) { setError(reason.message); } };
+ return <><span hidden ref={anchor} />{quotes.length > 0 && target?.sessionId === sessionId && createPortal(<div className="sk-quote-list" data-toolbox-replies role="region" aria-label={text(t, 'reply.action')} onMouseDown={event => event.stopPropagation()}>
+  <style>{conversationExtrasStyle}</style>{quotes.map(({ occurrence, quote }, index) => <div className="sk-quote-draft" data-toolbox-reply key={occurrence.occurrenceId ?? `${occurrence.offset}:${occurrence.ref}`}>
+   <span className="sk-quote-mark"><QuoteIcon /></span>
+   <div className="sk-quote-copy"><strong className="sk-quote-label">{quotes.length > 1 && `${index + 1} · `}{text(t, quote.role === 'user' ? 'reply.fromUser' : 'reply.fromAssistant')}</strong><span className="sk-quote-excerpt">{typeof renderFactorySlot === 'function' ? renderFactorySlot('conversation.user.text', { text: quote.text, facts: { toolboxQuoteBody: true } }) : quote.text}</span></div>
+   <button type="button" className="sk-extras-close" aria-label={`${text(t, 'reply.cancel')}${quotes.length > 1 ? ` ${index + 1}` : ''}`} title={text(t, 'reply.cancel')} disabled={snapshot.phase !== 'plain'} onClick={() => cancel(occurrence)}><CloseIcon /></button>
+  </div>)}{error && <span role="alert">{error}</span>}
+ </div>, target.card)}</>;
+}
+
 
 function WorkspaceSection({ state, t }) {
  const [busy, setBusy] = useState(false), [error, setError] = useState('');
@@ -719,36 +1044,79 @@ function WorkspaceSection({ state, t }) {
  </section>;
 }
 
+const groupsStyle = `
+.sk-groups-dialog{width:min(820px,calc(100vw - 40px));max-width:calc(100vw - 40px);max-height:calc(100dvh - 40px);overflow-y:auto;overscroll-behavior:contain}
+.sk-groups{color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.5;min-width:0}
+.sk-groups *{box-sizing:border-box}.sk-groups button,.sk-groups input,.sk-groups select{font:inherit}.sk-groups button{cursor:pointer}.sk-groups button:disabled{cursor:default}
+.sk-groups-intro{margin:0 0 20px;color:var(--dsw-alias-label-secondary)}
+.sk-groups-layout{display:grid;grid-template-columns:180px minmax(0,1fr);gap:24px;min-height:360px}
+.sk-groups-sidebar{display:flex;flex-direction:column;gap:16px;min-width:0;border-right:1px solid var(--dsw-alias-border-l2);padding-right:20px}
+.sk-groups-caption{margin:0;color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:500}
+.sk-groups-nav{display:flex;flex-direction:column;gap:4px;max-height:300px;overflow-y:auto;min-width:0}
+.sk-group-filter{display:flex;align-items:center;gap:8px;flex:none;width:100%;min-height:36px;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);padding:8px 10px;text-align:left}
+.sk-group-filter>span:first-child{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;flex:1}.sk-group-count{font-size:12px;font-variant-numeric:tabular-nums;opacity:.7}
+.sk-group-filter:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.sk-group-filter[aria-pressed=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);font-weight:600}
+.sk-groups-form{display:flex;flex-direction:column;gap:8px;margin-top:auto;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}.sk-groups-form-actions{display:flex;gap:6px}.sk-groups-form-actions>button:first-child{flex:1}
+.sk-groups input,.sk-groups select{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);border-radius:7px;color:var(--dsw-alias-label-primary);min-height:34px;padding:7px 9px;min-width:0;max-width:100%}.sk-groups input{width:100%}.sk-groups input::placeholder{color:var(--dsw-alias-label-tertiary)}
+.sk-groups :is(button,input,select):focus-visible{outline:2px solid var(--dsw-alias-state-active-primary);outline-offset:2px}
+.sk-groups-main{min-width:0;display:flex;flex-direction:column}.sk-groups-heading{display:flex;align-items:center;gap:8px;min-height:30px;margin-bottom:12px}.sk-groups-heading h3{font-size:14px;font-weight:600;line-height:22px;margin:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.sk-groups-heading>.sk-group-count{flex:1}.sk-group-actions{display:flex;align-items:center;gap:4px}.sk-group-actions>button{padding:5px 7px;min-height:28px}.sk-groups .sk-group-danger{color:var(--dsw-alias-state-error-primary)}
+.sk-group-projects{max-height:min(420px,calc(100dvh - 260px));overflow-y:auto;overscroll-behavior:contain;padding:2px;min-height:0}
+.sk-group-project{display:flex;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2);min-width:0}.sk-group-project:first-child{padding-top:8px}.sk-group-project:last-child{border-bottom:0}.sk-group-project>svg{flex:none;color:var(--dsw-alias-label-secondary)}
+.sk-group-project-copy{min-width:0;flex:1}.sk-group-project-name{display:flex;align-items:baseline;gap:8px;min-width:0}.sk-group-project-name strong{font-size:13px;font-weight:500;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.sk-group-project-name span{flex:none;color:var(--dsw-alias-label-secondary);font-size:12px}
+.sk-group-project-path{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;margin-top:3px;color:var(--dsw-alias-label-secondary);font:12px/18px ui-monospace,monospace}
+.sk-group-project-actions{display:flex;align-items:center;gap:6px;flex:none}.sk-group-project-actions select{width:110px;font-size:12px}.sk-group-project-actions>button{padding:7px;min-height:32px}
+.sk-groups-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;min-height:220px;text-align:center;color:var(--dsw-alias-label-secondary)}.sk-groups-empty p{margin:0}.sk-groups-empty strong{color:var(--dsw-alias-label-primary);font-weight:500}.sk-groups-note{font-size:12px;color:var(--dsw-alias-label-secondary);margin:16px 0 0}.sk-groups-error{color:var(--dsw-alias-state-error-primary);margin:12px 0 0}
+@media(max-width:680px){.sk-groups-layout{grid-template-columns:1fr;gap:20px;min-height:0}.sk-groups-sidebar{border:0;padding:0;gap:10px}.sk-groups-nav{flex-direction:row;flex-wrap:wrap;max-height:110px;gap:4px}.sk-group-filter{width:auto;gap:12px;max-width:100%}.sk-groups-form{flex-direction:row;align-items:center;margin:0;padding:0;border:0}.sk-groups-form label{flex:1;min-width:0}.sk-groups-form label>span{display:none}.sk-groups-form-actions{flex:none}.sk-groups-caption{display:none}.sk-groups-intro{margin-bottom:16px}.sk-group-projects{max-height:max(120px,calc(100dvh - 390px))}.sk-groups-heading{margin-bottom:6px}.sk-group-project{gap:8px}.sk-group-project>svg{display:none}.sk-group-project-name{display:block}.sk-group-project-name strong{display:block}.sk-group-project-name span{font-size:12px}.sk-group-project-actions select{width:96px}}
+`;
+
 export function GroupsDialog({ close, t }) {
  const { state } = useKit();
  const [name, setName] = useState(''), [editing, setEditing] = useState(''), [busy, setBusy] = useState(false), [error, setError] = useState('');
- const groups = state?.groups ?? [];
+ const [selected, setSelected] = useState(null), nameInput = useRef(null);
+ const groups = state?.groups ?? [], projects = state?.projects ?? [];
+ const groupOf = id => groups.find(group => group.workspaceIds.includes(id))?.id ?? '';
+ const selectedGroup = groups.find(group => group.id === selected);
+ const visible = projects.filter(project => selected === null || groupOf(project.id) === selected);
+ useEffect(() => { if (selected && state && !groups.some(group => group.id === selected)) setSelected(null); }, [state, selected]);
+ useEffect(() => { if (editing) { nameInput.current?.focus(); nameInput.current?.select(); } }, [editing]);
+ const blocked = busy || !state || !!state.workspaceMove;
  const run = async input => {
-  if (busy) return;
+  if (blocked) return;
   setBusy(true); setError('');
-  try { await callHost(input); await loadState(); setName(''); setEditing(''); }
+  try { await callHost(input); await loadState(); if (['group.rename', 'group.create'].includes(input.type) || input.type === 'group.delete' && input.groupId === editing) { setName(''); setEditing(''); } }
   catch (reason) { setError(reason.message); }
   finally { setBusy(false); }
  };
- return <Modal open title={text(t, 'groups.manage')} closeLabel={text(t, 'common.close')} onClose={() => { if (!busy) close(); }}>
-  <div className="sk stack sk-dialog-body"><style>{styles}</style><p className="muted">{text(t, 'groups.help')}</p>
-   <form className="row" onSubmit={event => { event.preventDefault(); void run({ type: editing ? 'group.rename' : 'group.create', groupId: editing, title: name }); }}>
-    <input className="grow" aria-label={text(t, 'groups.name')} placeholder={text(t, 'groups.name')} maxLength={80} value={name} disabled={busy} onChange={event => setName(event.target.value)} />
-    <Button type="submit" variant="outline" disabled={busy || !name.trim()}>{text(t, editing ? 'common.save' : 'groups.create')}</Button>
-    {editing && <Button type="button" variant="ghost" disabled={busy} onClick={() => { setEditing(''); setName(''); }}>{text(t, 'common.cancel')}</Button>}
-   </form>
-   {groups.map(group => <div className="row" key={group.id}><strong style={{ flex: 1 }}>{group.title}</strong>
-    <Button variant="ghost" disabled={busy || !!state.workspaceMove} onClick={() => { setEditing(group.id); setName(group.title); }}>{text(t, 'groups.rename')}</Button>
-    <Button variant="ghost" disabled={busy || !!state.workspaceMove} onClick={() => void run({ type: 'group.delete', groupId: group.id })}>{text(t, 'groups.delete')}</Button>
-   </div>)}
-   {!state ? <p role="status">{text(t, 'common.loading')}</p> : state.projects.map(project => <div className="box" key={project.id}>
-    <div><strong>{project.title}</strong> · {project.sessions}<p className="muted mono">{project.path}</p></div>
-    <div className="row"><select aria-label={`${project.title} — ${text(t, 'groups.title')}`} disabled={busy || !!state.workspaceMove} value={groups.find(group => group.workspaceIds.includes(project.id))?.id ?? ''} onChange={event => void run({ type: 'group.assign', workspaceId: project.id, groupId: event.target.value })}>
-     <option value="">{text(t, 'groups.none')}</option>{groups.map(group => <option key={group.id} value={group.id}>{group.title}</option>)}
-    </select><Button variant="outline" disabled={busy || !!state.workspaceMove} onClick={() => showOverlay({ kind: 'workspace', workspaceId: project.id })}>{text(t, 'project.edit')}</Button></div>
-   </div>)}
-   {state?.workspaceMove && <WorkspaceSection state={state} t={t} />}
-   {error && <p role="alert" className="error">{error}</p>}
+ const filters = [{ id: null, title: text(t, 'groups.all'), count: projects.length }, ...groups.map(group => ({ ...group, count: projects.filter(project => groupOf(project.id) === group.id).length })), { id: '', title: text(t, 'groups.none'), count: projects.filter(project => !groupOf(project.id)).length }];
+ return <Modal open className="sk-groups-dialog" title={text(t, 'groups.manage')} closeLabel={text(t, 'common.close')} onClose={() => { if (!busy) close(); }}>
+  <div className="sk-groups" data-toolbox-groups><style>{groupsStyle}</style>
+   <p className="sk-groups-intro">{text(t, 'groups.intro')}</p>
+   <div className="sk-groups-layout">
+    <aside className="sk-groups-sidebar">
+     <h3 className="sk-groups-caption">{text(t, 'groups.list')}</h3>
+     <nav className="sk-groups-nav" aria-label={text(t, 'groups.title')}>{filters.map(group => <button type="button" className="sk-group-filter" key={group.id ?? 'all'} title={group.title} aria-pressed={selected === group.id} onClick={() => setSelected(group.id)}><span>{group.title}</span><span className="sk-group-count">{group.count}</span></button>)}</nav>
+     <form className="sk-groups-form" onSubmit={event => { event.preventDefault(); void run({ type: editing ? 'group.rename' : 'group.create', groupId: editing, title: name }); }}>
+      <label><span className="sk-groups-caption">{text(t, editing ? 'groups.rename' : 'groups.create')}</span><input ref={nameInput} aria-label={text(t, 'groups.name')} placeholder={text(t, 'groups.name')} maxLength={80} value={name} disabled={blocked} onChange={event => setName(event.target.value)} /></label>
+      <div className="sk-groups-form-actions"><Button type="submit" variant={editing ? 'primary' : 'outline'} disabled={blocked || !name.trim()}>{text(t, editing ? 'common.save' : 'groups.create')}</Button>{editing && <Button type="button" variant="ghost" disabled={busy} onClick={() => { setEditing(''); setName(''); }}>{text(t, 'common.cancel')}</Button>}</div>
+     </form>
+    </aside>
+    <section className="sk-groups-main" aria-label={text(t, 'groups.projects')}>
+     <div className="sk-groups-heading"><h3>{selected === null ? text(t, 'groups.all') : selectedGroup?.title ?? text(t, 'groups.none')}</h3><span className="sk-group-count">{visible.length}</span>
+      {selectedGroup && <div className="sk-group-actions"><Button variant="ghost" disabled={blocked} title={text(t, 'groups.rename')} aria-label={text(t, 'groups.rename')} onClick={() => { setEditing(selectedGroup.id); setName(selectedGroup.title); }}><EditIcon /></Button><Button className="sk-group-danger" variant="ghost" disabled={blocked} title={text(t, 'groups.delete') + ' · ' + text(t, 'groups.help')} aria-label={text(t, 'groups.delete')} onClick={() => void run({ type: 'group.delete', groupId: selectedGroup.id })}><DeleteIcon /></Button></div>}
+     </div>
+     <div className="sk-group-projects">
+      {!state ? <p role="status">{text(t, 'common.loading')}</p> : visible.map(project => <div className="sk-group-project" data-toolbox-group-project key={project.id}>
+       <IconFolderOpenOutlineRegular size={18} aria-hidden="true" />
+       <div className="sk-group-project-copy"><div className="sk-group-project-name"><strong title={project.title}>{project.title}</strong><span>{project.sessions} {text(t, 'groups.sessions')}</span></div><span className="sk-group-project-path" title={project.path}>{project.path}</span></div>
+       <div className="sk-group-project-actions"><select aria-label={`${project.title} — ${text(t, 'groups.title')}`} disabled={blocked} value={groupOf(project.id)} onChange={event => void run({ type: 'group.assign', workspaceId: project.id, groupId: event.target.value })}><option value="">{text(t, 'groups.none')}</option>{groups.map(group => <option key={group.id} value={group.id}>{group.title}</option>)}</select><Button variant="ghost" title={text(t, 'project.edit')} aria-label={`${project.title} — ${text(t, 'project.edit')}`} disabled={blocked} onClick={() => showOverlay({ kind: 'workspace', workspaceId: project.id })}><EditIcon /></Button></div>
+      </div>)}
+      {state && !visible.length && <div className="sk-groups-empty"><IconFolderOpenOutlineRegular size={28} aria-hidden="true" /><strong>{text(t, 'groups.empty')}</strong><p>{text(t, 'groups.emptyHelp')}</p></div>}
+     </div>
+     <p className="sk-groups-note">{text(t, 'groups.saved')}</p>
+    </section>
+   </div>
+   {state?.workspaceMove && <div className="sk stack"><style>{styles}</style><WorkspaceSection state={state} t={t} /></div>}
+   {error && <p role="alert" className="sk-groups-error">{error}</p>}
   </div>
  </Modal>;
 }
@@ -801,29 +1169,4 @@ export function WorkspaceDialog({ workspaceId, close, t }) {
    {state?.workspaceMove && <WorkspaceSection state={state} t={t} />}
   </div>
  </Modal>;
-}
-
-/** Native steer moves the same inbox row to next-step; it never cancels the running tools. */
-export function SteerQueueButton({ useSession, useProjection, updateQueue, phase, readOnly, t }) {
- const inbox = useProjection('inbox');
- const running = useSession(state => state.running);
- const mutable = useSession(state => state.subagent === null || state.subagent?.address?.mode === 'continuable');
- const submissions = useSession(state => state.pendingSubmissions ?? []);
- const inChat = new Set(submissions.filter(row => row.placement === 'transcript').map(row => row.requestId));
- const queue = (inbox?.['next-turn'] ?? []).filter(row => row.source?.kind !== 'user' || !inChat.has(row.source.rpcId));
- const [busy, setBusy] = useState(false), [error, setError] = useState('');
- const sending = useRef(false);
- if (!queue.length) return null;
- const disabled = busy || !running || !mutable || readOnly === true || phase !== undefined && phase !== 'ready' || typeof updateQueue !== 'function';
- const steer = async () => {
-  if (disabled || sending.current) return;
-  sending.current = true; setBusy(true); setError('');
-  try { await updateQueue(queue[0].id, { kind: 'steer' }); }
-  catch (reason) { setError(reason.message); }
-  finally { sending.current = false; setBusy(false); }
- };
- return <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-  <Button variant="outline" disabled={disabled} title={text(t, 'queue.help')} onClick={steer}>{text(t, busy ? 'common.busy' : 'queue.steer')} ({queue.length})</Button>
-  {error && <span role="alert">{error}</span>}
- </div>;
 }

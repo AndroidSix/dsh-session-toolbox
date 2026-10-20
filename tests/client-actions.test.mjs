@@ -6,12 +6,12 @@ import { readFile } from 'node:fs/promises';
 async function client() {
 	let entry;
 	let values = [];
-	const effects = [], updates = [], timers = new Map();
+	const effects = [], updates = [], initialized = [], timers = new Map();
 	let clock = 0, timerId = 0;
 	const events = new Map();
 	const render = (type, props) => ({ type, props });
 	const native = Object.fromEntries(['MenuItemButton', 'Modal', 'Button', 'IconFolderOpenOutlineRegular', 'IconArchiveOutlineRegular'].map(name => [name, name]));
-	const react = { useState: initial => [values.length ? values.shift() : initial, value => updates.push(value)], useRef: () => ({ current: null }), useEffect: (run, deps) => effects.push({ run, deps }), useMemo: fn => fn() };
+	const react = { useState: initial => { const value = values.length ? values.shift() : typeof initial === 'function' ? initial() : initial; initialized.push(value); return [value, value => updates.push(value)]; }, useRef: value => ({ current: value }), useEffect: (run, deps) => effects.push({ run, deps }), useMemo: fn => fn() };
 	const sandbox = vm.createContext({ console, setTimeout: (run, delay) => { const id = ++timerId; timers.set(id, { run, at: clock + delay }); return id; }, clearTimeout: id => timers.delete(id), setInterval: () => 0, clearInterval() {},
 		CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } },
 		window: { __ModuleLoader__: { load: value => { entry = value; } }, dispatchEvent(event) { events.get(event.type)?.(event); }, addEventListener: (type, listener) => events.set(type, listener), removeEventListener() {} },
@@ -25,14 +25,75 @@ async function client() {
 		if (id === '@deepseek-ai/dsh-client-ui-primitives') return native;
 		throw new Error(id);
 	});
-	return { plugin, states: next => { values = next; }, native, fetch: fn => { sandbox.fetch = fn; }, effects, updates,
+	return { plugin, states: next => { values = next; }, native, fetch: fn => { sandbox.fetch = fn; }, effects, updates, initialized,
 		tick: ms => { clock += ms; for (const [id, timer] of timers) if (timer.at <= clock) { timers.delete(id); timer.run(); } } };
 }
+
+test('switching from a draft to an empty chat never dismisses the destination suggestions using the old draft', async () => {
+ const c = await client();
+ const inputs = Object.fromEntries(['draft', 'empty'].map(id => [id, { state: { getSnapshot: () => ({ phase: 'plain', draft: id === 'draft' ? 'unfinished question' : '', attachmentIds: [] }) } }]));
+ c.plugin.apply({ sessions: { binding: id => ({ ctx: id }) }, conversation: { input: { for: id => inputs[id] } }, get() {}, effect: fn => fn(), locale: { register() {} }, slots: { inject() {} } });
+ c.plugin.NextTaskController({ sessionId: 'draft' });
+ const previous = c.initialized.at(-1);
+ c.effects.length = 0;
+ // React can reuse the component and its state before the input subscription effect runs.
+ c.states([0, previous]);
+ c.plugin.NextTaskController({ sessionId: 'empty' });
+ const dismissal = c.effects.find(effect => effect.deps?.length === 2 && effect.deps[0] === 'empty');
+ assert.equal(dismissal.deps[1], false, 'the empty destination must not inherit the old chat editing state');
+});
 function find(node, predicate) {
 	if (!node || typeof node !== 'object') return undefined;
 	if (predicate(node)) return node;
-	for (const child of [node.props?.children].flat(Infinity)) { const result = find(child, predicate); if (result) return result; }
+	for (const child of [node.props?.children, node.props?.footer].flat(Infinity)) { const result = find(child, predicate); if (result) return result; }
 }
+
+test('empty checkpoint uses an edit icon, changes keep restore, and action is checked again on click', async () => {
+ const c = await client(); let latest = { action: 'edit', tracked: true };
+ let draft;
+ c.plugin.apply({ sessions: { binding: () => ({ session: { getSnapshot: () => ({ subagent: null, removed: false }) }, ctx: {} }) }, conversation: { input: { for: () => ({ state: { getSnapshot: () => ({ phase: 'plain', draft: '' }) }, setDraft: value => { draft = value; } }) } }, get() {}, effect: fn => fn(), locale: { register() {} }, slots: { inject() {} } });
+ c.fetch(async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ ...latest, key: 'k' }) }));
+ const render = status => { c.states([status, '', false]); return c.plugin.MessageAction({ sessionId: 's', node: { kind: 'user', anchorSeq: 9, data: { content: [{ type: 'text', text: 'original' }] } }, canWrite: true }); };
+ let tree = render({ action: 'edit' });
+ const button = find(tree, node => node.type === 'button'); assert.equal(button.props['aria-label'], '编辑并重新发送');
+ await button.props.onClick(); await new Promise(resolve => setImmediate(resolve));
+ assert.equal(draft.text, 'original');
+ latest = { action: 'restore', seq: 20 };
+ await button.props.onClick(); await new Promise(resolve => setImmediate(resolve));
+ const overlay = c.plugin.ToolboxOverlay(); assert.equal(overlay.type, c.plugin.CheckpointDialog); assert.equal(overlay.props.request.seq, 20);
+ tree = render(latest); assert.equal(find(tree, node => node.type === 'button').props['aria-label'], '恢复检查点');
+ tree = render({ action: 'pending' }); assert.equal(find(tree, node => node.type === 'button').props.disabled, true);
+});
+
+test('edit loads the native composer, restores its previous semantic draft and appends candidates without sending or dropping attachments', async () => {
+ const c = await client(); let draft = { text: 'draft @file', references: [{ source: 'file', offset: 6, length: 5, ref: 'f' }] }, phase = 'plain', persisted = 0, focused = 0;
+ const attachments = ['screenshot'];
+ const input = { state: { getSnapshot: () => ({ phase, draft: draft.text, attachmentIds: attachments }) }, get draftSnapshot() { return draft; }, setDraft: value => { draft = value; }, persistCurrentDraft: () => persisted++, focus: () => focused++ };
+ c.plugin.apply({ sessions: { binding: id => { assert.equal(id, 'selected'); return { session: { getSnapshot: () => ({ subagent: null, removed: false }) }, ctx: {} }; } }, conversation: { input: { for: () => input } }, get() {}, effect: fn => fn(), locale: { register() {} }, slots: { inject() {} } });
+ c.plugin.fillComposer('selected', 'original history text', true); assert.equal(draft.text, 'original history text'); assert.equal(focused, 1);
+ const tree = c.plugin.EditDraftNotice({ sessionId: 'selected' });
+ find(tree, node => node.type === c.native.Button).props.onClick(); assert.equal(draft.text, 'draft @file'); assert.equal(draft.references[0].source, 'file');
+ c.plugin.fillComposer('selected', '', true); assert.equal(draft.text, 'draft @file', 'editing image-only history must not wipe current text');
+ c.plugin.fillComposer('selected', 'next task'); assert.equal(draft.text, 'draft @file\n\nnext task'); assert.equal(draft.references[0].offset, 6); assert.deepEqual(attachments, ['screenshot']); assert.equal(persisted, 3);
+ phase = 'submitting'; assert.throws(() => c.plugin.fillComposer('selected', 'blocked'), /就绪/); assert.equal(persisted, 3);
+});
+
+test('message delete waits for confirmation and host context removal before dismissing; failures remain visible', async () => {
+ const c = await client(), calls = [], closed = [];
+ c.plugin.apply({ sessions: { binding: () => ({ session: { getSnapshot: () => ({ removed: false, subagent: null }) } }) }, conversation: {}, get() {}, effect: fn => fn(), locale: { register() {} }, slots: { inject() {} } });
+ let accepted = false;
+ c.fetch(async (_url, options) => {
+  if (options?.body) calls.push(JSON.parse(options.body));
+  return { ok: true, status: 200, text: async () => JSON.stringify({ key: 'k', removedFromContext: accepted, seqs: [7] }) };
+ });
+ c.states([false, '']); const tree = c.plugin.DeleteMessageDialog({ request: { sessionId: 'selected', seq: 7 }, close: () => closed.push(true) });
+ assert.equal(calls.length, 0, 'opening the dialog must not delete');
+ const button = find(tree, node => node.type === c.native.Button && node.props.children === '确认删除消息');
+ assert.equal(button.props.variant, 'primary'); assert.match(button.props.style.background, /error/);
+ button.props.onClick(); await new Promise(resolve => setImmediate(resolve)); assert.equal(closed.length, 0); assert(c.updates.some(value => typeof value === 'string' && value.includes('尚未确认')));
+ accepted = true; button.props.onClick(); button.props.onClick(); await new Promise(resolve => setImmediate(resolve)); assert.equal(closed.length, 1); assert.equal(calls.length, 2);
+ assert.equal(calls[1].type, 'message.delete'); assert.equal(calls[1].seq, 7);
+});
 
 test('panel preflight uses the parent action and does not reference an undefined busy setter', async () => {
 	const c = await client();
@@ -68,6 +129,17 @@ test('a late snapshot cannot replace the project counts read after a move', asyn
 	assert.deepEqual(Array.from(latest.projects, row => row.sessions), [1, 4]);
 });
 
+test('concurrent message mounts share one key bootstrap and never POST with an empty authorization key', async () => {
+ const c = await client(); let reads = 0, release;
+ const writes = [];
+ c.fetch(async (_url, options) => {
+  if (!options?.body) { reads++; await new Promise(resolve => { release = resolve; }); return { ok: true, status: 200, text: async () => JSON.stringify({ key: 'ready', projects: [] }) }; }
+  writes.push(options.headers['x-session-toolbox-key']); return { ok: true, status: 200, text: async () => JSON.stringify({ seqs: [] }) };
+ });
+ const requests = Array.from({ length: 20 }, () => c.plugin.callHost({ type: 'message.list', sessionId: 's' }));
+ assert.equal(reads, 1); release(); await Promise.all(requests); assert.equal(writes.length, 20); assert(writes.every(key => key === 'ready'));
+});
+
 test('native workspace notifications refresh the pool and project counts, and unsubscribe on unload', async () => {
 	const c = await client();
 	let changed, reads = 0, disposed = false;
@@ -88,43 +160,16 @@ test('native workspace notifications refresh the pool and project counts, and un
 	assert.equal(disposed, true);
 });
 
-test('manual steering sends the original durable queue item once without cancelling the turn', async () => {
- const c = await client();
- let release;
- const calls = [];
- const props = { phase: 'ready', readOnly: false, sessionId: 'session-a',
-  useSession: selector => selector({ running: true, subagent: null }),
-  useProjection: () => ({ 'next-turn': [{ id: 'q1', content: [{ type: 'text', text: 'continue' }] }, { id: 'q2' }] }),
-  updateQueue: (...args) => { calls.push(args); return new Promise(resolve => { release = resolve; }); },
- };
- const tree = c.plugin.SteerQueueButton(props);
- const button = find(tree, node => node.type === c.native.Button);
- assert.equal(button.props.disabled, false);
- const first = button.props.onClick();
- await button.props.onClick();
- assert.equal(calls.length, 1);
- assert.equal(calls[0][0], 'q1');
- assert.equal(calls[0][1].kind, 'steer');
- release(); await first;
- assert.equal(c.plugin.SteerQueueButton({ ...props, useProjection: () => ({}) }), null);
- const idle = c.plugin.SteerQueueButton({ ...props, useSession: selector => selector({ running: false, subagent: null }) });
- assert.equal(find(idle, node => node.type === c.native.Button).props.disabled, true);
-});
-
-test('steering is disabled for disconnected/read-only/locked sessions and uses scoped public API', async () => {
- const c = await client();
- const base = { useSession: fn => fn({ running: true, subagent: null }), useProjection: () => ({ 'next-turn': [{ id: 'queued' }] }), updateQueue() {} };
- for (const change of [{ phase: 'pending' }, { readOnly: true }, { updateQueue: undefined }, { useSession: fn => fn({ running: true, subagent: { address: { mode: 'readonly' } } }) }]) {
-  assert.equal(find(c.plugin.SteerQueueButton({ ...base, ...change }), node => node.type === c.native.Button).props.disabled, true);
- }
- const registered = [], calls = [];
- c.plugin.apply({ get() {}, effect: fn => fn(), locale: { register: () => () => {} },
-  slots: { inject: (name, fn) => fn(), register: (spec, component) => { registered.push({ spec, component }); return () => {}; } },
-  sessions: { scope: id => { calls.push(['scope', id]); return { get: name => { assert.equal(name, 'conversation'); return { updateQueue: (...args) => calls.push(args) }; } }; } },
+test('plugin leaves the official queue entry and its handlers untouched', async () => {
+ const c = await client(), registered = [], NativeQueue = () => {}, updateQueue = () => {};
+ const original = { options: { name: 'conversation.input.dock', id: 'queue' }, component: NativeQueue, inject: () => ({ updateQueue }) };
+ c.plugin.apply({ get() {}, effect: fn => fn(), locale: { register: () => () => {} }, sessions: {},
+  slots: { entries: name => name === 'conversation.input.dock' ? [original] : [], subscribe: () => () => {},
+   inject: (_name, run) => run(), register: (spec, component) => { registered.push({ spec, component }); return () => {}; } },
  });
- const row = registered.find(row => row.component === c.plugin.SteerQueueButton);
- await row.spec.inject('session-scope').updateQueue('queued', { kind: 'steer' });
- assert.deepEqual(calls.map(row => row[0]), ['scope', 'queued']);
+ assert.equal(registered.some(row => ['queue', 'session-toolbox-steer'].includes(row.spec.id)), false);
+ assert.equal(original.component, NativeQueue); assert.equal(original.inject().updateQueue, updateQueue);
+ assert.equal(c.plugin.SteerQueueButton, undefined); assert.equal(c.plugin.NativeSteerQueue, undefined);
 });
 
 test('sidebar hierarchy retains all native sessions and forwards native menus and actions', async () => {
@@ -146,15 +191,6 @@ test('sidebar hierarchy retains all native sessions and forwards native menus an
  assert.equal(rendered[0][1].sessionId, '1');
 });
 
-
-test('row steering keeps native queue handlers and localizes the visible action', async () => {
- const c=await client(); function Native() {} const updateQueue=()=>{};
- const tree=c.plugin.NativeSteerQueue({Native,updateQueue,t:key=>key,toolboxT:key=>key==='queue.rowSteer'?'引导':key});
- const native=find(tree,node=>node.type===Native);
- assert.equal(native.props.updateQueue,updateQueue);
- assert.equal(native.props.t('queue.steer'),'引导');
- assert.equal(native.props.t('queue.remove'),'queue.remove');
-});
 
 test('sidebar move feedback expires after completion, keeps busy visible and cancels old notice timers', async () => {
  const c = await client();

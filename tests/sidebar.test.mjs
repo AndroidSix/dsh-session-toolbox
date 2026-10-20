@@ -63,18 +63,6 @@ test('group hierarchy orders actual projects once and retains unassigned project
 });
 
 
-test('native queue decoration follows late registration and unloads without replacing handlers', async () => {
- const { installQueueSteering } = await import('../src/sidebar.mjs');
- const entries=[],registered=[],effects=[];let changed;
- const ctx={effect:fn=>{effects.push(fn());},slots:{entries:()=>entries,inject:(name,fn)=>fn(),subscribe:(name,fn)=>{changed=fn;return()=>{};},register:(options,component)=>{const row={options,component,disposed:false};registered.push(row);return()=>{row.disposed=true;};}}};
- installQueueSteering(ctx, entry => function Decorated(){});
- assert.equal(registered.length,0);
- const native={options:{id:'queue',order:20},component(){},inject(){}};entries.push(native);changed();
- assert.equal(registered.length,1);assert.equal(registered[0].options.inject,native.inject);
- changed();assert.equal(registered.length,1);
- effects.forEach(dispose=>dispose?.());assert.equal(registered[0].disposed,true);
-});
-
 test('project menu keeps pointer transitions between the native anchor and portal inside one boundary', async t => {
  t.mock.timers.enable({ apis: ['setTimeout'] });
  const { protectProjectMenu } = await import('../src/sidebar.mjs');

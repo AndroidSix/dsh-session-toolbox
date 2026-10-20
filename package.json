@@ -1,11 +1,11 @@
 {
   "name": "dsh-session-toolbox",
-  "version": "0.1.26",
+  "version": "0.1.38",
   "repository": {
     "type": "git",
     "url": "https://github.com/AndroidSix/dsh-session-toolbox.git"
   },
-  "description": "Draft vault, workspace groups, project path migration, queue steering and archive pool for DeepSeek Harness",
+  "description": "Draft vault, workspace groups, project path migration and archive pool for DeepSeek Harness",
   "type": "module",
   "main": "lib/index.js",
   "bin": {

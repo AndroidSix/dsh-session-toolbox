@@ -13,6 +13,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
 	draftVault: { enabled: true, maxSizeBytes: 200 * 1024 * 1024, ttlDays: 7 },
 	trash: { ttlDays: 30, autoPurge: false },
 	move: { enabled: true },
+	nextTasks: { enabled: true },
 });
 
 const OWNED = { mode: 0o600, dirMode: 0o700 };
@@ -23,6 +24,7 @@ function mergeSettings(raw) {
 		draftVault: { ...DEFAULT_SETTINGS.draftVault, ...(raw.draftVault ?? {}) },
 		trash: { ...DEFAULT_SETTINGS.trash, ...(raw.trash ?? {}) },
 		move: { ...DEFAULT_SETTINGS.move, ...(raw.move ?? {}) },
+		nextTasks: { ...DEFAULT_SETTINGS.nextTasks, ...(raw.nextTasks ?? {}) },
 	};
 }
 
@@ -75,6 +77,7 @@ export class JsonDocument {
 export function guardSettings(value, file) {
 	if (value.version !== undefined && value.version !== 1) throw new Error(`session-toolbox: unsupported settings version in ${file}: ${String(value.version)}`);
 	if (value.move?.enabled !== undefined && typeof value.move.enabled !== 'boolean') throw new Error(`session-toolbox: settings.move.enabled must be boolean (${file})`);
+	if (value.nextTasks?.enabled !== undefined && typeof value.nextTasks.enabled !== 'boolean') throw new Error(`session-toolbox: settings.nextTasks.enabled must be boolean (${file})`);
 	const draft = value.draftVault ?? {};
 	if (draft.enabled !== undefined && typeof draft.enabled !== 'boolean') throw new Error(`session-toolbox: settings.draftVault.enabled must be boolean (${file})`);
 	if (draft.maxSizeBytes !== undefined && !positiveInt(draft.maxSizeBytes)) throw new Error(`session-toolbox: settings.draftVault.maxSizeBytes must be a positive safe integer (${file})`);

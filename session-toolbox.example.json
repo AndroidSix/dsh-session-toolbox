@@ -11,5 +11,8 @@
   },
   "move": {
     "enabled": true
+  },
+  "nextTasks": {
+    "enabled": true
   }
 }

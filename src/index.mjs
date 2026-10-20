@@ -8,7 +8,7 @@
  */
 import { mkdir, realpath, stat } from 'node:fs/promises';
 import { appendFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { guardJournal, guardLedger, guardManifest, guardSettings, JsonDocument } from './store.mjs';
@@ -17,6 +17,9 @@ import { createSessionMaintenance } from './session-maintenance.mjs';
 import { TrashEngine } from './trash.mjs';
 import { WorkspaceTools, guardGroups, guardWorkspaceJournal } from './workspace.mjs';
 import { apiHandler, dispatch } from './api.mjs';
+import { Checkpoints, installCheckpoints } from './checkpoints.mjs';
+import { MessageTools } from './messages.mjs';
+import { NextTasks, installNextTasks } from './next-tasks.mjs';
 import pkg from '../package.json' with { type: 'json' };
 const pluginVersion = pkg.version;
 
@@ -95,6 +98,30 @@ async function applyInner(ctx, options = {}) {
 		capabilities: hostCapabilities(ctx),
 	});
 	const workspace = new WorkspaceTools({ registry: () => ctx.get('workspaceRegistry'), move, groups: groupsDoc, journal: workspaceJournalDoc, ledger: ledgerDoc });
+	const checkpoints = new Checkpoints({ root, busy: async cwd => {
+		const sessions = ctx.get('sessions')?.list?.() ?? [];
+		for (const session of sessions) {
+			const path = ctx.get('workingDirectory')?.get?.(session) ?? session.header?.cwd;
+			if (typeof path !== 'string') continue;
+			const actual = await realpath(path).catch(() => path);
+			if (actual !== cwd && !actual.startsWith(cwd + sep) && !cwd.startsWith(actual + sep)) continue;
+			if (await hostCapabilities(ctx).sessionLive(session.id ?? session.header?.id)) return true;
+			for (const agent of ctx.get('agents')?.list?.() ?? []) if (agent.session?.id === (session.id ?? session.header?.id) && ctx.get('terminals')?.list?.(agent).some(terminal => terminal.status.kind === 'running')) return true;
+		}
+		return false;
+	} });
+	installCheckpoints(ctx, checkpoints);
+	const messageIdle = sessionId => {
+		const agent = ctx.get('agents')?.get?.(sessionId);
+		return !agent || agent.status === 'idle' && !agent.inbox.nextTurn.length && !agent.inbox.nextStep.length;
+	};
+	const messages = new MessageTools({ sessions: () => ctx.get('sessions'), idle: messageIdle, busy: async sessionId => {
+		if (await hostCapabilities(ctx).sessionLive(sessionId)) return true;
+		return !messageIdle(sessionId);
+	} });
+	const nextTasks = new NextTasks({ root, settings: () => settingsCache, llm: () => ctx.get('llm'), busy: id => !messageIdle(id) });
+	await nextTasks.restore().catch(error => ctx.logger.warn(`任务联想缓存恢复失败：${error.message}`));
+	installNextTasks(ctx, nextTasks);
 	const trash = new TrashEngine({
 		adapter: registryAdapter(ctx),
 		sessions: async () => {
@@ -131,9 +158,13 @@ async function applyInner(ctx, options = {}) {
 		move,
 		trash,
 		workspace,
+		checkpoints,
+		messages,
+		nextTasks,
 		updateSettings: async patch => {
 			const next = await settingsDoc.update(current => deepMerge(current, patch));
 			settingsCache = next;
+			nextTasks.configure();
 			return next;
 		},
 		vaultSync: async records => {
@@ -157,6 +188,7 @@ async function applyInner(ctx, options = {}) {
 				pluginVersion,
 				capabilities,
 				settings,
+				nextTasks: await nextTasks.summary(),
 				journal,
 				projects: listProjects(ctx),
 				groups: (await groupsDoc.read()).groups,
@@ -181,7 +213,7 @@ async function applyInner(ctx, options = {}) {
 		},
 		action: input => {
 			const result = pendingAction.then(async () => {
-				if (!['workspace.complete', 'project.of', 'trash.list', 'vault.sync', 'vault.sweep', 'settings.update'].includes(input.type)) await workspace.assertIdle();
+				if (!['nextTasks.get', 'workspace.complete', 'project.of', 'trash.list', 'vault.sync', 'vault.sweep', 'settings.update'].includes(input.type)) await workspace.assertIdle();
 				return dispatch(kit, input);
 			});
 			pendingAction = result.catch(() => {});

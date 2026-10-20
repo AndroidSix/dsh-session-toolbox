@@ -64,6 +64,16 @@ export async function dispatch(kit, input) {
 		throw Object.assign(new Error('会话迁移功能已停用'), { code: 'feature-disabled' });
 	}
 	switch (input.type) {
+		case 'nextTasks.get': return kit.nextTasks.state(String(input.sessionId ?? ''));
+		case 'message.list': return kit.messages.list(String(input.sessionId ?? ''));
+		case 'message.delete': {
+			const result = await kit.messages.delete(String(input.sessionId ?? ''), input.seq);
+			kit.nextTasks?.invalidate(String(input.sessionId ?? ''));
+			return result;
+		}
+		case 'checkpoint.status': return await kit.checkpoints.status(String(input.sessionId ?? ''), input.seq);
+		case 'checkpoint.preview': return await kit.checkpoints.preview(String(input.sessionId ?? ''), input.seq);
+		case 'checkpoint.restore': return await kit.checkpoints.restore(String(input.sessionId ?? ''), input.seq, input.id);
 		case 'group.create': return await kit.workspace.createGroup(input.title);
 		case 'group.rename': return await kit.workspace.renameGroup(String(input.groupId ?? ''), input.title);
 		case 'group.delete': return await kit.workspace.deleteGroup(String(input.groupId ?? ''));

@@ -126,30 +126,6 @@ export function sidebarLayout(workspaces, groups) {
   .sort((a, b) => a.group - b.group || a.index - b.index);
 }
 
-export function installQueueSteering(ctx, makeComponent) {
- if (typeof ctx.slots.entries !== 'function' || typeof ctx.slots.subscribe !== 'function') return;
- ctx.slots.inject('conversation.input.dock', () => ctx.effect(() => {
-  let original, release, syncing = false;
-  const owned = new Set();
-  const sync = () => {
-   if (syncing) return;
-   const native = ctx.slots.entries('conversation.input.dock').find(entry => entry.options.id === 'queue' && !owned.has(entry.component));
-   if (native === original) return;
-   syncing = true;
-   try {
-    release?.(); release = undefined; original = native;
-    if (!native?.component || native.children) return;
-    const component = makeComponent(native); owned.add(component);
-    release = ctx.slots.register({ ...native.options, name: 'conversation.input.dock', priority: (native.options.priority ?? 0) - 10,
-     store: native.store, inject: native.inject, locale: native.locale }, component);
-   } finally { syncing = false; }
-  };
-  const unsubscribe = ctx.slots.subscribe('conversation.input.dock', sync);
-  sync();
-  return () => { unsubscribe(); release?.(); };
- }));
-}
-
 /** React portals have separate event ancestry. Keep the native menu's leave timer
  * from treating a transition to an added item as an exit from its anchor. */
 export function protectProjectMenu(doc, anchor, menu, close) {

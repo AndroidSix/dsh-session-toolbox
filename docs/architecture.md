@@ -12,7 +12,6 @@
 │  ├ KitPage          插件详情页：交流群 / 开关 / 项目管理 / 迁移 / 归档池      │
 │  ├ GroupedSidebar   sidebar.mjs：装饰原生侧栏，分组过滤与子插槽镜像         │
 │  ├ GroupsDialog / WorkspaceDialog  分组管理、项目名称与路径编辑             │
-│  ├ SteerQueueButton conversation.input.dock：原消息引导到当前轮次           │
 │  ├ 菜单项           sidebar.workspaces.session.menu.item（MR6/TB2）          │
 │  ├ VaultBadge       conversation.input.dock（FR5）                           │
 │  └ draft-vault.js   capture 旁观 → IndexedDB → 合成 paste 重放（FR1/FR2/FR3）│
@@ -35,6 +34,8 @@
 
 ## 关键决策与不变量
 
+文件检查点由 `checkpoints.mjs` 在公开 `tools/execute` 的顶层执行边界记录，按最近的用户消息序号归属；同一消息的交叠工具共享起止快照，不同归属交叠则标记不完整。Git 仅用于枚举未被忽略的项目文件，不改索引或提交；无 Git 项目递归枚举并排除依赖、构建、环境文件。内容寻址快照与索引保存在插件数据目录，按 SHA-256 与文件模式检查外部改动；预览计划带摘要，确认时再验证。恢复先持久记录整个计划，逐文件原子替换，重试接受已经达到目标的文件，直到索引完成；聊天日志不写入。选区引用只接管同一会话正文中的非空单消息选区，缓存文字后显示复制/引用菜单，其他区域不拦截。
+
 1. **帧外科手术**（§10.8-1 实测结论）：官方 v4 会话日志 = 多帧 zstd（header 一帧、事件逐帧、全帧带 XXH64 校验）。迁移只重编码 header 帧，其余帧字节不动；`scanFrames` 复刻官方扫描器语义（含 skippable 帧与截断即报错），重写产物先自 walk 再落盘。可用 `DSH_SESSION_TOOLBOX_LIVE=1` 对当前本机日志做只读校验，实际数量随本机数据变化。
 2. **发布时序**（§10 MN1）：旧目录先整体退役（rename 进 `pending-purge/`），新日志在目标目录独占发布（temp+rename+fsync），再动账本——任何时刻 `findLog` 只会命中一个位置，官方「同 id 两目录=报错」的不变量永不破口。
 3. **账本收敛协议**（§10 MR3/MR4）：同进程 header 缓存可能滞后，ledger 失败记 `deferredLedger`，journal 保留为重试指针；`complete()` 在新进程冷缓存下重跑账本尾巴，仍失败则继续保留（备份不删），可回滚。回滚在 commit 之后走「整体目录逆向 rename」，逐字节还原。
@@ -44,10 +45,10 @@
 7. **软失败降级**（NFR3）：host/client 全部 `ctx.get(...)` 探测；缺 `webServer` 无 UI 通道但 CLI 可用；缺 `workspaceRegistry`/`sessionPersistence` 时面板显示不可用原因；浏览器侧合成粘贴被拒（官方改版）时 vault 记录仍在，仅降级为不恢复并 warn——绝不拦截官方事件。
 8. **多会话项目迁移**：`workspace-journal.json` 记录项目快照和逐条迁移进度；先检查全部成员，再逐条调用迁移引擎。项目替换保留顺序、置顶、归档、分组及归档池引用；恢复期间阻止冲突写操作。只改项目名称时不迁移会话。
 9. **图片输入绑定隔离**：输入绑定替换后，旧绑定的迟到通知与队列快照不能重新备份已发送图片。恢复前检查当前会话与官方附件列表，发送或删除只清理对应备份。
-10. **队列引导**：通过原生 `conversation.updateQueue(id, { kind: 'steer' })` 修改原队列项的接收位置，保留消息与附件，不发送取消当前工具的指令；运行状态、可写性和连续性决定按钮是否可用。
+10. **原生队列**：0.1.34 起移除插件队列引导扩展；不注册快捷入口、不装饰原生队列，不修改原生文案与按钮样式。
 
 11. **在线迁移兼容层**：`session-maintenance.mjs` 探测 DSH 的 `agentLoop.scope(id)` 清理链，以 Cordis 公开 effect 元数据的对象身份校验对应 disposer。当前 Cordis 没有公开 disposer 查询，适配器只读探测 `_disposables`，不修改集合；匹配不唯一或结构变化即拒绝。仅关闭 agent scope fiber 不能关闭持久化 writer，因此不能作为替代。完整清理后以 persistence 写句柄阻止同进程重开，并在目标发布前持有内核写锁。恢复时保护退役目录，结束后释放锁，由原生流程重新加载会话。
-12. **侧栏扩展**：保留原生项目、会话与菜单，在公开 `data-row-key` / `role=tree` DOM 位置用 React portal 增加分组标题和菜单项；不重挂载或搬动原生 DOM。分组投影需保持引用稳定，避免原生 effect 反复更新。会话拖动在 capture 阶段附独立 MIME，仅接管项目标题上的跨项目放下，调用同一 `move` 预检与迁移接口；同项目行间排序仍交给原生。跨项目放下后保留原生 dragend 清理，但暂时抑制遗留排序标记的提交，等整个 DOM 事件分发结束后再解除，不能用可能早于 bubble 阶段执行的微任务解除。队列通过公开插槽同 id 装饰原生组件，仅修改引导文案与样式，保留其原有动作及禁用条件。
+12. **侧栏扩展**：保留原生项目、会话与菜单，在公开 `data-row-key` / `role=tree` DOM 位置用 React portal 增加分组标题和菜单项；不重挂载或搬动原生 DOM。分组投影需保持引用稳定，避免原生 effect 反复更新。会话拖动在 capture 阶段附独立 MIME，仅接管项目标题上的跨项目放下，调用同一 `move` 预检与迁移接口；同项目行间排序仍交给原生。跨项目放下后保留原生 dragend 清理，但暂时抑制遗留排序标记的提交，等整个 DOM 事件分发结束后再解除，不能用可能早于 bubble 阶段执行的微任务解除。
 
 ## 测试分层
 
@@ -59,7 +60,7 @@
 | api / startup | loopback 守卫（host/origin/sec-fetch/密钥/体积/JSON）、深合并设置、端到端移动 |
 | kernel | 真 cordis v4：inject/provide/effect/dispose 全生命周期 |
 | client-bundle | 浏览器 globals-only vm 加载 lib/client.js，断言 __ModuleLoader__ 信封与插槽注册集 |
-| client-actions / draft-vault | 原生菜单与弹窗、快照防覆盖、队列引导防重入、图片恢复与旧绑定迟到通知 |
+| client-actions / draft-vault | 原生菜单与弹窗、快照防覆盖、图片恢复与旧绑定迟到通知 |
 | workspace / sidebar / sidebar-drag | 分组层级与菜单编辑、项目路径迁移、会话拖动跨项目及原生排序隔离、归档与排序保留、崩溃进度恢复、插槽清理 |
 | cli / package-check | 离线账本维护、打包门禁失败时只清理本次拥有的临时目录 |
 | live-artifact | 可选（env）：对 `~/.dsh/sessions` 全部真实日志只读 walk→rewrite→re-walk |
@@ -113,8 +114,23 @@ CLI 写入 `~/.dsh/storages/workspace.json` 的离线镜像。`status` 可能含
 
 ## 引用回复与原生菜单边界（0.1.24）
 
+0.1.29 扩展到 `assistant-step`，镜像该节点声明的 single 子插槽；助手正文与 turn-tail 用 `finalNode.seq` 关联，不能用带小数的合成 UI anchor 作为删除标识。0.1.32 起编辑直接经 session-scoped `conversation.input.for(binding.ctx)` 的 `setDraft` / `persistCurrentDraft` / `focus` 回填原生输入框；保留附件，已有语义草稿提供文字恢复入口。候选追加保留 reference occurrence 的位置和内容，不接管原生发送。
+
+`src/messages.mjs` 只经已加载 Session 的公开 `append` 与 `sessions.flush` 操作。删除用户/已完成助手消息时，追加带独立 ID 前缀的 `user/message` 删除占位，用 `surfaceOp: { op: replace, startSeq, endSeq }` 与 `sourceEventSeqs` 精确替换单条当前模型节点；模型仅接收不含原文或附件的 `[Message deleted]` 占位；user-role 替换可在轮次之外合法提交，不伪造 turn/step 边界。原始事件不改写；surface generation 变化触发原生下一请求的新系列，避免复用旧上下文。删除状态从原生日志标记重建，刷新/热更新后仍保留；重复删除与 flush 失败重试幂等。运行/排队任务、包含 tool-call 的助手消息、已被压缩或替换的节点拒绝操作。此机制不擦除原始磁盘记录，也不保证清除其它消息里的间接引用。
+
 `src/reply.mjs` 装饰公开 keyed Chat 的 user/steering/turn-tail 渲染项，保留 store、inject、locale，并镜像 turn-tail 的原生动作与反馈插槽。引用文本来自节点的用户文字或 closing.blocks 中的 text，不读取推理与工具输出。
 
-通过已探测的 `inputTriggers.registerSource` 注册独立 reference codec，使用公开 `conversation.input.for(binding.ctx)` 的结构化草稿与状态存储。引用包含自描述版本、角色及原文，持久化在原生草稿中；发送由原生 serializer 转成 Markdown 引用，不截获键盘、替换发送器或停止会话。取消和替换按 occurrence 的完整范围变更，保留其他引用和附件。缺少能力时禁用引用入口。
+通过已探测的 `inputTriggers.registerSource` 注册独立 reference codec，使用公开 `conversation.input.for(binding.ctx)` 的结构化草稿与状态存储。引用包含自描述版本、角色及原文，持久化在原生草稿中；发送由原生 serializer 转成 Markdown 引用，不截获键盘、替换发送器或停止会话。取消按 occurrence 的完整范围变更，保留其他引用和附件。引用插入前捕获原生 detect 坐标与草稿版本，经 `insertReference` 插入芯片；多条引用累加插入，取消时按 occurrenceId 精确移除对应芯片并调整后续坐标，保留其他引用及附件；旧版不含 ID 的引用使用偏移与引用值匹配。原位置已失效时追加到末尾，聚焦后光标停在新引用后方。缺少能力时禁用引用入口。
 
 项目菜单无公开扩展槽时，新增项挂载到原生菜单视口。独立 portal 无法参与原生 React pointer-enter/leave 祖先链，因此在 DOM 捕获层统一锚点与菜单边界，包含两者之间的短距离穿越；真实离开仍延迟关闭，卸载清理事件与计时器。菜单归属从本次点击的真实项目行取值，不从显示顺序推断。
+
+
+## 后续任务联想（0.1.32）
+
+`next-tasks.mjs` 监听新增 `session/event` 的正常 `turn/end`，延迟等待轮次空闲，逐个独立调用公开 `llm.prepareCall` / `stream`。使用该 Session 最近的 `requestHeader().config` 路由和最低支持的 reasoning effort，标记独立 `purpose`，不带工具，不 append 聊天事件。canonical `deriveMessages()` 的最近 6 条用户/助手文字受 12 KB 限制，替换删除已生效的原文不会进入候选请求。输出不超过 600 token，解析纯文本 JSON 数组，最多 3 条。新消息/轮次、关闭设置、Session disposal 及 HMR 会取消旧任务；读接口只读取，不产生收费调用。
+
+独立 `next-task-usage.json` 在调用前原子记录请求，结束时按最新 provider usage 结算累计、模型及 UTC 日统计；缓存桶与未缓存输入分开，reasoning 已包含在 output。没有完整 usage 的已发出请求列为 unreported，异常中断留下的 pending 从累计已结算次数差额计算，避免伪造精确总数。保留最近 200 次请求元数据、90 天日统计；不持久化提示词、模型回复或聊天正文。主会话的消息用量投影不会收到此辅助请求的事件。
+
+0.1.36 起已完成候选写入独立 `next-task-candidates.json`（原子写入、0600 权限，最多 100 个会话）。启动只恢复最近 7 天、结构有效的 ready 结果，不重新调用模型；新消息、上下文删除、关闭功能或 Session disposal 失效后同步移除缓存。热更新取消未完成任务并保留已完成结果。候选缓存含候选文字，与只存用量元数据的账本分开。输入观察状态按原生 input 实例匹配，避免复用组件切换会话时暴露上一会话的草稿、误将新会话候选标为收起；收起标记仍按会话和轮次保存在窗口 sessionStorage。
+
+0.1.38 分组管理继续使用原生 Modal 与 Button，以公开 className 设置宽度及滚动边界；独立样式仅作用于管理弹窗。左侧筛选来自同一 groups/projects 状态，右侧归组沿用 group.assign，自动保存后刷新列表与数量；删除分组后回到全部项目，项目编辑沿用已有 WorkspaceDialog。窄窗口切为单栏，路径省略不改变实际值。

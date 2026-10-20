@@ -1,17 +1,17 @@
 # 文档媒体与脱敏说明
 
-这些素材用于 [首页](../../README.md) 和 [使用指南](../usage.md)，对应插件 0.1.23、DSH 0.2.1-rc.2。
+这些素材用于 [首页](../../README.md) 和 [使用指南](../usage.md)，分组管理截图对应插件 0.1.38，其余既有截图及视频对应 0.1.23；DSH 为 0.2.1-rc.2。
 
 ## 素材清单
 
 | 文件 | 内容 |
 | --- | --- |
 | [01-overview.png](01-overview.png) | 插件顶部、交流群入口、图片草稿与项目管理入口。 |
-| [02-project-groups.png](02-project-groups.png) | 原生项目分组管理弹窗，含虚构项目与分组。 |
+| [02-project-groups.png](02-project-groups.png) | 0.1.38 分组管理弹窗：左侧分组筛选、右侧项目归组，含虚构数据。 |
 | [03-project-path.png](03-project-path.png) | 原生项目编辑弹窗，保存前核对新路径。 |
 | [04-archive-pool.png](04-archive-pool.png) | 原生归档与工具箱归档同时显示。 |
 | [05-session-move.png](05-session-move.png) | 单会话迁移的面板体检示例。 |
-| [06-queue-steering.svg](06-queue-steering.svg) | 队列引导流程示意，非真实会话截图。 |
+| [06-queue-steering.svg](06-queue-steering.svg) | 旧版队列引导流程示意；0.1.34 起使用 DSH 原生功能。 |
 | [video-poster.png](video-poster.png) | 图文导览视频封面。 |
 | [session-toolbox-tour.mp4](session-toolbox-tour.mp4) | 50 秒、1920 × 1080、24 fps、H.264 / yuv420p，带画面说明，无音轨。 |
 | [session-toolbox-tour.vtt](session-toolbox-tour.vtt) | 与视频七个章节对应的中文说明字幕。 |
@@ -20,9 +20,9 @@
 
 ## 演示数据
 
-- 项目：示例商城、示例文档站、示例实验室。
+- 项目：示例商城、示例文档站、示例实验室、示例服务接口、示例移动应用及示例前端组件项目。
 - 分组：产品开发、学习与实验。
-- 路径：`/demo/projects/shop`、`/demo/projects/docs`、`/demo/projects/lab`、`/demo/projects/shop-next`。
+- 路径：`/demo/projects/shop`、`/demo/projects/docs`、`/demo/projects/lab`、`/demo/projects/shop-next` 等虚构演示路径。
 - 会话标识：`session-demo-guide`、`session-demo-ui`。
 - 会话标题、数量、草稿统计、归档日期同样是演示值。
 - QQ 群号与链接是作者已公开的交流入口，予以保留。
@@ -49,4 +49,4 @@ node scripts/render-docs-tour.mjs
 
 渲染时浏览器网络被禁用，只读取脱敏图片与 SVG。脚本会重建 MP4、封面和 VTT，并输出本次临时帧目录；不会递归清理其他临时目录。更新素材后，请重新逐帧抽查视频和核对元数据，再公开。
 
-- `07-quote-reply.svg`：0.1.24 引用回复的静态操作示意，完全由本地 SVG 与虚构文本生成；不是用户会话截图，不含账号、目录、会话 ID、凭据或远程素材。现有 MP4 仍对应 0.1.23。
+- `07-quote-reply.svg`：0.1.37 多引用回复的静态操作示意，完全由本地 SVG 与虚构文本生成；不是用户会话截图，不含账号、目录、会话 ID、凭据或远程素材。现有 MP4 仍对应 0.1.23。
