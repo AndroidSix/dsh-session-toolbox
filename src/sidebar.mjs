@@ -1,3 +1,5 @@
+import { orderedGroups, UNGROUPED } from './group-order.mjs';
+
 /** Restrict both projections: otherwise filtered projects leak into native "ungrouped". */
 export function filterSidebar(workspaces, sessions, groups, selected) {
  if (!selected) return { workspaces, sessions };
@@ -13,6 +15,65 @@ export function filterSidebar(workspaces, sessions, groups, selected) {
  } };
 }
 export const mirroredSlot = name => `session-toolbox.${name}`;
+
+const GROUP_DRAG = 'application/x-dsh-toolbox-group';
+/** Group sorting owns its MIME and capture events, leaving native project and
+ * session sorting untouched. Save only on drop; keep the drag source mounted. */
+export function groupOrderDrag({ read, move, preview, report }) {
+ let source, moving = false;
+ const heading = event => event.target.closest?.('[data-toolbox-group]');
+ const ours = event => !!source && Array.from(event.dataTransfer?.types ?? []).includes(GROUP_DRAG);
+ const consume = event => { event.preventDefault(); event.stopPropagation(); };
+ const destination = event => {
+  const row = heading(event), snapshot = read(), id = row?.getAttribute('data-toolbox-group');
+  if (moving || snapshot.blocked || !row || !snapshot.groups.some(group => group.id === source)) return;
+  const at = snapshot.groups.findIndex(group => group.id === id);
+  if (at < 0) return;
+  const bounds = row.getBoundingClientRect(), after = event.clientY >= bounds.top + bounds.height / 2;
+  return { groupId: id, edge: after ? 'after' : 'before', beforeGroupId: after ? snapshot.groups[at + 1]?.id ?? '' : id };
+ };
+ const commit = async (id, beforeGroupId) => {
+  const snapshot = read(), at = snapshot.groups.findIndex(group => group.id === id);
+  if (moving || snapshot.blocked || at < 0 || beforeGroupId === id || (snapshot.groups[at + 1]?.id ?? '') === beforeGroupId) return;
+  moving = true; report('');
+  try { await move({ type: 'group.move', groupId: id, beforeGroupId }); }
+  catch (error) { report(error.message); }
+  finally { moving = false; preview(null); }
+ };
+ return {
+  start(event) {
+   const row = heading(event);
+   if (!row) return false;
+   event.stopPropagation();
+   const id = row.getAttribute('data-toolbox-group'), snapshot = read();
+   if (moving || snapshot.blocked || !snapshot.groups.some(group => group.id === id)) { event.preventDefault(); return true; }
+   source = id; preview(null);
+   event.dataTransfer.setData(GROUP_DRAG, id); event.dataTransfer.effectAllowed = 'move';
+   return true;
+  },
+  over(event) {
+   if (!ours(event)) return false;
+   consume(event);
+   const target = destination(event);
+   event.dataTransfer.dropEffect = target ? 'move' : 'none'; preview(target ?? null);
+   return true;
+  },
+  leave(event) { if (ours(event) && !heading(event)?.contains(event.relatedTarget)) preview(null); },
+  async drop(event) {
+   if (!ours(event)) return;
+   consume(event);
+   const target = destination(event), id = source;
+   source = undefined; preview(null);
+   if (target && event.dataTransfer.getData(GROUP_DRAG) === id) await commit(id, target.beforeGroupId);
+  },
+  end(event) { if (source) event?.stopPropagation(); source = undefined; preview(null); },
+  step(id, direction) {
+   const groups = read().groups, at = groups.findIndex(group => group.id === id);
+   if (at < 0 || at + direction < 0 || at + direction >= groups.length) return;
+   return commit(id, direction < 0 ? groups[at - 1].id : groups[at + 2]?.id ?? '');
+  },
+ };
+}
 
 const SESSION_DRAG = 'application/x-dsh-toolbox-session';
 /** Extend native session sorting with project-header drops. Keep native dragend
@@ -118,11 +179,13 @@ export function installSidebar(ctx, makeComponent) {
  });
 }
 
-/** Placement shared by CSS and projection order; unassigned projects follow named groups. */
-export function sidebarLayout(workspaces, groups) {
+/** Placement shared by CSS and projection order, including the built-in group. */
+export function sidebarLayout(workspaces, groups, ungroupedIndex) {
+ const ordered = orderedGroups(groups, ungroupedIndex);
  const ranks = new Map();
- for (const [index, group] of groups.entries()) for (const id of group.workspaceIds) if (!ranks.has(id)) ranks.set(id, index);
- return workspaces.map((workspace, index) => ({ workspace, group: ranks.get(workspace.workspaceId) ?? groups.length, index }))
+ for (const [index, group] of ordered.entries()) for (const id of group.workspaceIds) if (!ranks.has(id)) ranks.set(id, index);
+ const ungrouped = ordered.findIndex(group => group.id === UNGROUPED);
+ return workspaces.map((workspace, index) => ({ workspace, group: ranks.get(workspace.workspaceId) ?? ungrouped, index }))
   .sort((a, b) => a.group - b.group || a.index - b.index);
 }
 

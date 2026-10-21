@@ -119,7 +119,7 @@ async function applyInner(ctx, options = {}) {
 		if (await hostCapabilities(ctx).sessionLive(sessionId)) return true;
 		return !messageIdle(sessionId);
 	} });
-	const nextTasks = new NextTasks({ root, settings: () => settingsCache, llm: () => ctx.get('llm'), busy: id => !messageIdle(id) });
+	const nextTasks = new NextTasks({ root, settings: () => settingsCache, llm: () => ctx.get('llm'), sessions: () => ctx.get('sessions'), busy: id => !messageIdle(id) });
 	await nextTasks.restore().catch(error => ctx.logger.warn(`任务联想缓存恢复失败：${error.message}`));
 	installNextTasks(ctx, nextTasks);
 	const trash = new TrashEngine({
@@ -184,6 +184,7 @@ async function applyInner(ctx, options = {}) {
 			const journal = (await journalDoc.read().catch(() => ({ active: journalCache }))).active;
 			journalCache = journal;
 			const manifest = await manifestDoc.read();
+			const groupState = await groupsDoc.read();
 			return {
 				pluginVersion,
 				capabilities,
@@ -191,7 +192,8 @@ async function applyInner(ctx, options = {}) {
 				nextTasks: await nextTasks.summary(),
 				journal,
 				projects: listProjects(ctx),
-				groups: (await groupsDoc.read()).groups,
+				groups: groupState.groups,
+				ungroupedIndex: groupState.ungroupedIndex ?? groupState.groups.length,
 				workspaceMove: await workspace.active(),
 				trash: await trash.items(),
 				// Bytes live in browser IndexedDB; the manifest mirrors their metadata only.
@@ -213,7 +215,7 @@ async function applyInner(ctx, options = {}) {
 		},
 		action: input => {
 			const result = pendingAction.then(async () => {
-				if (!['nextTasks.get', 'workspace.complete', 'project.of', 'trash.list', 'vault.sync', 'vault.sweep', 'settings.update'].includes(input.type)) await workspace.assertIdle();
+				if (!['nextTasks.get', 'nextTasks.generate', 'workspace.complete', 'project.of', 'trash.list', 'vault.sync', 'vault.sweep', 'settings.update'].includes(input.type)) await workspace.assertIdle();
 				return dispatch(kit, input);
 			});
 			pendingAction = result.catch(() => {});

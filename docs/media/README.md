@@ -1,13 +1,13 @@
 # 文档媒体与脱敏说明
 
-这些素材用于 [首页](../../README.md) 和 [使用指南](../usage.md)，分组管理截图对应插件 0.1.38，其余既有截图及视频对应 0.1.23；DSH 为 0.2.1-rc.2。
+这些素材用于 [首页](../../README.md) 和 [使用指南](../usage.md)，分组管理截图对应插件 0.1.41，其余既有截图及视频对应 0.1.23；DSH 为 0.2.1-rc.2。
 
 ## 素材清单
 
 | 文件 | 内容 |
 | --- | --- |
 | [01-overview.png](01-overview.png) | 插件顶部、交流群入口、图片草稿与项目管理入口。 |
-| [02-project-groups.png](02-project-groups.png) | 0.1.38 分组管理弹窗：左侧分组筛选、右侧项目归组，含虚构数据。 |
+| [02-project-groups.png](02-project-groups.png) | 0.1.41 分组管理弹窗（未分组可排序）：左侧分组筛选、拖动与上下移动箭头、右侧项目归组，含虚构数据。 |
 | [03-project-path.png](03-project-path.png) | 原生项目编辑弹窗，保存前核对新路径。 |
 | [04-archive-pool.png](04-archive-pool.png) | 原生归档与工具箱归档同时显示。 |
 | [05-session-move.png](05-session-move.png) | 单会话迁移的面板体检示例。 |

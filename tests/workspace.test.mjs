@@ -173,3 +173,52 @@ test('a removed original code directory does not prevent changing its project pa
  const result = await w.tools.edit({ workspaceId: 'A', path: w.to });
  assert.deepEqual(w.registry.get(result.workspaceId).sessionIds, w.ids);
 });
+
+test('group moves persist relative order without changing membership or native project/session order', async t => {
+ const w = await world(t);
+ const a = await w.tools.createGroup('First'), b = await w.tools.createGroup('Second'), c = await w.tools.createGroup('Third');
+ await w.tools.assignGroup('A', a.id); await w.tools.assignGroup('C', b.id);
+ const projects = JSON.stringify(w.registry.list()), ids = async () => (await w.groups.read()).groups.map(row => row.id);
+ await w.tools.moveGroup(c.id, a.id); assert.deepEqual(await ids(), [c.id, a.id, b.id]);
+ await new WorkspaceTools(w.deps).moveGroup(c.id); assert.deepEqual(await ids(), [a.id, b.id, c.id]);
+ await w.tools.moveGroup(a.id, a.id); await w.tools.moveGroup(a.id, b.id);
+ assert.deepEqual(await ids(), [a.id, b.id, c.id]);
+ // A move based on a previous snapshot must retain subsequent group edits.
+ const added = await w.tools.createGroup('Added later'); await w.tools.renameGroup(b.id, 'Renamed');
+ await w.tools.moveGroup(a.id);
+ assert.deepEqual((await w.groups.read()).groups, [{ ...b, title: 'Renamed', workspaceIds: ['C'] }, c, added, { ...a, workspaceIds: ['A'] }]);
+ assert.equal(JSON.stringify(w.registry.list()), projects);
+ const saved = await readFile(join(w.root, 'groups.json'), 'utf8');
+ assert.deepEqual(JSON.parse(saved).groups.map(row => row.id), [b.id, c.id, added.id, a.id]);
+ for (const [id, before] of [['missing', b.id], [a.id, 'missing']]) await assert.rejects(w.tools.moveGroup(id, before), /分组不存在/);
+ assert.equal(await readFile(join(w.root, 'groups.json'), 'utf8'), saved);
+});
+
+test('built-in ungrouped moves first, middle and last, persists after reload and remains valid across group CRUD', async t => {
+ const { orderedGroups } = await import('../src/group-order.mjs');
+ const w = await world(t), a = await w.tools.createGroup('A'), b = await w.tools.createGroup('B');
+ const ids = async () => { const s = await w.groups.read(); return orderedGroups(s.groups, s.ungroupedIndex).map(g => g.id); };
+ assert.deepEqual(await ids(), [a.id, b.id, 'ungrouped'], 'old documents keep their order');
+ await w.tools.assignGroup('A', a.id);
+ await w.tools.moveGroup('ungrouped', a.id); assert.deepEqual(await ids(), ['ungrouped', a.id, b.id]);
+ await new WorkspaceTools(w.deps).moveGroup(a.id, 'ungrouped'); assert.deepEqual(await ids(), [a.id, 'ungrouped', b.id]);
+ assert.equal(JSON.parse(await readFile(join(w.root, 'groups.json'), 'utf8')).ungroupedIndex, 1);
+ const c = await w.tools.createGroup('C'); assert.deepEqual(await ids(), [a.id, 'ungrouped', b.id, c.id]);
+ await w.tools.deleteGroup(a.id); assert.deepEqual(await ids(), ['ungrouped', b.id, c.id]);
+ assert(w.registry.get('A'), 'projects in a deleted group become ungrouped');
+ await w.tools.moveGroup('ungrouped'); assert.deepEqual(await ids(), [b.id, c.id, 'ungrouped']);
+ const d = await w.tools.createGroup('D'); assert.deepEqual(await ids(), [b.id, c.id, d.id, 'ungrouped']);
+ await w.tools.assignGroup('A', d.id); await w.tools.assignGroup('A', 'ungrouped');
+ assert((await w.groups.read()).groups.every(g => !g.workspaceIds.includes('A')));
+ for(const id of [b.id, c.id, d.id]) await w.tools.deleteGroup(id);
+ assert.deepEqual(await ids(), ['ungrouped']);
+ await w.tools.moveGroup('ungrouped');
+ await assert.rejects(w.tools.deleteGroup('ungrouped'), /默认未分组不能删除/);
+ assert.equal((await w.groups.read()).ungroupedIndex, 0);
+});
+
+test('group state validates the built-in position and prevents collision with its reserved id', () => {
+ for(const ungroupedIndex of [-1, 1, .5, null, '0']) assert.throws(() => guardGroups({ version: 1, groups: [], ungroupedIndex }), /排序位置/);
+ assert.throws(() => guardGroups({version:1,groups:[{id:'ungrouped',title:'Reserved',workspaceIds:[]}]}), /数据格式/);
+ assert.equal(guardGroups({version:1,groups:[],ungroupedIndex:0}).ungroupedIndex,0);
+});

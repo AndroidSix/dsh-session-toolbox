@@ -27,3 +27,12 @@ test('disabled storage does not break presentation or in-memory dismissal', () =
  const view = createCandidateView({ getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); } });
  view.publish('s', { seq: 5, status: 'ready' }); view.dismiss('s'); view.publish('s', { seq: 5, status: 'ready' }); assert.equal(view.get('s'), null);
 });
+
+test('explicit manual generation reveals a previously dismissed turn and stays visible after remount', () => {
+ const values = new Map(), storage = { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) };
+ const view = createCandidateView(storage), ready = { seq: 5, status: 'ready', candidates: ['继续测试'] };
+ view.publish('s', ready); view.dismiss('s'); assert.equal(view.get('s'), null);
+ view.reveal('s', { seq: 5, status: 'generating', manual: true }); assert.equal(view.get('s').status, 'generating');
+ view.publish('s', { ...ready, manual: true }); assert.deepEqual(view.get('s').candidates, ['继续测试']);
+ const reload = createCandidateView(storage); reload.publish('s', ready); assert.equal(reload.get('s').seq, 5);
+});

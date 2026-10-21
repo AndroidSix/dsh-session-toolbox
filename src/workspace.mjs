@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, realpath, stat } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
+import { orderedGroups, UNGROUPED } from './group-order.mjs';
 
 const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
 function titleOf(value) {
@@ -10,9 +11,10 @@ function titleOf(value) {
 
 export function guardGroups(value) {
 	if (value.version !== 1 || !Array.isArray(value.groups)) fail('groups-invalid', '项目分组数据格式无效');
+	if (value.ungroupedIndex !== undefined && (!Number.isInteger(value.ungroupedIndex) || value.ungroupedIndex < 0 || value.ungroupedIndex > value.groups.length)) fail('groups-invalid', '未分组排序位置无效');
 	const ids = new Set(), members = new Set();
 	for (const group of value.groups) {
-		if (typeof group.id !== 'string' || !group.id || ids.has(group.id) || !Array.isArray(group.workspaceIds)) fail('groups-invalid', '项目分组数据格式无效');
+		if (typeof group.id !== 'string' || !group.id || group.id === UNGROUPED || ids.has(group.id) || !Array.isArray(group.workspaceIds)) fail('groups-invalid', '项目分组数据格式无效');
 		titleOf(group.title); ids.add(group.id);
 		for (const id of group.workspaceIds) {
 			if (typeof id !== 'string' || !id || members.has(id)) fail('groups-invalid', '项目分组包含重复或无效项目');
@@ -42,7 +44,7 @@ export class WorkspaceTools {
 		const group = { id: randomUUID(), title, workspaceIds: [] };
 		await this.groups.update(state => {
 			if (state.groups.some(row => row.title === title)) fail('group-exists', '分组名称已存在 / Group name exists');
-			return { ...state, groups: [...state.groups, group] };
+			return { ...state, groups: [...state.groups, group], ...(state.ungroupedIndex === state.groups.length ? { ungroupedIndex: state.ungroupedIndex + 1 } : {}) };
 		});
 		return group;
 	}
@@ -56,10 +58,28 @@ export class WorkspaceTools {
 		return { ok: true };
 	}
 	async deleteGroup(id) {
-		await this.groups.update(state => ({ ...state, groups: state.groups.filter(row => row.id !== id) }));
+		if (id === UNGROUPED) fail('group-built-in', '默认未分组不能删除 / Cannot delete the built-in group');
+		await this.groups.update(state => {
+			const at = state.groups.findIndex(row => row.id === id);
+			return { ...state, groups: state.groups.filter(row => row.id !== id), ...(state.ungroupedIndex === undefined ? {} : { ungroupedIndex: state.ungroupedIndex - (at >= 0 && at < state.ungroupedIndex ? 1 : 0) }) };
+		});
+		return { ok: true };
+	}
+	async moveGroup(id, beforeId = '') {
+		// Apply one move to the latest document; a stale sidebar must not replace
+		// concurrently created groups, names or project assignments.
+		await this.groups.update(state => {
+			const ordered = orderedGroups(state.groups, state.ungroupedIndex), group = ordered.find(row => row.id === id);
+			if (!group || beforeId && !ordered.some(row => row.id === beforeId)) fail('group-unknown', '分组不存在，请刷新后重试 / Group not found; refresh and retry');
+			if (id === beforeId) return state;
+			const moved = ordered.filter(row => row.id !== id);
+			moved.splice(beforeId ? moved.findIndex(row => row.id === beforeId) : moved.length, 0, group);
+			return { ...state, groups: moved.filter(row => row.id !== UNGROUPED), ungroupedIndex: moved.findIndex(row => row.id === UNGROUPED) };
+		});
 		return { ok: true };
 	}
 	async assignGroup(workspaceId, groupId) {
+		if (groupId === UNGROUPED) groupId = '';
 		this.row(workspaceId);
 		await this.groups.update(state => {
 			if (groupId && !state.groups.some(row => row.id === groupId)) fail('group-unknown', '分组不存在 / Group not found');

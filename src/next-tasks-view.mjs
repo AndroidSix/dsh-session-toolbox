@@ -5,7 +5,7 @@ export function createCandidateView(storage) {
  const state = id => {
   if (!sessions.has(id)) {
    let hidden;
-   try { const raw = storage?.getItem(key(id)); if (raw !== null && raw !== undefined) hidden = Number(raw); } catch { /* storage can be disabled */ }
+   try { const raw = storage?.getItem(key(id)); if (raw !== null && raw !== undefined && raw !== '') hidden = Number(raw); } catch { /* storage can be disabled */ }
    sessions.set(id, { value: null, hidden, listeners: new Set() });
   }
   return sessions.get(id);
@@ -19,6 +19,11 @@ export function createCandidateView(storage) {
    const next = value?.seq === row.hidden ? null : value;
    if (JSON.stringify(row.value) === JSON.stringify(next)) return;
    row.value = next; notify(row);
+  },
+  reveal(id, value) {
+   const row = state(id); row.hidden = undefined;
+   try { storage?.setItem(key(id), ''); } catch { /* ephemeral fallback */ }
+   this.publish(id, value);
   },
   dismiss(id) {
    const row = state(id);

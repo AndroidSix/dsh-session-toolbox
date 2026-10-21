@@ -39,7 +39,7 @@ test('switching from a draft to an empty chat never dismisses the destination su
  // React can reuse the component and its state before the input subscription effect runs.
  c.states([0, previous]);
  c.plugin.NextTaskController({ sessionId: 'empty' });
- const dismissal = c.effects.find(effect => effect.deps?.length === 2 && effect.deps[0] === 'empty');
+ const dismissal = c.effects.find(effect => effect.deps?.[0] === 'empty');
  assert.equal(dismissal.deps[1], false, 'the empty destination must not inherit the old chat editing state');
 });
 function find(node, predicate) {
@@ -213,4 +213,71 @@ test('sidebar move feedback expires after completion, keeps busy visible and can
  c.tick(7999); assert.deepEqual(c.updates, []); c.tick(1); assert.deepEqual(c.updates, [null]); failure();
  c.updates.length = 0;
  const unmount = render({ busy: false, message: '完成' }); unmount(); c.tick(10000); assert.deepEqual(c.updates, []);
+});
+
+test('group manager uses shared ordering for arrows, keeps the selection, disables boundaries and prevents duplicate pending moves', async () => {
+ const c = await client(), writes = [];
+ let release;
+ const snapshot = { key: 'ready', groups: ['a', 'b', 'c'].map(id => ({ id, title: id.toUpperCase(), workspaceIds: [] })), projects: [] };
+ c.fetch(async (_url, options) => {
+  if (options?.body) { writes.push(JSON.parse(options.body)); await new Promise(resolve => { release = resolve; }); }
+  return { ok: true, status: 200, text: async () => JSON.stringify(snapshot) };
+ });
+ await c.plugin.loadState();
+ c.states([0, '', '', false, '', 'b', null]);
+ const tree = c.plugin.GroupsDialog({ close() {} });
+ const button = label => find(tree, node => node.type === c.native.Button && node.props['aria-label'] === label);
+ assert.equal(button('A — 上移').props.disabled, true);
+ assert.equal(button('C — 下移').props.disabled, false);
+ assert.equal(button('未分组 — 下移').props.disabled, true);
+ assert.equal(button('B — 上移').props.disabled, false);
+ const nav = find(tree, node => node.type === 'nav');
+ assert.equal(typeof nav.props.onDragStartCapture, 'function');
+ assert.equal(typeof nav.props.onDropCapture, 'function');
+ assert.equal(find(tree, node => node.props?.['data-toolbox-group'] === 'ungrouped').props.draggable, true);
+ const selected = find(tree, node => node.props?.className === 'sk-group-filter' && node.props['aria-pressed']);
+ assert.equal(selected.props.children[0].props.children, 'B');
+ button('B — 上移').props.onClick(); button('B — 下移').props.onClick();
+ await new Promise(resolve => setImmediate(resolve));
+ assert.equal(writes.length, 1); assert.equal(writes[0].type, 'group.move'); assert.equal(writes[0].groupId, 'b'); assert.equal(writes[0].beforeGroupId, 'a');
+ release(); await new Promise(resolve => setImmediate(resolve));
+ assert.equal(c.updates.some(value => value === null), true, 'drop marker clears');
+ assert.equal(c.updates.includes(''), true, 'previous error clears');
+ assert.equal(c.updates.includes('b'), false, 'reordering must not change the selected filter');
+ c.states([0, '', '', true, '', 'b', null]);
+ const busy = c.plugin.GroupsDialog({ close() {} });
+ assert.equal(find(busy, node => node.type === c.native.Button && node.props['aria-label'] === 'B — 下移').props.disabled, true);
+ assert.equal(find(busy, node => node.props?.['data-toolbox-group'] === 'b').props.draggable, false);
+});
+
+test('next-task status is visible at its own answer when generating or failed, without leaking error payloads', async () => {
+ const c=await client();
+ for(const result of [{seq:8,status:'generating',candidates:[]},{seq:8,status:'failed',reason:'credentials',candidates:[]},{seq:8,status:'ready',candidates:[]}]){
+  c.states([result,'']);const tree=c.plugin.NextTaskCandidates({sessionId:'s',seq:8});assert.ok(tree,'generation and failures must not silently disappear');
+  assert.equal(find(tree,node=>node.props?.role==='status')!==undefined,true);
+ }
+ c.states([{seq:8,status:'failed',reason:'credentials',candidates:[]},'']);assert.equal(c.plugin.NextTaskCandidates({sessionId:'s',seq:7}),null);
+});
+
+test('manual next-task icon forwards the selected answer once, prevents rapid double clicks and disables while chat runs', async () => {
+ const c = await client(), calls = []; let release;
+ c.fetch(async (_url, options) => {
+  if (!options?.body) return { ok: true, status: 200, text: async () => JSON.stringify({ key: 'k' }) };
+  calls.push(JSON.parse(options.body)); await new Promise(resolve => { release = resolve; });
+  return { ok: true, status: 200, text: async () => JSON.stringify({ key: 'k', status: 'generating', seq: 8, manual: true }) };
+ });
+ c.states([null, false, '']);
+ const tree = c.plugin.NextTaskAction({ sessionId: 's', seq: 8, canWrite: true, running: false });
+ const button = find(tree, node => node.type === 'button');
+ assert.match(button.props['aria-label'], /生成任务联想/); assert.equal(button.props.disabled, false);
+ assert.equal(typeof button.props.children.type, 'function', 'action uses an icon without a text label');
+ const first = button.props.onClick(), duplicate = button.props.onClick();
+ while (!release) await new Promise(resolve => setImmediate(resolve));
+ release(); await Promise.all([first, duplicate]);
+ assert.equal(calls.length, 1); assert.equal(calls[0].type, 'nextTasks.generate'); assert.equal(calls[0].seq, 8);
+ for (const props of [{ running: true, canWrite: true }, { running: false, canWrite: false }]) {
+  c.states([null, false, '']); const disabled = c.plugin.NextTaskAction({ sessionId: 's', seq: 8, ...props });
+  const action = find(disabled, node => node.type === 'button'); assert.equal(action.props.disabled, true); await action.props.onClick();
+ }
+ assert.equal(calls.length, 1);
 });

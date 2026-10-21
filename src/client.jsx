@@ -13,7 +13,8 @@ import { MenuItemButton, Modal, Button, Tooltip, UserTextRun, IconFolderOpenOutl
 import { REPLY_SOURCE, REPLY_TEXT_NODE, readReply, insertReply, withoutReply, messageReply, messageSequence, replySource, replyTextRule, installReplyNodes, selectedReply } from './reply.mjs';
 import { createCandidateView, candidatesForTurn } from './next-tasks-view.mjs';
 import { createVault } from './draft-vault.js';
-import { filterSidebar, installSidebar, mirroredSlot, sidebarLayout, protectProjectMenu, sessionProjectDrag } from './sidebar.mjs';
+import { orderedGroups, UNGROUPED } from './group-order.mjs';
+import { filterSidebar, installSidebar, mirroredSlot, sidebarLayout, protectProjectMenu, sessionProjectDrag, groupOrderDrag } from './sidebar.mjs';
 
 export const name = 'dsh-session-toolbox-client';
 // `locale` is a real service, so it must be injected before use: cordis throws
@@ -518,15 +519,16 @@ export function VaultBadge({ sessionId }) {
 const workspaceChinese = {
  'message.delete': '删除这条消息', 'message.deleteHelp': '从会话界面和后续 AI 上下文中移除这条消息，不撤销文件修改。其它消息仍可能包含相关信息。原始日志保留用于完整性校验，此操作不提供界面撤销。', 'message.deleteConfirm': '确认删除消息', 'message.deleted': '消息已删除，已从后续 AI 上下文移除',
  'reply.selection': '引用所选内容', 'reply.copy': '复制',
+ 'nextTasks.generate': '生成任务联想（单独统计 token）', 'nextTasks.regenerate': '重新生成任务联想（单独统计 token）',
  'checkpoint.action': '恢复检查点', 'checkpoint.help': '撤销这条消息及之后的文件修改，保留全部聊天记录。仅支持已保存的本地项目文件，忽略 Git 忽略文件、依赖、构建和环境文件。工具运行期间请避免手动修改同一项目，该时段的写入无法区分来源。',
  'checkpoint.loading': '正在检查文件…', 'checkpoint.restore': '确认恢复文件', 'checkpoint.conflicts': '以下文件又被修改过，请先处理冲突：', 'checkpoint.empty': '没有需要恢复的文件。', 'checkpoint.done': '文件已恢复，聊天记录已保留。', 'checkpoint.retry': '重新检查',
- 'nextTasks.title': '接下来', 'nextTasks.dismiss': '收起建议', 'reply.fromUser': '引用用户消息', 'reply.fromAssistant': '引用助手回复', 'nextTasks.generating': '正在生成后续任务候选…', 'nextTasks.failed': '后续任务候选生成失败（不会自动重试）', 'message.inComposer': '历史文字已载入输入框，可编辑并添加截图。', 'message.restoreDraft': '恢复原草稿文字', 'message.edit': '编辑并重新发送',
+ 'nextTasks.title': '接下来', 'nextTasks.empty': '本轮没有合适的后续建议', 'nextTasks.unavailable': '本轮未生成后续建议', 'nextTasks.reason.credentials': '模型凭据或权限无效', 'nextTasks.reason.rate-limit': '模型服务限流', 'nextTasks.reason.format': '模型返回的候选格式无效', 'nextTasks.reason.output-limit': '达到候选输出上限', 'nextTasks.reason.model-call': '模型调用未完成', 'nextTasks.reason.model-unconfigured': '会话未配置可用模型', 'nextTasks.reason.context': '缺少可用于联想的问答文字', 'nextTasks.reason.busy': '会话仍在运行或收尾', 'nextTasks.reason.host-state': '无法读取会话状态', 'nextTasks.reason.cancelled': '候选生成已取消', 'nextTasks.dismiss': '收起建议', 'reply.fromUser': '引用用户消息', 'reply.fromAssistant': '引用助手回复', 'nextTasks.generating': '正在生成后续任务候选…', 'nextTasks.failed': '后续任务候选生成失败（不会自动重试）', 'message.inComposer': '历史文字已载入输入框，可编辑并添加截图。', 'message.restoreDraft': '恢复原草稿文字', 'message.edit': '编辑并重新发送',
  'reply.action': '引用回复', 'reply.cancel': '取消引用', 'reply.user': '用户', 'reply.assistant': '助手', 'reply.unavailable': '当前输入框暂不支持引用回复',
  'community.join': '加入 QQ 交流群 ↗', 'community.name': 'AndroidSix 的开源项目交流群', 'community.number': '群号',
  'groups.title': '项目分组', 'groups.all': '全部项目', 'groups.none': '未分组', 'groups.manage': '管理项目与分组',
- 'groups.move': '移入分组…', 'groups.drop': '可将项目拖到分组标题，或从项目菜单选择“移入分组”。', 'groups.name': '分组名称', 'groups.create': '新建分组', 'groups.rename': '重命名', 'groups.delete': '删除分组',
+ 'groups.reorder': '拖动分组标题调整顺序；也可聚焦后按 Alt/Option + ↑/↓。未分组也可自由排序。', 'groups.move': '移入分组…', 'groups.drop': '可将项目拖到分组标题，或从项目菜单选择“移入分组”。', 'groups.name': '分组名称', 'groups.create': '新建分组', 'groups.rename': '重命名', 'groups.delete': '删除分组',
  'groups.help': '每个项目可归入一个分组；删除分组会将其中项目恢复为未分组。侧栏按“分组 → 项目 → 会话”展开，原生搜索仍搜索全部会话。',
- 'groups.intro': '整理项目归属，侧栏会同步更新。', 'groups.list': '分组', 'groups.projects': '项目', 'groups.empty': '这个分组还没有项目', 'groups.emptyHelp': '在“全部项目”中为项目选择所属分组。', 'groups.saved': '分组变更自动保存', 'groups.sessions': '个会话',
+ 'groups.intro': '整理项目归属，侧栏会同步更新。', 'groups.list': '分组', 'groups.projects': '项目', 'groups.empty': '这个分组还没有项目', 'groups.emptyHelp': '在“全部项目”中为项目选择所属分组。', 'groups.sortHelp': '拖动分组或点击箭头排序，与侧栏同步。', 'groups.up': '上移', 'groups.down': '下移', 'groups.saved': '分组变更自动保存', 'groups.sessions': '个会话',
  'project.groupHelp': '分组选择后立即保存；名称和路径点击“保存”后生效。', 'project.editGroup': '编辑项目', 'project.edit': '编辑项目', 'project.title': '项目名称', 'project.path': '项目目录', 'project.browse': '浏览…',
  'project.help': '选择已有代码目录。保存后，将该项目的全部已有会话一起迁入新路径，保留顺序、归档及置顶状态；代码文件不会搬动，历史消息中的路径保持原样。会话必须空闲且没有排队消息。',
  'project.resume': '继续迁移', 'project.pending': '项目迁移尚未完成，请继续迁移。',
@@ -535,15 +537,16 @@ const workspaceChinese = {
 const workspaceEnglish = {
  'message.delete': 'Delete this message', 'message.deleteHelp': 'Remove this message from the chat and future AI context. File changes are kept. Other messages may still contain related information. Original logs are retained for integrity; there is no UI undo.', 'message.deleteConfirm': 'Delete message', 'message.deleted': 'Message deleted from the chat and future AI context',
  'reply.selection': 'Quote selection', 'reply.copy': 'Copy',
+ 'nextTasks.generate': 'Generate next steps (tokens tracked separately)', 'nextTasks.regenerate': 'Regenerate next steps (tokens tracked separately)',
  'checkpoint.action': 'Restore checkpoint', 'checkpoint.help': 'Undo file changes from this message onward; keep all chat messages. Saved local project files only; Git-ignored files, dependencies, build output and environment files are excluded. Avoid manual edits while tools run: changes made during execution cannot be attributed separately.',
  'checkpoint.loading': 'Checking files…', 'checkpoint.restore': 'Restore files', 'checkpoint.conflicts': 'These files changed again. Resolve conflicts first:', 'checkpoint.empty': 'No files need restoring.', 'checkpoint.done': 'Files restored. Chat history was kept.', 'checkpoint.retry': 'Check again',
- 'nextTasks.title': 'Next steps', 'nextTasks.dismiss': 'Dismiss suggestions', 'reply.fromUser': 'Quoted message', 'reply.fromAssistant': 'Quoted reply', 'nextTasks.generating': 'Generating next task suggestions…', 'nextTasks.failed': 'Suggestions failed (no automatic retry)', 'message.inComposer': 'History text loaded into the composer. Edit it and add images.', 'message.restoreDraft': 'Restore previous draft text', 'message.edit': 'Edit and resend',
+ 'nextTasks.title': 'Next steps', 'nextTasks.empty': 'No useful next steps for this answer', 'nextTasks.unavailable': 'No suggestions generated for this answer', 'nextTasks.reason.credentials': 'Invalid model credentials or permissions', 'nextTasks.reason.rate-limit': 'Model rate limit reached', 'nextTasks.reason.format': 'Invalid suggestion format returned by the model', 'nextTasks.reason.output-limit': 'Suggestion output limit reached', 'nextTasks.reason.model-call': 'Model call did not complete', 'nextTasks.reason.model-unconfigured': 'No model configured for this chat', 'nextTasks.reason.context': 'No suitable question and answer text', 'nextTasks.reason.busy': 'Chat is still running or finishing', 'nextTasks.reason.host-state': 'Unable to read chat state', 'nextTasks.reason.cancelled': 'Suggestion generation cancelled', 'nextTasks.dismiss': 'Dismiss suggestions', 'reply.fromUser': 'Quoted message', 'reply.fromAssistant': 'Quoted reply', 'nextTasks.generating': 'Generating next task suggestions…', 'nextTasks.failed': 'Suggestions failed (no automatic retry)', 'message.inComposer': 'History text loaded into the composer. Edit it and add images.', 'message.restoreDraft': 'Restore previous draft text', 'message.edit': 'Edit and resend',
  'reply.action': 'Quote reply', 'reply.cancel': 'Cancel quote', 'reply.user': 'User', 'reply.assistant': 'Assistant', 'reply.unavailable': 'Quote reply is unavailable for this composer',
  'community.join': 'Join the QQ community ↗', 'community.name': 'AndroidSix open-source projects', 'community.number': 'Group',
  'groups.title': 'Project groups', 'groups.all': 'All projects', 'groups.none': 'Ungrouped', 'groups.manage': 'Manage projects and groups',
- 'groups.move': 'Move to group…', 'groups.drop': 'Drag a project onto a group heading, or choose Move to group from its menu.', 'groups.name': 'Group name', 'groups.create': 'New group', 'groups.rename': 'Rename', 'groups.delete': 'Delete group',
+ 'groups.reorder': 'Drag group headings to reorder, or focus and press Alt/Option + ↑/↓. Ungrouped can also be reordered.', 'groups.move': 'Move to group…', 'groups.drop': 'Drag a project onto a group heading, or choose Move to group from its menu.', 'groups.name': 'Group name', 'groups.create': 'New group', 'groups.rename': 'Rename', 'groups.delete': 'Delete group',
  'groups.help': 'Each project belongs to one group. Deleting a group leaves its projects ungrouped. The sidebar nests projects under collapsible groups; native search still searches all chats.',
- 'groups.intro': 'Organize your projects. The sidebar updates automatically.', 'groups.list': 'Groups', 'groups.projects': 'Projects', 'groups.empty': 'No projects in this group', 'groups.emptyHelp': 'Choose a group for a project in All projects.', 'groups.saved': 'Group changes save automatically', 'groups.sessions': 'chats',
+ 'groups.intro': 'Organize your projects. The sidebar updates automatically.', 'groups.list': 'Groups', 'groups.projects': 'Projects', 'groups.empty': 'No projects in this group', 'groups.emptyHelp': 'Choose a group for a project in All projects.', 'groups.sortHelp': 'Drag groups or use the arrows to reorder. Synced with the sidebar.', 'groups.up': 'Move up', 'groups.down': 'Move down', 'groups.saved': 'Group changes save automatically', 'groups.sessions': 'chats',
  'project.groupHelp': 'Group changes save immediately. Name and directory changes apply when you click Save.', 'project.editGroup': 'Edit project', 'project.edit': 'Edit project', 'project.title': 'Project name', 'project.path': 'Project directory', 'project.browse': 'Browse…',
  'project.help': 'Choose an existing code directory. Saving moves all existing chats to the new path and keeps their order, archive and pin state. Code files and paths in past messages stay as they are. Chats must be idle with no queued messages; the host releases their writer before migration.',
  'project.resume': 'Resume migration', 'project.pending': 'Project migration is incomplete. Resume it to continue.',
@@ -563,6 +566,7 @@ export function GroupedSidebar({ Native, ...props }) {
   const timer = setTimeout(() => setSessionFeedback(null), sessionFeedback.error ? 8000 : 4000);
   return () => clearTimeout(timer);
  }, [sessionFeedback]);
+ const [groupInsertion, setGroupInsertion] = useState(null);
  const movingGroup = useRef(false);
  const groups = state?.groups ?? [];
  const workspaces = props.useWorkspaces(value => value);
@@ -572,9 +576,14 @@ export function GroupedSidebar({ Native, ...props }) {
   archived: workspaces.archivedSessionIds, blocked: !!state?.journal || !!state?.workspaceMove || state?.settings?.move?.enabled === false || typeof props.actions?.setSessionOrder !== 'function' };
  const sessionDrag = useMemo(() => sessionProjectDrag({ read: () => dragSnapshot.current, move: callHost, report: setSessionFeedback }), []);
  useEffect(() => () => sessionDrag.dispose(), [sessionDrag]);
+ const groupSnapshot = useRef(null);
+ const headings = useMemo(() => orderedGroups(groups, state?.ungroupedIndex).map(group => group.id === UNGROUPED ? { ...group, title: text(props.toolboxT, 'groups.none') } : group), [groups, state?.ungroupedIndex, props.toolboxT]);
+ groupSnapshot.current = { groups: headings, blocked: !!state?.workspaceMove || !!state?.journal };
+ const groupDrag = useMemo(() => groupOrderDrag({ read: () => groupSnapshot.current,
+  move: async input => { await callHost(input); await loadState(); }, preview: setGroupInsertion, report: setGroupError }), []);
  const view = props.useStore(value => value.groupBy);
- const grouped = props.wide && view !== 'flat' && groups.length > 0;
- const layout = useMemo(() => sidebarLayout(workspaces.items, groups), [workspaces, groups]);
+ const grouped = props.wide && view !== 'flat' && !!state;
+ const layout = useMemo(() => sidebarLayout(workspaces.items, groups, state?.ungroupedIndex), [workspaces, groups, state?.ungroupedIndex]);
  useEffect(() => {
   const discover = () => {
    const row = root.current?.querySelector('[data-row-key^="workspace:"]');
@@ -626,32 +635,38 @@ export function GroupedSidebar({ Native, ...props }) {
   useStore: selector => props.useStore(value => selector(grouped && value.groupBy === 'workspace-tree' ? { ...value, groupBy: 'workspace' } : value)),
   renderSlot: (name, ...args) => props.renderSlot(mirroredSlot(name), ...args),
  };
- const headings = [...groups, { id: 'ungrouped', title: text(props.toolboxT, 'groups.none') }];
  const rules = grouped && list ? layout.map(({ workspace, group }) => {
   const selector = `.sk-sidebar [role="tree"]>div:has([data-row-key=${JSON.stringify('workspace:' + workspace.workspaceId)}])`;
   return `${selector}{order:${group * 2 + 1};padding-left:12px;${collapsed[headings[group].id] ? 'display:none!important;' : ''}}`;
  }).join('') : '';
  return <div className="sk-sidebar" ref={root} onClickCapture={capture} onDragStartCapture={event => {
+   if (groupDrag.start(event)) return;
    sessionDrag.start(event);
    if (event.target.closest?.('[data-row-key^="session:"]')) return;
    const row = event.target.closest?.('[data-row-key^="workspace:"]');
    const id = row?.getAttribute('data-row-key').slice('workspace:'.length);
    if (workspaces.items.some(item => item.workspaceId === id)) event.dataTransfer.setData('application/x-dsh-toolbox-workspace', id);
-  }} onDragOverCapture={sessionDrag.over} onDragLeaveCapture={sessionDrag.leave} onDropCapture={sessionDrag.drop}
-   onDragEndCapture={() => { sessionDrag.end(); setDropGroup(null); }}>
+  }} onDragOverCapture={event => { if (!groupDrag.over(event)) sessionDrag.over(event); }}
+   onDragLeaveCapture={event => { groupDrag.leave(event); sessionDrag.leave(event); }}
+   onDropCapture={event => { void groupDrag.drop(event); void sessionDrag.drop(event); }}
+   onDragEndCapture={event => { groupDrag.end(event); sessionDrag.end(); setDropGroup(null); }}>
   <style>{`.sk-sidebar [data-toolbox-session-drop]{background:var(--dsw-alias-interactive-bg-hover);outline:1px solid var(--dsw-alias-state-active-primary);outline-offset:-1px;border-radius:6px}`}</style>
-  <style>{`.sk-sidebar{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}.sk-groupbar{display:flex;gap:4px;padding:4px 12px;align-items:center;color:var(--dsw-alias-label-secondary);font-size:12px}.sk-groupbar span{flex:1}.sk-group-heading{display:flex;align-items:center;gap:6px;min-height:32px;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;padding:0 8px}[data-toolbox-project-menu]{min-width:172px!important}[data-toolbox-project-menu] [role="menuitem"]>span:last-child{white-space:nowrap;overflow:visible}.sk-group-heading[data-drop="true"]{background:var(--dsw-alias-interactive-bg-hover);outline:1px solid var(--dsw-alias-state-active-primary);border-radius:6px}.sk-group-heading>button:first-child{flex:1;text-align:left}.sk-group-heading button{background:transparent;color:inherit;border:0;border-radius:6px;cursor:pointer;padding:5px}.sk-group-heading button:hover{background:var(--dsw-alias-interactive-bg-hover)}${rules}`}</style>
+  <style>{`.sk-sidebar{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}.sk-groupbar{display:flex;gap:4px;padding:4px 12px;align-items:center;color:var(--dsw-alias-label-secondary);font-size:12px}.sk-groupbar span{flex:1}.sk-group-heading{position:relative;display:flex;align-items:center;gap:6px;min-height:32px;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;padding:0 8px}[data-toolbox-project-menu]{min-width:172px!important}[data-toolbox-project-menu] [role="menuitem"]>span:last-child{white-space:nowrap;overflow:visible}.sk-group-heading[data-drop="true"]{background:var(--dsw-alias-interactive-bg-hover);outline:1px solid var(--dsw-alias-state-active-primary);border-radius:6px}.sk-group-heading[draggable="true"]{cursor:grab}.sk-group-heading[draggable="true"]>button:first-child{cursor:inherit}.sk-group-heading[data-insertion]::after{content:"";position:absolute;left:8px;right:8px;height:2px;border-radius:1px;background:var(--dsw-alias-state-active-primary);pointer-events:none}.sk-group-heading[data-insertion="before"]::after{top:0}.sk-group-heading[data-insertion="after"]::after{bottom:0}.sk-group-heading button:focus-visible{outline:2px solid var(--dsw-alias-state-active-primary);outline-offset:-2px}.sk-group-heading>button:first-child{flex:1;text-align:left}.sk-group-heading button{background:transparent;color:inherit;border:0;border-radius:6px;cursor:pointer;padding:5px}.sk-group-heading button:hover{background:var(--dsw-alias-interactive-bg-hover)}${rules}`}</style>
   <div className="sk-groupbar"><span>{text(props.toolboxT, 'groups.title')}</span><Button variant="ghost" title={text(props.toolboxT, 'groups.manage')} aria-label={text(props.toolboxT, 'groups.manage')} onClick={() => showOverlay({ kind: 'groups' })}>…</Button></div>
   {groupError && <p role="alert">{groupError}</p>}
   {sessionFeedback && <p role={sessionFeedback.error ? 'alert' : 'status'} style={{ padding: '0 12px', fontSize: 12 }}>{sessionFeedback.busy ? '正在切换项目…' : sessionFeedback.message}</p>}
   <Native {...nativeProps} />
   {grouped && list && createPortal(<>
-   <style>{`.sk-sidebar div:has(>.sk-group-heading){display:flex;flex-direction:column}.sk-sidebar [role="tree"]>div:has([data-row-key="workspace:"]){order:${groups.length * 2 + 1};${collapsed.ungrouped ? 'display:none!important;' : ''}}`}</style>
-   {headings.map((group, index) => <div className="sk-group-heading" key={group.id} style={{ order: index * 2 }} data-toolbox-group={group.id} data-drop={dropGroup === group.id} title={text(props.toolboxT, 'groups.drop')}
+   <style>{`.sk-sidebar div:has(>.sk-group-heading){display:flex;flex-direction:column}.sk-sidebar [role="tree"]>div:has([data-row-key="workspace:"]){order:${headings.findIndex(group => group.id === UNGROUPED) * 2 + 1};${collapsed.ungrouped ? 'display:none!important;' : ''}}`}</style>
+   {headings.map((group, index) => <div className="sk-group-heading" key={group.id} style={{ order: index * 2 }} data-toolbox-group={group.id} data-drop={dropGroup === group.id}
+    draggable={!state?.workspaceMove && !state?.journal}
+    data-insertion={groupInsertion?.groupId === group.id ? groupInsertion.edge : undefined}
+    title={`${text(props.toolboxT, 'groups.reorder')} ${text(props.toolboxT, 'groups.drop')}`}
     onDragOver={event => { if (!state?.workspaceMove && event.dataTransfer.types.includes('application/x-dsh-toolbox-workspace')) { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; setDropGroup(group.id); } }}
     onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDropGroup(null); }}
     onDrop={event => { const id = event.dataTransfer.getData('application/x-dsh-toolbox-workspace'); if (!id) return; event.preventDefault(); event.stopPropagation(); void moveGroup(id, group.id); }}>
-    <button aria-expanded={!collapsed[group.id]} onClick={() => setCollapsed(value => ({ ...value, [group.id]: !value[group.id] }))}>{collapsed[group.id] ? '▸' : '▾'} {group.title} <span>({layout.filter(row => row.group === index).length})</span></button>
+    <button aria-expanded={!collapsed[group.id]} aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+     onKeyDown={event => { if (event.altKey && ['ArrowUp', 'ArrowDown'].includes(event.key)) { event.preventDefault(); event.stopPropagation(); void groupDrag.step(group.id, event.key === 'ArrowUp' ? -1 : 1); } }} onClick={() => setCollapsed(value => ({ ...value, [group.id]: !value[group.id] }))}>{collapsed[group.id] ? '▸' : '▾'} {group.title} <span>({layout.filter(row => row.group === index).length})</span></button>
     <button aria-label={`${group.title} — ${text(props.toolboxT, 'groups.manage')}`} onClick={() => showOverlay({ kind: 'groups' })}>…</button>
    </div>)}
   </>, list)}
@@ -715,6 +730,20 @@ export function EditDraftNotice({ sessionId, t }) {
  }}>{text(t, 'message.restoreDraft')}</Button>{error && <span role="alert">{error}</span>}</div>;
 }
 const candidateView = createCandidateView({ getItem: key => window.sessionStorage?.getItem(key), setItem: (key, value) => window.sessionStorage?.setItem(key, value) });
+export function NextTaskAction({ sessionId, seq, canWrite, running, t }) {
+ const [result, setResult] = useState(() => candidateView.get(sessionId)), [pending, setPending] = useState(false), [error, setError] = useState('');
+ const locked = useRef(false);
+ useEffect(() => { setResult(candidateView.get(sessionId)); return candidateView.subscribe(sessionId, setResult); }, [sessionId]);
+ const generating = pending || result?.status === 'generating';
+ const label = text(t, generating ? 'nextTasks.generating' : result?.seq === seq && result.status === 'ready' ? 'nextTasks.regenerate' : 'nextTasks.generate');
+ return <><Tooltip label={label} side="bottom"><button type="button" className="sk-reply-button" data-toolbox-next-generate aria-label={label} aria-busy={generating} disabled={!canWrite || running || generating} onClick={async () => {
+  if (locked.current || !canWrite || running || generating) return;
+  locked.current = true; setPending(true); setError('');
+  try { candidateView.reveal(sessionId, await callHost({ type: 'nextTasks.generate', sessionId, seq })); }
+  catch (reason) { setError(reason.message); }
+  finally { locked.current = false; setPending(false); }
+ }}><NextTaskIcon busy={generating} /></button></Tooltip>{error && <span className="sk-next-action-error" role="alert">{error}</span>}</>;
+}
 /** Observe only once per composer. Candidate buttons belong to their answer footer. */
 export function NextTaskController({ sessionId, useSession }) {
  const { state } = useKit();
@@ -723,20 +752,20 @@ export function NextTaskController({ sessionId, useSession }) {
  const enabled = state?.settings?.nextTasks?.enabled !== false;
  const editing = Boolean(snapshot?.draft?.trim() || snapshot?.attachmentIds?.length);
  const editingRef = useRef(editing); editingRef.current = editing;
- useEffect(() => { if (editing) candidateView.dismiss(sessionId); }, [sessionId, editing]);
+ useEffect(() => { if (editing) candidateView.dismiss(sessionId); }, [sessionId, editing, snapshot?.draft, JSON.stringify(snapshot?.attachmentIds ?? [])]);
  useEffect(() => {
   let live = true, pending = false;
-  if (running || !enabled) candidateView.publish(sessionId, null);
+  if (running) candidateView.publish(sessionId, null);
   const refresh = async () => {
-   if (!enabled || running || pending) return;
+   if (running || pending) return;
    pending = true;
    try {
     const next = await callHost({ type: 'nextTasks.get', sessionId });
-    if (live) { candidateView.publish(sessionId, next); if (editingRef.current) candidateView.dismiss(sessionId); }
+    if (live) { candidateView.publish(sessionId, next); if (editingRef.current && !next.manual) candidateView.dismiss(sessionId); }
    } catch { if (live) candidateView.publish(sessionId, null); }
    finally { pending = false; }
   };
-  void refresh(); const timer = enabled && !running ? setInterval(refresh, 3000) : undefined;
+  void refresh(); const timer = !running ? setInterval(refresh, 3000) : undefined;
   return () => { live = false; clearInterval(timer); };
  }, [sessionId, enabled, running]);
  return null;
@@ -745,7 +774,12 @@ export function NextTaskCandidates({ sessionId, seq, t }) {
  const [result, setResult] = useState(() => candidateView.get(sessionId)), [error, setError] = useState('');
  useEffect(() => { setResult(candidateView.get(sessionId)); return candidateView.subscribe(sessionId, setResult); }, [sessionId]);
  const candidates = candidatesForTurn(result, seq);
- if (!candidates.length) return null;
+ if (!candidates.length) {
+  if (result?.seq !== seq || !['generating', 'ready', 'failed', 'unavailable', 'cancelled', 'error'].includes(result?.status)) return null;
+  const key = result.status === 'generating' ? 'nextTasks.generating' : result.status === 'ready' ? 'nextTasks.empty' : result.status === 'unavailable' ? 'nextTasks.unavailable' : 'nextTasks.failed';
+  const reasonKey = `nextTasks.reason.${result.reason}`;
+  return <div data-toolbox-next-status className="sk-next-status"><style>{conversationExtrasStyle}</style><span role="status">{text(t, key)}{Object.hasOwn(workspaceChinese, reasonKey) ? ` · ${text(t, reasonKey)}` : ''}</span><button type="button" className="sk-extras-close" aria-label={text(t, 'nextTasks.dismiss')} onClick={() => candidateView.dismiss(sessionId)}><CloseIcon /></button></div>;
+ }
  return <section data-toolbox-next-tasks className="sk-next-tasks" aria-label={text(t, 'nextTasks.title')}>
   <style>{conversationExtrasStyle}</style>
   <div className="sk-next-heading"><span>{text(t, 'nextTasks.title')}</span><button className="sk-extras-close" type="button" aria-label={text(t, 'nextTasks.dismiss')} title={text(t, 'nextTasks.dismiss')} onClick={() => candidateView.dismiss(sessionId)}><CloseIcon /></button></div>
@@ -756,11 +790,13 @@ export function NextTaskCandidates({ sessionId, seq, t }) {
 
 function NextTaskSettings({ state, act, busy }) {
  const usage = state?.nextTasks, totals = usage?.totals;
+ const lastFailure = usage?.recent?.[0]?.status === 'failed' ? usage.recent[0] : null;
  const number = value => Number(value ?? 0).toLocaleString();
  return <section className="box" data-toolbox-next-settings><h3>接下来任务联想</h3>
   <label className="row"><input type="checkbox" checked={state?.settings?.nextTasks?.enabled !== false} disabled={busy || !state?.settings} onChange={event => void act({ type: 'settings.update', patch: { nextTasks: { enabled: event.target.checked } } }, event.target.checked ? '已开启任务联想' : '已关闭任务联想并取消待生成请求').catch(() => {})} /> 问答结束后生成候选（默认开启）</label>
   <p className="muted">每轮正常结束后额外调用一次该会话的模型；取最近最多 6 条可见文字（不含图片、工具和思考过程），输入上限 12 KB，输出上限 600 token。点击候选填入输入框，已有草稿会保留，由你决定是否发送。失败不自动重试。</p>
   {usage?.available === false && <p className="error">当前 DSH 未提供模型调用接口，暂不生成。</p>}
+  {lastFailure && <p className="error" role="status">最近一次联想失败：{text(undefined, `nextTasks.reason.${lastFailure.reason ?? 'model-call'}`) ?? text(undefined, 'nextTasks.reason.model-call')}。不会自动重试，可检查模型配置后点击回答末尾的星光图标手动重试。</p>}
   {totals && <><div className="row"><span className="pill">调用 {number(totals.calls)}</span><span className="pill">成功 {number(totals.completed)}</span><span className="pill">失败 {number(totals.failed)} / 取消 {number(totals.cancelled)}</span><span className="pill">已报告总 token {number(totals.totalTokens)}</span></div>
    <p className="muted">独立记录本功能的模型用量，不计入会话消息统计。未缓存输入 {number(totals.inputTokens)} · 缓存读取 {number(totals.cacheReadTokens)} · 缓存写入 {number(totals.cacheWriteTokens)} · 输出 {number(totals.outputTokens)}（含思考 {number(totals.reasoningTokens)}）。按服务商报告统计；缺少完整用量 {number(totals.unreported)} 次，尚未结算 {number(usage.pending)} 次，消耗未计入总数。日期按 UTC 记录。</p>
    {!!usage.models?.length && <div style={{ overflowX: 'auto' }}><table><thead><tr><th>模型</th><th>调用</th><th>未缓存输入</th><th>缓存读 / 写</th><th>输出</th><th>已报告总 token</th></tr></thead><tbody>{usage.models.map(row => <tr key={`${row.provider}:${row.model}`}><td>{row.provider} / {row.model}</td><td>{number(row.calls)}</td><td>{number(row.inputTokens)}</td><td>{number(row.cacheReadTokens)} / {number(row.cacheWriteTokens)}</td><td>{number(row.outputTokens)}</td><td>{number(row.totalTokens)}</td></tr>)}</tbody></table></div>}
@@ -795,7 +831,13 @@ function useDeletedMessages(id, running) {
  }, [id, running]);
  return seqs;
 }
-const replyStyle = `.sk-reply-button{display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;padding:5px;background:transparent;border:0;border-radius:var(--dsw-radius-sm,6px);color:var(--dsw-alias-label-tertiary);cursor:pointer}.sk-reply-button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.sk-reply-button:disabled{opacity:.4;cursor:default}.sk-reply-preview{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,12px);color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;background:var(--dsw-alias-bg-module-platform)}.sk-reply-preview>div{min-width:0;flex:1;border-left:2px solid var(--dsw-alias-label-tertiary);padding-left:10px}.sk-reply-preview p{margin:4px 0 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:pre-wrap;overflow-wrap:anywhere}.sk-reply-preview strong{font-size:12px;font-weight:500}`;
+const replyStyle = `
+.sk-next-spinner{transform-origin:8px 8px;animation:sk-next-spin 900ms linear infinite}
+@keyframes sk-next-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.sk-next-spinner{animation:none}}
+.sk-next-action-error{max-width:220px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
+.sk-reply-button:focus-visible{outline:2px solid var(--dsw-alias-state-active-primary);outline-offset:2px}
+.sk-reply-button{display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;padding:5px;background:transparent;border:0;border-radius:var(--dsw-radius-sm,6px);color:var(--dsw-alias-label-tertiary);cursor:pointer}.sk-reply-button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.sk-reply-button:disabled{opacity:.4;cursor:default}.sk-reply-preview{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,12px);color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;background:var(--dsw-alias-bg-module-platform)}.sk-reply-preview>div{min-width:0;flex:1;border-left:2px solid var(--dsw-alias-label-tertiary);padding-left:10px}.sk-reply-preview p{margin:4px 0 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:pre-wrap;overflow-wrap:anywhere}.sk-reply-preview strong{font-size:12px;font-weight:500}`;
 const replyCarets = new WeakMap();
 export function ReplyMessage({ Native, mirrors, toolboxT, ...props }) {
  const root = useRef(null), [target, setTarget] = useState(null), [error, setError] = useState('');
@@ -821,7 +863,8 @@ export function ReplyMessage({ Native, mirrors, toolboxT, ...props }) {
  const nativeProps = { ...props, renderSlot: (name, ...args) => props.renderSlot(mirrors.get(name) ?? name, ...args) };
  if (deleted) return null;
  return <div ref={root} style={{ display: 'contents' }}><Native {...nativeProps} /><style>{replyStyle}</style>
-  {target && createPortal(<>{quote && <Tooltip label={label} side="bottom"><button type="button" className="sk-reply-button" aria-label={label} disabled={!replyAvailable || !input || !canWrite || phase !== 'plain'} onClick={reply}><QuoteIcon /></button></Tooltip>}
+  {target && createPortal(<>{quote?.role === 'assistant' && props.node?.kind === 'turn-tail' && Number.isSafeInteger(props.node.data?.seq) && <NextTaskAction sessionId={props.sessionId} seq={props.node.data.seq} canWrite={canWrite} running={running} t={toolboxT} />}
+   {quote && <Tooltip label={label} side="bottom"><button type="button" className="sk-reply-button" aria-label={label} disabled={!replyAvailable || !input || !canWrite || phase !== 'plain'} onClick={reply}><QuoteIcon /></button></Tooltip>}
    {['user', 'steering'].includes(props.node?.kind) && Number.isSafeInteger(props.node.anchorSeq) && <MessageAction sessionId={props.sessionId} node={props.node} canWrite={canWrite} running={running} t={toolboxT} />}
    {seq !== undefined && <Tooltip label={text(toolboxT, 'message.delete')} side="bottom"><button type="button" className="sk-reply-button" aria-label={text(toolboxT, 'message.delete')} disabled={!canWrite || running} onClick={() => showOverlay({ kind: 'message-delete', sessionId: props.sessionId, seq })}><DeleteIcon /></button></Tooltip>}
   </>, target)}
@@ -832,10 +875,14 @@ export function ReplyMessage({ Native, mirrors, toolboxT, ...props }) {
 export function QuoteIcon() {
  return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.15" aria-hidden="true"><circle cx="8" cy="8" r="6" /><path d="M5 8h2v2H5V8c0-1.3.6-2.3 1.6-2.7M9 8h2v2H9V8c0-1.3.6-2.3 1.6-2.7" strokeLinejoin="round" /></svg>;
 }
+function NextTaskIcon({ busy }) {
+ return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.15" aria-hidden="true">{busy ? <><circle cx="8" cy="8" r="5.5" opacity=".25" /><path className="sk-next-spinner" d="M8 2.5A5.5 5.5 0 0 1 13.5 8" strokeLinecap="round" /></> : <><path d="m6.5 3 1.2 3.8 3.8 1.2-3.8 1.2L6.5 13 5.3 9.2 1.5 8l3.8-1.2L6.5 3Z" strokeLinejoin="round" /><path d="m12.5 1 .6 1.9 1.9.6-1.9.6-.6 1.9-.6-1.9-1.9-.6 1.9-.6.6-1.9Z" strokeLinejoin="round" /></>}</svg>;
+}
 function CloseIcon() {
  return <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" strokeLinecap="round" /></svg>;
 }
 const conversationExtrasStyle = `
+.sk-next-status{display:flex;align-items:center;gap:8px;margin:12px 0 4px;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:20px}.sk-next-status>span{min-width:0}.sk-next-status>button{flex:none}
 .sk-next-tasks{max-width:640px;min-width:0;margin:18px 0 4px;color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;line-height:20px}
 .sk-next-heading{display:flex;align-items:center;gap:12px;margin-bottom:8px;color:var(--dsw-alias-label-secondary);font-size:12px}.sk-next-heading>span{flex:1}
 .sk-next-options{display:flex;flex-direction:column;align-items:flex-start;gap:7px}
@@ -900,6 +947,9 @@ export function MessageAction({ sessionId, node, canWrite, running, t }) {
 }
 function EditIcon() {
  return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true"><path d="m10.5 2.5 3 3M3 10l7.7-7.7a1.4 1.4 0 0 1 2 2L5 12l-3 1 1-3Z" strokeLinejoin="round" /></svg>;
+}
+function GroupOrderIcon({ down = false }) {
+ return <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={down ? 'M8 3v10m-4-4 4 4 4-4' : 'M8 13V3M4 7l4-4 4 4'} /></svg>;
 }
 function DeleteIcon() {
  return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true"><path d="M2.5 4.5h11M6 4V2.5h4V4M4 4.5l.7 9h6.6l.7-9M6.5 6.5v5M9.5 6.5v5" strokeLinejoin="round" /></svg>;
@@ -1037,7 +1087,7 @@ function WorkspaceSection({ state, t }) {
   finally { await loadState(); setBusy(false); }
  };
  return <section className="box"><h3>项目分组与路径 / Projects</h3>
-  <p className="muted">{state?.groups?.length ?? 0} 个分组 · {state?.projects?.length ?? 0} 个项目。侧栏按分组展开项目，项目菜单可编辑名称、路径和分组。</p>
+  <p className="muted">{(state?.groups?.length ?? 0) + 1} 个分组（含未分组） · {state?.projects?.length ?? 0} 个项目。侧栏按分组展开项目，项目菜单可编辑名称、路径和分组。</p>
   <div><Button variant="outline" onClick={() => showOverlay({ kind: 'groups' })}>{text(t, 'groups.manage')}</Button></div>
   {state?.workspaceMove && <p role="status">{text(t, 'project.pending')}<br /><span className="mono">{state.workspaceMove.fromCwd} → {state.workspaceMove.toCwd}</span><br />{state.workspaceMove.moved.length} / {state.workspaceMove.sessionIds.length} <Button variant="outline" disabled={busy} onClick={() => void resume()}>{text(t, busy ? 'common.busy' : 'project.resume')}</Button></p>}
   {error && <p className="error" role="alert">{error}</p>}
@@ -1049,13 +1099,18 @@ const groupsStyle = `
 .sk-groups{color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.5;min-width:0}
 .sk-groups *{box-sizing:border-box}.sk-groups button,.sk-groups input,.sk-groups select{font:inherit}.sk-groups button{cursor:pointer}.sk-groups button:disabled{cursor:default}
 .sk-groups-intro{margin:0 0 20px;color:var(--dsw-alias-label-secondary)}
-.sk-groups-layout{display:grid;grid-template-columns:180px minmax(0,1fr);gap:24px;min-height:360px}
+.sk-groups-layout{display:grid;grid-template-columns:212px minmax(0,1fr);gap:24px;min-height:360px}
 .sk-groups-sidebar{display:flex;flex-direction:column;gap:16px;min-width:0;border-right:1px solid var(--dsw-alias-border-l2);padding-right:20px}
 .sk-groups-caption{margin:0;color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:500}
 .sk-groups-nav{display:flex;flex-direction:column;gap:4px;max-height:300px;overflow-y:auto;min-width:0}
 .sk-group-filter{display:flex;align-items:center;gap:8px;flex:none;width:100%;min-height:36px;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);padding:8px 10px;text-align:left}
 .sk-group-filter>span:first-child{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;flex:1}.sk-group-count{font-size:12px;font-variant-numeric:tabular-nums;opacity:.7}
 .sk-group-filter:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.sk-group-filter[aria-pressed=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);font-weight:600}
+.sk-group-filter-row{position:relative;display:flex;align-items:center;flex:none;gap:2px;border-radius:7px;min-width:0}.sk-group-filter-row:has(>.sk-group-filter[aria-pressed=true]),.sk-group-filter-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.sk-group-filter-row>.sk-group-filter{flex:1;min-width:0;width:auto;gap:6px;padding:8px}.sk-group-filter-row>.sk-group-filter:hover,.sk-group-filter-row>.sk-group-filter[aria-pressed=true]{background:transparent}.sk-group-filter-row[draggable=true],.sk-group-filter-row[draggable=true]>.sk-group-filter{cursor:grab}
+.sk-group-order-buttons{display:flex;align-items:center;gap:2px;padding-right:4px;flex:none}.sk-groups .sk-group-order-buttons>button{display:grid;place-items:center;width:26px;min-width:26px;height:28px;min-height:28px;padding:0;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary)}.sk-groups .sk-group-order-buttons>button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.sk-group-order-buttons>button:disabled{opacity:.3}
+.sk-group-filter-row[data-insertion]::after{content:"";position:absolute;left:4px;right:4px;height:2px;border-radius:1px;background:var(--dsw-alias-state-active-primary);pointer-events:none}.sk-group-filter-row[data-insertion=before]::after{top:-2px}.sk-group-filter-row[data-insertion=after]::after{bottom:-2px}
+.sk-groups-sort-help{margin:-6px 0 0;font-size:12px;color:var(--dsw-alias-label-secondary)}
 .sk-groups-form{display:flex;flex-direction:column;gap:8px;margin-top:auto;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}.sk-groups-form-actions{display:flex;gap:6px}.sk-groups-form-actions>button:first-child{flex:1}
 .sk-groups input,.sk-groups select{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);border-radius:7px;color:var(--dsw-alias-label-primary);min-height:34px;padding:7px 9px;min-width:0;max-width:100%}.sk-groups input{width:100%}.sk-groups input::placeholder{color:var(--dsw-alias-label-tertiary)}
 .sk-groups :is(button,input,select):focus-visible{outline:2px solid var(--dsw-alias-state-active-primary);outline-offset:2px}
@@ -1066,35 +1121,57 @@ const groupsStyle = `
 .sk-group-project-path{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;margin-top:3px;color:var(--dsw-alias-label-secondary);font:12px/18px ui-monospace,monospace}
 .sk-group-project-actions{display:flex;align-items:center;gap:6px;flex:none}.sk-group-project-actions select{width:110px;font-size:12px}.sk-group-project-actions>button{padding:7px;min-height:32px}
 .sk-groups-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;min-height:220px;text-align:center;color:var(--dsw-alias-label-secondary)}.sk-groups-empty p{margin:0}.sk-groups-empty strong{color:var(--dsw-alias-label-primary);font-weight:500}.sk-groups-note{font-size:12px;color:var(--dsw-alias-label-secondary);margin:16px 0 0}.sk-groups-error{color:var(--dsw-alias-state-error-primary);margin:12px 0 0}
-@media(max-width:680px){.sk-groups-layout{grid-template-columns:1fr;gap:20px;min-height:0}.sk-groups-sidebar{border:0;padding:0;gap:10px}.sk-groups-nav{flex-direction:row;flex-wrap:wrap;max-height:110px;gap:4px}.sk-group-filter{width:auto;gap:12px;max-width:100%}.sk-groups-form{flex-direction:row;align-items:center;margin:0;padding:0;border:0}.sk-groups-form label{flex:1;min-width:0}.sk-groups-form label>span{display:none}.sk-groups-form-actions{flex:none}.sk-groups-caption{display:none}.sk-groups-intro{margin-bottom:16px}.sk-group-projects{max-height:max(120px,calc(100dvh - 390px))}.sk-groups-heading{margin-bottom:6px}.sk-group-project{gap:8px}.sk-group-project>svg{display:none}.sk-group-project-name{display:block}.sk-group-project-name strong{display:block}.sk-group-project-name span{font-size:12px}.sk-group-project-actions select{width:96px}}
+@media(max-width:680px){.sk-groups-layout{grid-template-columns:1fr;gap:20px;min-height:0}.sk-groups-sidebar{border:0;padding:0;gap:10px}.sk-groups-nav{max-height:180px;gap:4px}.sk-group-filter{gap:12px;max-width:100%}.sk-groups .sk-group-order-buttons>button{width:36px;height:36px}.sk-groups-sort-help{margin:0}.sk-groups-form{flex-direction:row;align-items:center;margin:0;padding:0;border:0}.sk-groups-form label{flex:1;min-width:0}.sk-groups-form label>span{display:none}.sk-groups-form-actions{flex:none}.sk-groups-caption{display:none}.sk-groups-intro{margin-bottom:16px}.sk-group-projects{max-height:max(120px,calc(100dvh - 390px))}.sk-groups-heading{margin-bottom:6px}.sk-group-project{gap:8px}.sk-group-project>svg{display:none}.sk-group-project-name{display:block}.sk-group-project-name strong{display:block}.sk-group-project-name span{font-size:12px}.sk-group-project-actions select{width:96px}}
 `;
 
 export function GroupsDialog({ close, t }) {
  const { state } = useKit();
  const [name, setName] = useState(''), [editing, setEditing] = useState(''), [busy, setBusy] = useState(false), [error, setError] = useState('');
  const [selected, setSelected] = useState(null), nameInput = useRef(null);
+ const [groupInsertion, setGroupInsertion] = useState(null), pending = useRef(false), orderSnapshot = useRef(null);
  const groups = state?.groups ?? [], projects = state?.projects ?? [];
+ const ordered = useMemo(() => orderedGroups(groups, state?.ungroupedIndex), [groups, state?.ungroupedIndex]);
  const groupOf = id => groups.find(group => group.workspaceIds.includes(id))?.id ?? '';
  const selectedGroup = groups.find(group => group.id === selected);
  const visible = projects.filter(project => selected === null || groupOf(project.id) === selected);
  useEffect(() => { if (selected && state && !groups.some(group => group.id === selected)) setSelected(null); }, [state, selected]);
  useEffect(() => { if (editing) { nameInput.current?.focus(); nameInput.current?.select(); } }, [editing]);
- const blocked = busy || !state || !!state.workspaceMove;
+ const blocked = busy || !state || !!state.workspaceMove || !!state.journal;
+ orderSnapshot.current = { groups: ordered, blocked };
+ const groupDrag = useMemo(() => groupOrderDrag({ read: () => ({ ...orderSnapshot.current, blocked: orderSnapshot.current.blocked || pending.current }),
+  move: async input => {
+   pending.current = true; setBusy(true);
+   try { await callHost(input); await loadState(); }
+   finally { pending.current = false; setBusy(false); }
+  }, preview: setGroupInsertion, report: setError }), []);
  const run = async input => {
-  if (blocked) return;
-  setBusy(true); setError('');
+  if (blocked || pending.current) return;
+  pending.current = true; setBusy(true); setError('');
   try { await callHost(input); await loadState(); if (['group.rename', 'group.create'].includes(input.type) || input.type === 'group.delete' && input.groupId === editing) { setName(''); setEditing(''); } }
   catch (reason) { setError(reason.message); }
-  finally { setBusy(false); }
+  finally { pending.current = false; setBusy(false); }
  };
- const filters = [{ id: null, title: text(t, 'groups.all'), count: projects.length }, ...groups.map(group => ({ ...group, count: projects.filter(project => groupOf(project.id) === group.id).length })), { id: '', title: text(t, 'groups.none'), count: projects.filter(project => !groupOf(project.id)).length }];
+ const filters = [{ id: null, title: text(t, 'groups.all'), count: projects.length }, ...ordered.map(group => { const id = group.id === UNGROUPED ? '' : group.id; return { ...group, id, title: group.id === UNGROUPED ? text(t, 'groups.none') : group.title, count: projects.filter(project => groupOf(project.id) === id).length }; })];
  return <Modal open className="sk-groups-dialog" title={text(t, 'groups.manage')} closeLabel={text(t, 'common.close')} onClose={() => { if (!busy) close(); }}>
   <div className="sk-groups" data-toolbox-groups><style>{groupsStyle}</style>
    <p className="sk-groups-intro">{text(t, 'groups.intro')}</p>
    <div className="sk-groups-layout">
     <aside className="sk-groups-sidebar">
      <h3 className="sk-groups-caption">{text(t, 'groups.list')}</h3>
-     <nav className="sk-groups-nav" aria-label={text(t, 'groups.title')}>{filters.map(group => <button type="button" className="sk-group-filter" key={group.id ?? 'all'} title={group.title} aria-pressed={selected === group.id} onClick={() => setSelected(group.id)}><span>{group.title}</span><span className="sk-group-count">{group.count}</span></button>)}</nav>
+     <nav className="sk-groups-nav" aria-label={text(t, 'groups.title')} aria-describedby="sk-groups-sort-help"
+      onDragStartCapture={groupDrag.start} onDragOverCapture={groupDrag.over} onDragLeaveCapture={groupDrag.leave} onDropCapture={event => void groupDrag.drop(event)} onDragEndCapture={groupDrag.end}>
+      {filters.map((group, index) => <div className="sk-group-filter-row" key={group.id ?? 'all'} data-toolbox-group={group.id === null ? undefined : group.id || 'ungrouped'}
+       draggable={group.id !== null && !blocked} data-insertion={group.id !== null && groupInsertion?.groupId === (group.id || 'ungrouped') ? groupInsertion.edge : undefined}>
+       <button type="button" className="sk-group-filter" title={group.title} aria-pressed={selected === group.id} aria-keyshortcuts={group.id !== null ? 'Alt+ArrowUp Alt+ArrowDown' : undefined}
+        onKeyDown={event => { if (group.id !== null && event.altKey && ['ArrowUp', 'ArrowDown'].includes(event.key)) { event.preventDefault(); void groupDrag.step(group.id || UNGROUPED, event.key === 'ArrowUp' ? -1 : 1); } }}
+        onClick={() => setSelected(group.id)}><span>{group.title}</span><span className="sk-group-count">{group.count}</span></button>
+       {group.id !== null && <div className="sk-group-order-buttons">
+        <Button type="button" variant="ghost" title={text(t, 'groups.up')} aria-label={`${group.title} — ${text(t, 'groups.up')}`} disabled={blocked || index === 1} onClick={() => void groupDrag.step(group.id || UNGROUPED, -1)}><GroupOrderIcon /></Button>
+        <Button type="button" variant="ghost" title={text(t, 'groups.down')} aria-label={`${group.title} — ${text(t, 'groups.down')}`} disabled={blocked || index === ordered.length} onClick={() => void groupDrag.step(group.id || UNGROUPED, 1)}><GroupOrderIcon down /></Button>
+       </div>}
+      </div>)}
+     </nav>
+     <p className="sk-groups-sort-help" id="sk-groups-sort-help">{text(t, 'groups.sortHelp')}</p>
      <form className="sk-groups-form" onSubmit={event => { event.preventDefault(); void run({ type: editing ? 'group.rename' : 'group.create', groupId: editing, title: name }); }}>
       <label><span className="sk-groups-caption">{text(t, editing ? 'groups.rename' : 'groups.create')}</span><input ref={nameInput} aria-label={text(t, 'groups.name')} placeholder={text(t, 'groups.name')} maxLength={80} value={name} disabled={blocked} onChange={event => setName(event.target.value)} /></label>
       <div className="sk-groups-form-actions"><Button type="submit" variant={editing ? 'primary' : 'outline'} disabled={blocked || !name.trim()}>{text(t, editing ? 'common.save' : 'groups.create')}</Button>{editing && <Button type="button" variant="ghost" disabled={busy} onClick={() => { setEditing(''); setName(''); }}>{text(t, 'common.cancel')}</Button>}</div>

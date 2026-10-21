@@ -30,6 +30,13 @@ function kitDouble() {
 	};
 }
 
+test('manual suggestion dispatch forwards the selected turn without exposing generation through GET', async () => {
+ const calls = [], kit = { nextTasks: { state: id => ({ status: 'idle', id }), request: async (id, seq) => { calls.push({ id, seq }); return { status: 'generating', seq, manual: true }; } } };
+ assert.equal((await dispatch(kit, { type: 'nextTasks.get', sessionId: 's' })).status, 'idle'); assert.equal(calls.length, 0);
+ const result = await dispatch(kit, { type: 'nextTasks.generate', sessionId: 's', seq: 12 });
+ assert.equal(result.status, 'generating'); assert.deepEqual(calls, [{ id: 's', seq: 12 }]);
+});
+
 test('GET serves the snapshot and the write key only to loopback', async () => {
 	const kit = kitDouble();
 	const handler = apiHandler(kit);

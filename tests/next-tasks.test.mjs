@@ -10,6 +10,18 @@ const usage = { inputTokens: 100, cacheReadTokens: 200, cacheWriteTokens: 5, out
 const message = (role, text, rest = {}) => ({ role, source: { kind: role === 'user' ? 'user' : 'model' }, content: [{ type: 'text', text }], ...rest });
 function session(id = 's') { return { id, header: {}, deriveMessages: () => [message('user', '请完成测试'), message('assistant', '已完成测试')], requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) }; }
 const end = seq => ({ type: 'turn/end', seq, data: { reason: { kind: 'completed' } } });
+function historySession() {
+ const messages = [message('user', '早期问题', { id: 'u1' }), message('assistant', '早期回答', { id: 'a1' }), message('user', '未来问题，不应泄漏', { id: 'u2' }), message('assistant', '未来回答，不应泄漏', { id: 'a2' })];
+ const events = [
+  { seq: 1, type: 'user/message', data: messages[0] },
+  { seq: 2, type: 'assistant/message', data: { turn: 1, message: messages[1] } },
+  { ...end(3), data: { turn: 1, reason: { kind: 'completed' } } },
+  { seq: 4, type: 'user/message', data: messages[2] },
+  { seq: 5, type: 'assistant/message', data: { turn: 2, message: messages[3] } },
+  { ...end(6), data: { turn: 2, reason: { kind: 'completed' } } },
+ ];
+ return { ...session(), deriveMessages: () => messages, snapshotEvents: () => events };
+}
 async function fixture(t, options = {}) {
  const root = await mkdtemp(join(tmpdir(), 'sk-next-'));
  let enabled = true; const calls = [];
@@ -47,6 +59,68 @@ test('context is bounded canonical text; hidden reasoning, tools, attachments an
  const text = nextTaskContext(s);
  assert(Buffer.byteLength(text) <= 12000); assert(!/SECRET|DELETED ORIGINAL|Message deleted/.test(text)); assert(JSON.parse(text).length <= 6);
  assert.equal(nextTaskContext({ deriveMessages: () => [message('assistant', 'only assistant')] }), null);
+});
+
+test('formatted model candidates remain usable instead of showing a format failure', async t => {
+ const text = '以下是接下来可以做的事：\n```JSON\n["补充边界测试", "检查键盘操作"]\n```';
+ const { engine, calls } = await fixture(t, { stream: async function* () {
+  yield { type: 'text-delta', index: 0, text: text.slice(0, 18) };
+  yield { type: 'text-delta', index: 0, text: text.slice(18) };
+  yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+  yield { type: 'usage', usage };
+  yield { type: 'finish', reason: { kind: 'stop' } };
+ } });
+ await engine.complete(session(), end(12));
+ assert.equal(engine.state('s').status, 'ready', 'a valid array with a model preamble must not become reason=format');
+ assert.deepEqual(engine.state('s').candidates, ['补充边界测试', '检查键盘操作']);
+ assert.equal(calls.length, 1);
+ const { totals } = await engine.summary();
+ assert.equal(totals.completed, 1); assert.equal(totals.totalTokens, 325);
+});
+
+test('candidate parsing tolerates one JSON payload and known wrappers, preserving empty results and escaped delimiters', () => {
+ const candidates = ['检查 [a] 与 {b}', '验证 "引号" 与 \\ 路径'];
+ const json = JSON.stringify(candidates);
+ for (const text of [json, `\uFEFF${json}`, `建议如下：${json}\n以上供选择。`, `建议：\n\`\`\`JSON\n${json}\n\`\`\`\n请选择。`, ...['candidates', 'suggestions', 'nextTasks', 'next_tasks'].map(key => JSON.stringify({ [key]: candidates }))]) {
+  assert.deepEqual(parseNextTasks(text), candidates);
+ }
+ for (const text of ['[]', '{"suggestions":[]}', '没有合适的后续任务：\n```json\n[]\n```']) assert.deepEqual(parseNextTasks(text), []);
+ assert.deepEqual(parseNextTasks('["A", " A ", "B", "C", "D"]'), ['A', 'B', 'C']);
+});
+
+test('candidate parsing rejects malformed, ambiguous and unstructured responses instead of inventing candidates', () => {
+ for (const text of ['', '已完成，无需继续。', '1. 普通答复\n2. 普通答复', '["A",]', '["A"', '[{}]', '["A", 1]', '{"answer":["A"]}', '{"suggestions":["A"],"candidates":["B"]}', '{"suggestions":[{"text":"A"}]}', '建议：["A"] 或者 ["B"]', '```json\n["A"]\n```\n```json\n["B"]\n```', '```javascript\n["A"]\n```', '```json\n["A"]\n```\n["B"]', '{"broken": ["A"]', 'x'.repeat(16385)]) {
+  assert.throws(() => parseNextTasks(text), { code: 'invalid-candidates' }, text.slice(0, 100));
+ }
+});
+
+test('stream assembly preserves JSON across text blocks without duplicating final blocks or reading reasoning', async t => {
+ const { engine } = await fixture(t, { stream: async function* () {
+  yield { type: 'reasoning-delta', index: 0, text: '["not a candidate"]' };
+  yield { type: 'block-end', index: 0, block: { type: 'reasoning', text: 'not a candidate' } };
+  yield { type: 'text-delta', index: 1, text: '建议：\n' };
+  yield { type: 'block-end', index: 1, block: { type: 'text', text: '建议：\n' } };
+  yield { type: 'text-delta', index: 2, text: '{"suggestions":[' };
+  yield { type: 'text-delta', index: 2, text: '"补充测试"]}' };
+  yield { type: 'block-end', index: 2, block: { type: 'text', text: '{"suggestions":["补充测试"]}' } };
+  yield { type: 'usage', usage };
+  yield { type: 'finish', reason: { kind: 'stop' } };
+ } });
+ await engine.complete(session(), end(14));
+ assert.deepEqual(engine.state('s').candidates, ['补充测试']);
+});
+
+test('a genuinely invalid model response remains a visible format failure with usage counted once and no retry', async t => {
+ const { engine, calls } = await fixture(t, { stream: async function* () {
+  yield { type: 'text-delta', index: 0, text: '普通回答，没有候选数据。' };
+  yield { type: 'usage', usage };
+  yield { type: 'finish', reason: { kind: 'stop' } };
+ } });
+ await engine.complete(session(), end(15)); await engine.complete(session(), end(15));
+ assert.equal(engine.state('s').status, 'failed'); assert.equal(engine.state('s').reason, 'format');
+ assert.equal(calls.length, 1); const summary = await engine.summary();
+ assert.equal(summary.totals.failed, 1); assert.equal(summary.totals.totalTokens, 325);
+ assert(!JSON.stringify(summary).includes('普通回答'));
 });
 
 test('completed turn generates once, uses its model, never appends chat, and persists independent usage across reload', async t => {
@@ -103,6 +177,68 @@ test('disabled, running, subagent and aborted turns generate no auxiliary reques
  disable(); await engine.complete(session(), end(5)); assert.equal(calls.length, 0); assert.equal(engine.state('s').status, 'disabled');
 });
 
+test('manual generation works with auto OFF, targets the selected historical answer and restores its cache without paid replay', async t => {
+ const s = historySession();
+ const { root, engine, calls, disable } = await fixture(t, { sessions: () => ({ get: id => id === s.id ? s : undefined }) });
+ disable();
+ const state = await engine.request('s', 3);
+ assert.equal(state.status, 'generating'); assert.equal(state.manual, true);
+ await engine.tail;
+ assert.equal(engine.state('s').status, 'ready'); assert.equal(engine.state('s').seq, 3);
+ assert.equal(calls.length, 1);
+ const context = calls[0].messages[0].content[0].text;
+ assert(context.includes('早期问题')); assert(context.includes('早期回答')); assert(!context.includes('未来'));
+ const reload = new NextTasks({ root, settings: () => ({ nextTasks: { enabled: false } }), llm: () => ({ prepareCall() { assert.fail('restore must not dispatch'); } }) });
+ await reload.restore(); assert.equal(reload.state('s').status, 'ready'); assert.equal(reload.state('s').manual, true); await reload.dispose();
+ await engine.request('s', 3); await engine.tail;
+ assert.equal(calls.length, 2, 'another explicit click may regenerate');
+ assert.equal((await engine.summary()).totals.completed, 2);
+});
+
+test('manual retries count once, concurrent clicks share the job and a different answer cannot replace active generation', async t => {
+ const s = historySession(); let release, attempts = 0;
+ const { engine, calls } = await fixture(t, { sessions: () => ({ get: () => s }), stream: async function* () {
+  if (++attempts === 1) yield { type: 'text-delta', index: 0, text: 'invalid model reply' };
+  else { await new Promise(resolve => { release = resolve; }); yield { type: 'text-delta', index: 0, text: '["重新生成成功"]' }; }
+  yield { type: 'usage', usage }; yield { type: 'finish', reason: { kind: 'stop' } };
+ } });
+ await engine.request('s', 3); await engine.tail; assert.equal(engine.state('s').reason, 'format');
+ await engine.request('s', 3); while (!release) await new Promise(resolve => setImmediate(resolve));
+ const duplicate = await engine.request('s', 3); assert.equal(duplicate.status, 'generating');
+ await assert.rejects(() => engine.request('s', 6), /正在生成/);
+ release(); await engine.tail;
+ assert.equal(calls.length, 2); assert.deepEqual(engine.state('s').candidates, ['重新生成成功']);
+ const { totals } = await engine.summary(); assert.equal(totals.failed, 1); assert.equal(totals.completed, 1); assert.equal(totals.totalTokens, 650);
+});
+
+test('manual generation rejects invalid, busy, subagent, aborted and deleted/compacted answers without a paid request', async t => {
+ const s = historySession(); let busy = true;
+ const { engine, calls } = await fixture(t, { sessions: () => ({ get: id => id === 's' ? s : undefined }), busy: () => busy });
+ await assert.rejects(() => engine.request('missing', 3), /打开此会话/);
+ await assert.rejects(() => engine.request('s', '3'), /无效/);
+ await assert.rejects(() => engine.request('s', 3), /仍在运行/); busy = false;
+ await assert.rejects(() => engine.request('s', 2), /正常结束/);
+ s.header.origin = 'subagent'; await assert.rejects(() => engine.request('s', 3), /子代理/); s.header.origin = undefined;
+ const events = s.snapshotEvents(); events[2].data.reason.kind = 'aborted'; await assert.rejects(() => engine.request('s', 3), /正常结束/); events[2].data.reason.kind = 'completed';
+ s.deriveMessages = () => []; await assert.rejects(() => engine.request('s', 3), /已删除/);
+ assert.equal(calls.length, 0);
+});
+
+test('saving unrelated settings while auto is already OFF keeps manual generation; switching auto from ON to OFF cancels it', async t => {
+ const s = historySession(); let started, release, signal;
+ const { engine, disable } = await fixture(t, { sessions: () => ({ get: () => s }), stream: async function* (request) {
+  signal = request.signal; started = true;
+  await new Promise(resolve => { release = resolve; signal.addEventListener('abort', resolve, { once: true }); });
+  yield { type: 'text-delta', index: 0, text: '["继续"]' }; yield { type: 'finish', reason: { kind: 'stop' } };
+ } });
+ disable(); await engine.request('s', 3); while (!started) await new Promise(resolve => setImmediate(resolve));
+ engine.configure(); assert.equal(signal.aborted, false); assert.equal(engine.state('s').status, 'generating');
+ engine.settings = () => ({ nextTasks: { enabled: true } }); engine.configure();
+ engine.settings = () => ({ nextTasks: { enabled: false } }); engine.configure();
+ assert.equal(signal.aborted, true); release(); await engine.tail;
+ assert.equal((await engine.summary()).totals.cancelled, 1);
+});
+
 test('disable aborts generation, retains provider-reported usage, and prevents stale candidates or retries', async t => {
  let started, unblock;
  const first = new Promise(resolve => { started = resolve; });
@@ -131,4 +267,41 @@ test('event observers defer generation and cancel a scheduled old turn when new 
  installNextTasks({ on: (name, fn) => { observe = fn; }, effect: fn => fn() }, engine);
  observe(session(), end(1)); observe(session(), { type: 'turn/start' });
  await new Promise(resolve => setTimeout(resolve, 180)); assert.equal(calls.length, 0);
+});
+
+test('a newly installed observer generates after a completed turn takes longer than 150ms to become idle', async t => {
+ t.mock.timers.enable({ apis: ['setTimeout'] });
+ let busy = true;
+ const { engine, calls } = await fixture(t, { busy: () => busy });
+ const observers = new Map();
+ installNextTasks({ on: (name, fn) => observers.set(name, fn), effect: fn => fn() }, engine);
+ observers.get('session/event')(session(), end(42));
+ t.mock.timers.tick(150); await new Promise(resolve => setImmediate(resolve));
+ assert.equal(calls.length, 0, 'never call the model while the host is still finalizing');
+ busy = false;
+ t.mock.timers.tick(300); await new Promise(resolve => setImmediate(resolve));
+ await engine.tail;
+ assert.equal(calls.length, 1, 'normal completion must not be silently lost during host cleanup');
+ assert.equal(engine.state('s').status, 'ready');
+});
+
+test('a newer prompt or disabling cancels idle waiting, and prolonged busy state does not issue paid requests', async t => {
+ t.mock.timers.enable({ apis: ['setTimeout'] });
+ let busy = true;
+ const { engine, calls, disable } = await fixture(t, { busy: () => busy });
+ engine.schedule(session(), end(10));
+ for(let n=0;n<3;n++){t.mock.timers.tick(150);await new Promise(resolve=>setImmediate(resolve));}
+ engine.invalidate('s');busy=false;t.mock.timers.tick(150);await new Promise(resolve=>setImmediate(resolve));assert.equal(calls.length,0);
+ busy=true;engine.schedule(session(),end(12));
+ for(let n=0;n<100;n++){t.mock.timers.tick(150);await new Promise(resolve=>setImmediate(resolve));}
+ assert.equal(engine.timers.size,0);assert.equal(engine.state('s').reason,'busy');assert.equal(calls.length,0);
+ engine.schedule(session(),end(14));disable();busy=false;t.mock.timers.tick(1000);await new Promise(resolve=>setImmediate(resolve));assert.equal(calls.length,0);
+});
+
+test('provider failures disclose a safe reason without storing request text, credentials or raw errors', async t => {
+ const {engine} = await fixture(t,{llm:()=>({prepareCall(){throw Object.assign(new Error('SECRET_TOKEN https://private.example/request-body'),{status:401});}})});
+ await engine.complete(session(),end(10));
+ assert.equal(engine.state('s').reason,'credentials');assert.equal(engine.state('s').status,'failed');
+ const summary=await engine.summary();assert.equal(summary.recent[0].reason,'credentials');assert.equal(summary.totals.failed,1);assert.equal(summary.totals.unreported,0);
+ assert(!JSON.stringify(summary).includes('SECRET_TOKEN'));assert(!JSON.stringify(summary).includes('private.example'));
 });
