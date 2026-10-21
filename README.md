@@ -33,7 +33,7 @@
 
 兼容范围以 [package.json](package.json) 中的 `engines` 为准；当前声明支持 `^0.2.0-rc.2 || ^0.2.1-rc.2`，本机验收基线为 DSH 0.2.1-rc.2。Node 版本要求为 `^22.19.0 || >=24.0.0`。
 
-**已发布版本：0.1.44。** 在 DSH 插件安装页输入 `dsh-session-toolbox` 安装，或使用 [GitHub Release](https://github.com/AndroidSix/dsh-session-toolbox/releases/tag/v0.1.44) 中的本地包。
+**已发布版本：0.1.45。** 在 DSH 插件安装页输入 `dsh-session-toolbox` 安装，或使用 [GitHub Release](https://github.com/AndroidSix/dsh-session-toolbox/releases/tag/v0.1.45) 中的本地包。
 
 ### 从源码构建本地安装包
 
@@ -45,9 +45,11 @@ npm run check
 npm pack --ignore-scripts
 ```
 
-在 DSH **侧栏 → 插件 → 安装** 中选择生成的 `dsh-session-toolbox-0.1.44.tgz` 并启用。后续版本的文件名随版本号变化。
+在 DSH **侧栏 → 插件 → 安装** 中选择生成的 `dsh-session-toolbox-0.1.45.tgz` 并启用。后续版本的文件名随版本号变化。
 
 通过 Plugin Manager 安装、更新或启停，宿主支持 HMR 时可直接生效，无需主动重启 DSH。若安装结果明确报告 `restart-required`，再按提示重启；首次安装后菜单或页面没有出现，也可完全退出后重开一次。不要直接覆盖 DSH 的 `node_modules` 来代替插件管理器更新。
+
+如果升级后点击星光图标出现「未知的操作类型：nextTasks.generate」，说明界面已更新而后台仍在运行旧版。可先在 DSH 插件页停用后重新启用本插件，再刷新界面；支持 HMR 时无需重启 DSH。0.1.45 起会在操作前检查版本，安装版本一致时自动请求 DSH 重新加载插件，确认后台就绪后再执行；重载失败会停止操作并提示处理方法。
 
 ### 通过 npm 安装
 

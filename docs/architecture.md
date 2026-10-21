@@ -103,6 +103,8 @@ CLI 写入 `~/.dsh/storages/workspace.json` 的离线镜像。`status` 可能含
 
 每次构建生成版本化的 host 入口和 Cordis component id，使宿主与浏览器模块随版本替换。通过 Plugin Manager 安装、更新或启停可在 HMR 可用时生效；手工覆盖安装目录不会执行这套生命周期。
 
+0.1.45 起，`callHost` 在写入前校验状态中的 `pluginVersion`，401 重新获取密钥后也再次校验。`src/host-version.mjs` 在版本不一致时检查公开 Remote `pluginManager.listBundles()`，仅当插件已安装、已启用且安装版本与当前界面一致时调用一次 `setBundleEnabled(name, true)`，由 DSH 重新应用当前插件补丁并按生命周期释放旧入口；随后重新读取状态，要求后台版本一致。并发调用共享一次修复，失败不重复重载、不继续提交操作；状态轮询及模型失败不触发修复。缺少 Remote、安装版本不同或宿主报告未应用时显示明确提示。插件不自行覆盖路由、抢占服务或并行启动另一后台，避免重复自动联想和 token 消耗。
+
 | `restartReason` | 含义 |
 | --- | --- |
 | `no-hmr` | 当前环境没有 HMR。 |

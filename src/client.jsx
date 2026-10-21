@@ -14,6 +14,7 @@ import { REPLY_SOURCE, REPLY_TEXT_NODE, readReply, insertReply, withoutReply, me
 import { createCandidateView, candidatesForTurn } from './next-tasks-view.mjs';
 import { createVault } from './draft-vault.js';
 import { orderedGroups, UNGROUPED } from './group-order.mjs';
+import { createHostVersionGuard } from './host-version.mjs';
 import { filterSidebar, installSidebar, mirroredSlot, sidebarLayout, protectProjectMenu, sessionProjectDrag, groupOrderDrag } from './sidebar.mjs';
 
 export const name = 'dsh-session-toolbox-client';
@@ -42,6 +43,7 @@ let directoryPicker; // ctx.get('directoryPicker') probed at apply time
 let conversationService;
 let replyAvailable = false;
 let sessionsService; // ctx.sessions — injected above, used by the manual refresh
+let pluginManager;
 /** @type {{ running: boolean }} */
 export const refreshState = { running: false };
 const store = { state: null, error: '', overlay: null, listeners: new Set() };
@@ -74,6 +76,8 @@ export async function loadState() {
 	return store.state;
 }
 let keyRequest;
+const ensureHostVersion = createHostVersionGuard({ version: pluginVersion, name: NS, manager: () => pluginManager, readState: loadState });
+const backgroundReads = new Set(['nextTasks.get', 'checkpoint.status', 'message.list', 'project.of', 'trash.list']);
 function ensureSessionKey(force = false) {
  if (sessionKey && !force) return Promise.resolve();
  if (!keyRequest) keyRequest = loadState().finally(() => { keyRequest = null; });
@@ -87,13 +91,14 @@ export async function callHost(input) {
 		return report;
 	}
 	await ensureSessionKey();
+	await ensureHostVersion(store.state, !backgroundReads.has(input.type));
 	const post = () => fetch(ENDPOINT, {
 		method: 'POST', cache: 'no-store',
 		headers: { 'content-type': 'application/json', 'x-session-toolbox-key': sessionKey },
 		body: JSON.stringify(input),
 	});
 	let response = await post();
-	if (response.status === 401) { await ensureSessionKey(true); response = await post(); }
+	if (response.status === 401) { await ensureSessionKey(true); await ensureHostVersion(store.state, !backgroundReads.has(input.type)); response = await post(); }
 	const res = await readResponse(response);
 	sessionKey = res.key ?? sessionKey;
 	if (['move', 'move.complete', 'move.rollback', 'workspace.edit', 'workspace.complete', 'trash.session', 'trash.workspace', 'trash.restore', 'trash.purge'].includes(input.type)) {
@@ -122,6 +127,13 @@ export async function refreshSessionList() {
 }
 
 export function apply(ctx) {
+	// Optional: hosts without the manager retain the rest of the plugin. Use the
+	// public Remote API, with its declared injection, for update reconciliation.
+	ctx.inject?.(['remote', 'remote.pluginManager'], scope => {
+		const service = scope.get('remote').pluginManager;
+		pluginManager = service;
+		scope.effect(() => () => { if (pluginManager === service) pluginManager = undefined; });
+	});
 	directoryPicker = ctx.get?.('directoryPicker');
 	// Injected service: `refresh()` re-pulls the session list baseline from the
 	// host, which is what makes a moved/restored row appear without a restart.

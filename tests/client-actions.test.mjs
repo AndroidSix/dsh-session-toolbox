@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
+import pkg from '../package.json' with { type: 'json' };
 
 async function client() {
 	let entry;
@@ -15,7 +16,7 @@ async function client() {
 	const sandbox = vm.createContext({ console, setTimeout: (run, delay) => { const id = ++timerId; timers.set(id, { run, at: clock + delay }); return id; }, clearTimeout: id => timers.delete(id), setInterval: () => 0, clearInterval() {},
 		CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } },
 		window: { __ModuleLoader__: { load: value => { entry = value; } }, dispatchEvent(event) { events.get(event.type)?.(event); }, addEventListener: (type, listener) => events.set(type, listener), removeEventListener() {} },
-		fetch: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ key: 'k', projects: [], settings: {} }) }),
+		fetch: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ pluginVersion: pkg.version, key: 'k', projects: [], settings: {} }) }),
 	});
 	vm.runInContext(await readFile(new URL('../lib/client.js', import.meta.url), 'utf8'), sandbox);
 	const plugin = entry.factory(id => {
@@ -25,9 +26,86 @@ async function client() {
 		if (id === '@deepseek-ai/dsh-client-ui-primitives') return native;
 		throw new Error(id);
 	});
-	return { plugin, states: next => { values = next; }, native, fetch: fn => { sandbox.fetch = fn; }, effects, updates, initialized,
+	return { plugin, states: next => { values = next; }, native, fetch: fn => { sandbox.fetch = async (...args) => {
+   const result = await fn(...args);
+   if (args[1]?.method === 'POST') return result;
+   return { ...result, text: async () => JSON.stringify({ pluginVersion: pkg.version, ...JSON.parse(await result.text()) }) };
+  }; }, effects, updates, initialized,
 		tick: ms => { clock += ms; for (const [id, timer] of timers) if (timer.at <= clock) { timers.delete(id); timer.run(); } } };
 }
+
+function installManager(c, manager) {
+ c.plugin.apply({ get() {}, effect: fn => fn(), locale: { register() {} }, slots: { inject() {} },
+  inject(names, run) { if (names.includes('remote.pluginManager')) run({ get: () => ({ pluginManager: manager }), effect: fn => fn() }); },
+ });
+}
+
+test('updated browser repairs a legacy host before sending nextTasks.generate, sharing one reload', async () => {
+ const c = await client(); let version = '0.1.38', reloads = 0;
+ const writes = [];
+ installManager(c, {
+  listBundles: async () => [{ name: 'dsh-session-toolbox', version: pkg.version, enabled: true, installed: true }],
+  setBundleEnabled: async (name, enabled) => {
+   assert.equal(name, 'dsh-session-toolbox'); assert.equal(enabled, true);
+   reloads++; await new Promise(resolve => setImmediate(resolve)); version = pkg.version;
+   return { application: 'applied' };
+  },
+ });
+ await new Promise(resolve => setImmediate(resolve));
+ c.fetch(async (_url, options) => {
+  if (!options?.body) return { ok: true, status: 200, text: async () => JSON.stringify({ pluginVersion: version, key: version, projects: [] }) };
+  const action = JSON.parse(options.body); writes.push(action.type);
+  assert.equal(options.headers['x-session-toolbox-key'], pkg.version, 'use the rotated key from the new host');
+  return { ok: version === pkg.version, status: version === pkg.version ? 200 : 400, text: async () => JSON.stringify(version === pkg.version ? { accepted: true } : { error: `操作失败：未知的操作类型：${action.type}` }) };
+ });
+ await c.plugin.loadState();
+ assert.equal(reloads, 0, 'snapshot polling alone never reloads a plugin');
+ await assert.rejects(c.plugin.callHost({type:'nextTasks.get',sessionId:'fixture'}),/版本不一致/);
+ assert.equal(reloads,0,'background candidate reads must not initiate recovery');
+ assert.equal(writes.length,0);
+ const results = await Promise.all(Array.from({ length: 3 }, () => c.plugin.callHost({ type: 'nextTasks.generate', sessionId: 'fixture', seq: 4 })));
+ assert(results.every(result => result.accepted)); assert.equal(reloads, 1);
+ assert.deepEqual(writes, Array(3).fill('nextTasks.generate'));
+});
+
+test('version mismatch refuses writes when the installed bundle differs or reconciliation fails', async () => {
+ for (const installedVersion of ['different', pkg.version]) {
+  const c = await client(); let reloads = 0, writes = 0;
+  installManager(c, { listBundles: async () => [{ name: 'dsh-session-toolbox', version: installedVersion, installed: true, enabled: true }],
+   setBundleEnabled: async () => { reloads++; return { application: 'failed' }; },
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  c.fetch(async (_url, options) => { if(options?.body) writes++; return {ok:true,status:200,text:async()=>JSON.stringify({ pluginVersion:'0.1.38',key:'old' })}; });
+  await c.plugin.loadState();
+  await assert.rejects(c.plugin.callHost({ type: 'nextTasks.generate', sessionId: 'fixture', seq: 4 }), /版本不一致|重新加载未生效/);
+  await assert.rejects(c.plugin.callHost({ type: 'nextTasks.generate', sessionId: 'fixture', seq: 4 }), /版本不一致|重新加载未生效/);
+  assert.equal(writes, 0); assert.equal(reloads, installedVersion === pkg.version ? 1 : 0);
+ }
+});
+
+test('a successful reconciliation must also change the running host; an unavailable manager never receives a write', async () => {
+ for (const available of [false, true]) {
+  const c = await client(); let writes = 0, reloads = 0;
+  if (available) installManager(c, { listBundles: async () => [{ name:'dsh-session-toolbox',version:pkg.version,enabled:true,installed:true }],
+   setBundleEnabled: async () => { reloads++; return {application:'applied'}; },
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  c.fetch(async (_url, options) => { if(options?.body)writes++;return {ok:true,status:200,text:async()=>JSON.stringify({pluginVersion:null,key:'legacy'})}; });
+  await c.plugin.loadState();
+  await assert.rejects(c.plugin.callHost({type:'nextTasks.generate',sessionId:'fixture',seq:4}), /版本不一致/);
+  assert.equal(writes,0);assert.equal(reloads,available?1:0);
+ }
+});
+
+test('an aligned host and a model failure never trigger a plugin reload', async () => {
+ const c=await client();let reloads=0;
+ installManager(c,{listBundles:async()=>{reloads++;return [];},setBundleEnabled:async()=>{reloads++;}});
+ await new Promise(resolve=>setImmediate(resolve));
+ c.fetch(async (_url,options)=>options?.body?{ok:false,status:400,text:async()=>JSON.stringify({error:'模型返回的候选格式无效'})}:{ok:true,status:200,text:async()=>JSON.stringify({pluginVersion:pkg.version,key:'current'})});
+ await c.plugin.loadState();
+ await assert.rejects(c.plugin.callHost({type:'nextTasks.generate',sessionId:'fixture',seq:4}),/候选格式无效/);
+ assert.equal(reloads,0);
+});
 
 test('switching from a draft to an empty chat never dismisses the destination suggestions using the old draft', async () => {
  const c = await client();
