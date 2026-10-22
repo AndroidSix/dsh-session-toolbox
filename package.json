@@ -5,7 +5,7 @@
     "type": "git",
     "url": "https://github.com/AndroidSix/dsh-session-toolbox.git"
   },
-  "description": "Draft vault, workspace groups, project path migration and archive pool for DeepSeek Harness",
+  "description": "图片草稿保险箱、项目分组与会话迁移、归档池、文件检查点恢复、多引用回复、后续任务联想。第三方插件，数据只存本机。",
   "type": "module",
   "main": "lib/index.js",
   "bin": {
