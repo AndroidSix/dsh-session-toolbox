@@ -53,6 +53,127 @@ test('next tasks defaults ON, setting is validated, candidates are bounded and p
  assert.equal(normalizeNextTaskUsage({ inputTokens: 10, outputTokens: 3 }), null, 'unknown totals never become invented zero-cost usage');
 });
 
+test('independent model settings are paired, bounded strings and old settings need no migration', () => {
+ assert.deepEqual(guardSettings({}, 'settings').nextTasks, { enabled: true });
+ assert.deepEqual(guardSettings({ nextTasks: { provider: ' local ', model: ' small ' } }, 'settings').nextTasks, { enabled: true, provider: 'local', model: 'small' });
+ assert.equal(guardSettings({ nextTasks: { provider: '', model: '' } }, 'settings').nextTasks.provider, '');
+ for (const nextTasks of [[], 'local', { provider: 'local' }, { model: 'small' }, { provider: 1, model: 'small' }, { provider: 'local', model: null }, { provider: 'local', model: 'x'.repeat(257) }, { provider: 'local\nsecret', model: 'small' }]) {
+  assert.throws(() => guardSettings({ nextTasks }, 'settings'), /nextTasks/);
+ }
+});
+
+test('independent model overrides only auxiliary calls and accounts usage to the selected route', async t => {
+ const s = session(); const original = s.requestHeader();
+ const { engine, calls } = await fixture(t, { settings: () => ({ nextTasks: { provider: 'local', model: 'small' } }) });
+ await engine.complete(s, end(20));
+ assert.equal(calls[0].provider, 'local'); assert.equal(calls[0].model, 'small');
+ assert.deepEqual(s.requestHeader(), original);
+ const summary = await engine.summary();
+ assert.equal(summary.models[0].provider, 'local'); assert.equal(summary.models[0].model, 'small');
+ assert.equal(summary.models[0].totalTokens, 325); assert.equal(summary.recent[0].customModel, true);
+ s.requestHeader = () => { assert.fail('an explicit auxiliary route must not need a session model'); };
+ await engine.complete(s, end(21)); assert.equal(calls.length, 2);
+});
+
+test('manual generation with auto OFF uses the same independent model', async t => {
+ const s = historySession();
+ const { engine, calls } = await fixture(t, { settings: () => ({ nextTasks: { enabled: false, provider: 'local', model: 'small' } }), sessions: () => ({ get: () => s }) });
+ await engine.complete(s, end(3)); assert.equal(calls.length, 0);
+ await engine.request('s', 3); await engine.tail;
+ assert.equal(calls[0].provider, 'local'); assert.equal(calls[0].model, 'small');
+});
+
+test('independent model failures are safe, explicit and never fall back or retry', async t => {
+ for (const [error, reason] of [
+  [{ code: 'NO_ADAPTER' }, 'model-unavailable'], [{ status: 404 }, 'model-unavailable'],
+  [{ code: 'INVALID_CREDENTIAL' }, 'credentials'], [{ code: 'RATE_LIMIT' }, 'rate-limit'],
+  [{ code: 'HTTP_ERROR', failure: { status: 404 } }, 'model-unavailable'],
+  [{ status: 401 }, 'credentials'], [{ status: 429 }, 'rate-limit'],
+ ]) {
+  const attempts = [];
+  const { engine } = await fixture(t, { settings: () => ({ nextTasks: { provider: 'local', model: 'small' } }), llm: () => ({ prepareCall(config) {
+   attempts.push(config); throw Object.assign(new Error('SECRET https://private.example'), error);
+  } }) });
+  await engine.complete(session(), end(9)); await engine.complete(session(), end(9));
+  assert.equal(engine.state('s').reason, reason); assert.equal(engine.state('s').customModel, true);
+  assert.equal(attempts.length, 1); assert.equal(attempts[0].provider, 'local');
+  const summary = await engine.summary(); assert.equal(summary.totals.failed, 1);
+  assert(!JSON.stringify(summary).includes('SECRET')); assert(!JSON.stringify(summary).includes('private.example'));
+ }
+});
+
+test('changing the auxiliary route cancels in-flight work and clears old cached candidates without replay', async t => {
+ let settings = { nextTasks: { provider: 'local', model: 'first' } }, started, signal;
+ const { engine, calls } = await fixture(t, { settings: () => settings, stream: async function* (request) {
+  signal = request.signal; started = true;
+  yield { type: 'usage', usage };
+  await new Promise(resolve => request.signal.addEventListener('abort', resolve, { once: true }));
+ } });
+ const pending = engine.complete(session(), end(8)); while (!started) await new Promise(resolve => setImmediate(resolve));
+ engine.configure(); assert.equal(signal.aborted, false);
+ settings = { nextTasks: { provider: 'local', model: 'second' } }; engine.configure();
+ assert.equal(signal.aborted, true);
+ await pending; await engine.cacheTail;
+ assert.equal(signal.aborted, true); assert.equal(engine.states.size, 0);
+ assert.deepEqual((await engine.cache.read()).items, []);
+ assert.equal(calls.length, 1); assert.equal((await engine.summary()).totals.cancelled, 1);
+});
+
+test('cached candidates only restore under the same auxiliary route, with legacy defaults preserved', async t => {
+ const nextTasks = { provider: 'local', model: 'small' };
+ const { engine, root } = await fixture(t, { settings: () => ({ nextTasks }) });
+ await engine.complete(session(), end(4));
+ const reload = config => new NextTasks({ root, settings: () => ({ nextTasks: config }), llm: () => ({ prepareCall() { assert.fail('restoration must never call a model'); } }) });
+ const same = reload(nextTasks); await same.restore(); assert.equal(same.state('s').status, 'ready'); await same.dispose();
+ const different = reload({ provider: 'local', model: 'other' }); await different.restore(); assert.equal(different.state('s').status, 'idle'); await different.dispose();
+});
+
+test('auxiliary timeout is a visible failure, not a user cancellation', async t => {
+ const { engine } = await fixture(t, { timeoutMs: 15, stream: async function* (request) {
+  await new Promise(resolve => request.signal.addEventListener('abort', resolve, { once: true }));
+ } });
+ const keepAlive = setTimeout(() => {}, 1000); t.after(() => clearTimeout(keepAlive));
+ await engine.complete(session(), end(1));
+ assert.equal(engine.state('s').status, 'failed'); assert.equal(engine.state('s').reason, 'timeout');
+ const { totals } = await engine.summary(); assert.equal(totals.failed, 1); assert.equal(totals.cancelled, 0);
+});
+
+test('a slow adapter cannot hold preparation beyond the auxiliary deadline or dispatch late', async t => {
+ let release;
+ const { engine } = await fixture(t, { timeoutMs: 10, llm: () => ({ prepareCall: () => new Promise(resolve => { release = () => resolve({ config: {}, stream() { assert.fail('late preparation must never dispatch'); } }); }) }) });
+ const pending = engine.complete(session(), end(2));
+ const fallback = setTimeout(() => release(), 250); t.after(() => clearTimeout(fallback));
+ await new Promise(resolve => setTimeout(resolve, 100));
+ const status = engine.state('s').status; release(); await pending;
+ assert.equal(status, 'failed'); assert.equal(engine.state('s').reason, 'timeout');
+});
+
+test('structured stream failures preserve safe categories and provider usage', async t => {
+ const { engine } = await fixture(t, { stream: async function* () {
+  yield { type: 'usage', usage };
+  yield { type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT', status: 429, message: 'SECRET' } } };
+ } });
+ await engine.complete(session(), end(3));
+ assert.equal(engine.state('s').reason, 'rate-limit');
+ const summary = await engine.summary(); assert.equal(summary.totals.totalTokens, 325); assert(!JSON.stringify(summary).includes('SECRET'));
+});
+
+test('model catalog is read-only, strips provider metadata and gracefully supports older hosts', async t => {
+ let listings = 0;
+ const { engine } = await fixture(t, { llm: () => ({
+  prepareCall() { assert.fail('catalog reads must never make paid calls'); },
+  listProviders: () => [{ id: 'local', name: 'Local', apiKey: 'SECRET' }],
+  listModels: async provider => { listings++; assert.equal(provider, 'local'); return [{ id: 'small', name: 'Small', headers: { token: 'SECRET' } }]; },
+ }) });
+ assert.deepEqual(await engine.catalog(), { providers: [{ id: 'local', name: 'Local' }], models: [] });
+ assert.equal(listings, 0);
+ assert.deepEqual(await engine.catalog('local'), { providers: [{ id: 'local', name: 'Local' }], models: [{ id: 'small', name: 'Small' }] });
+ engine.llm = () => ({ prepareCall() {} });
+ assert.equal((await engine.catalog()).reason, 'model-catalog');
+ engine.llm = () => ({ listProviders: () => [], listModels() { throw new Error('SECRET'); } });
+ const failed = await engine.catalog('local'); assert.equal(failed.reason, 'model-catalog'); assert(!JSON.stringify(failed).includes('SECRET'));
+});
+
 test('context is bounded canonical text; hidden reasoning, tools, attachments and deleted bodies never enter the request', () => {
  const s = session();
  s.deriveMessages = () => [message('user', 'DELETED ORIGINAL'), ...Array.from({ length: 15 }, (_, i) => message(i % 2 ? 'assistant' : 'user', '中'.repeat(2400))), message('user', '[Message deleted]'), message('assistant', '最后回复', { content: [{ type: 'text', text: '最后回复' }, { type: 'reasoning', text: 'SECRET' }, { type: 'tool-call', arguments: 'SECRET_TOOL' }, { type: 'image', url: 'SECRET_IMAGE' }] })];

@@ -140,11 +140,27 @@ test('settings.update deep-merges and persists across boots', async t => {
 	assert.equal(next.draftVault.ttlDays, 3);
 	assert.equal(next.draftVault.enabled, true, 'defaults survive partial patches');
 	assert.equal(next.trash.autoPurge, true);
+	await kit.updateSettings({ language: 'en', nextTasks: { provider: 'local', model: 'small' } });
+	await assert.rejects(kit.updateSettings({ nextTasks: { model: '' } }), /configured together/);
 	const ctx2 = fakeCtx({});
 	await apply(ctx2, { configFile: w.root, dshHome: w.dshHome });
 	const kit2 = ctx2.get('sessionToolbox');
 	assert.equal((await kit2.state()).settings.trash.autoPurge, true);
+	assert.equal((await kit2.state()).settings.language, 'en');
+	assert.equal((await kit2.state()).settings.nextTasks.model, 'small');
+	await ctx2.disposeAll();
 	await w.cleanup();
+});
+
+test('invalid persisted auxiliary routing cannot silently enable calls through the session model', async t => {
+ const w = await boot(t, { files: false, services: { llm: { prepareCall() { assert.fail('invalid configuration must not dispatch'); } } } });
+ await mkdir(w.root, { recursive: true });
+ await writeFile(join(w.root, 'session-toolbox.json'), JSON.stringify({ nextTasks: { provider: 'local' } }));
+ await apply(w.ctx, { configFile: w.root, dshHome: w.dshHome });
+ const nextTasks = w.ctx.get('sessionToolbox').nextTasks;
+ assert.equal(nextTasks.available(), false);
+ await assert.rejects(nextTasks.request('s', 1), /不支持任务联想/);
+ await w.cleanup();
 });
 
 test('end-to-end loopback move rewrites real files through the registered route', async t => {

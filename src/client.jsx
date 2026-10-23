@@ -5,7 +5,7 @@
  * Every official surface is probed (`ctx.get?.`, guarded registrations); no
  * path here may take the native composer down with it (NFR3).
  */
-import { useEffect, useState, useRef, useMemo } from 'react';
+import { useEffect, useState, useRef, useMemo, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import pkg from '../package.json' with { type: 'json' };
 const pluginVersion = pkg.version;
@@ -14,6 +14,10 @@ import { REPLY_SOURCE, REPLY_TEXT_NODE, readReply, insertReply, withoutReply, me
 import { createCandidateView, candidatesForTurn } from './next-tasks-view.mjs';
 import { createVault } from './draft-vault.js';
 import { orderedGroups, UNGROUPED } from './group-order.mjs';
+import { dictionaries, resolveLanguage, translate } from './locale.mjs';
+import { NextTaskModelSettings } from './next-task-model-settings.jsx';
+export { NextTaskModelSettings } from './next-task-model-settings.jsx';
+const workspaceChinese = dictionaries.zh;
 import { createHostVersionGuard } from './host-version.mjs';
 import { filterSidebar, installSidebar, mirroredSlot, sidebarLayout, protectProjectMenu, sessionProjectDrag, groupOrderDrag } from './sidebar.mjs';
 
@@ -44,6 +48,7 @@ let conversationService;
 let replyAvailable = false;
 let sessionsService; // ctx.sessions — injected above, used by the manual refresh
 let pluginManager;
+let localeService;
 /** @type {{ running: boolean }} */
 export const refreshState = { running: false };
 const store = { state: null, error: '', overlay: null, listeners: new Set() };
@@ -52,9 +57,9 @@ function showOverlay(request) { store.overlay = request; for (const listener of 
 async function readResponse(res) {
 	let next;
 	try { next = JSON.parse(await res.text()); }
-	catch { throw new Error(`插件后台未就绪（HTTP ${res.status}）；安装或重启期间会自动重试`); }
-	if (next === null || typeof next !== 'object' || Array.isArray(next)) throw new Error('插件后台返回了无效数据');
-	if (!res.ok) throw new Error(next.error ?? `操作失败（HTTP ${res.status}）`);
+	catch { throw new Error(uiText('error.backend', { status: res.status })); }
+	if (next === null || typeof next !== 'object' || Array.isArray(next)) throw new Error(uiText('error.response'));
+	if (!res.ok) throw new Error(next.error ?? uiText('error.http', { status: res.status }));
 	return next;
 }
 
@@ -76,8 +81,8 @@ export async function loadState() {
 	return store.state;
 }
 let keyRequest;
-const ensureHostVersion = createHostVersionGuard({ version: pluginVersion, name: NS, manager: () => pluginManager, readState: loadState });
-const backgroundReads = new Set(['nextTasks.get', 'checkpoint.status', 'message.list', 'project.of', 'trash.list']);
+const ensureHostVersion = createHostVersionGuard({ version: pluginVersion, name: NS, manager: () => pluginManager, readState: loadState, t: (key, values) => text(undefined, key, values) });
+const backgroundReads = new Set(['nextTasks.get', 'nextTasks.models', 'checkpoint.status', 'message.list', 'project.of', 'trash.list']);
 function ensureSessionKey(force = false) {
  if (sessionKey && !force) return Promise.resolve();
  if (!keyRequest) keyRequest = loadState().finally(() => { keyRequest = null; });
@@ -85,7 +90,7 @@ function ensureSessionKey(force = false) {
 }
 export async function callHost(input) {
 	if (input.type === 'vault.sweep') {
-		if (!vault) throw new Error('草稿保险箱尚未就绪');
+		if (!vault) throw new Error(uiText('error.vault'));
 		const report = await vault.sweep();
 		await vault.syncHost();
 		return report;
@@ -103,7 +108,7 @@ export async function callHost(input) {
 	sessionKey = res.key ?? sessionKey;
 	if (['move', 'move.complete', 'move.rollback', 'workspace.edit', 'workspace.complete', 'trash.session', 'trash.workspace', 'trash.restore', 'trash.purge'].includes(input.type)) {
 		try { await refreshSessionList(); }
-		catch (error) { dispatchNotice(`操作已完成，但列表刷新失败：${error.message}`); }
+		catch (error) { dispatchNotice(uiText('error.refreshAfterWrite', { error: error.message })); }
 	}
 	return res;
 }
@@ -118,8 +123,8 @@ export async function callHost(input) {
  */
 export async function refreshSessionList() {
 	const service = sessionsService;
-	if (service === undefined) throw new Error('当前 DSH 未提供会话服务，无法刷新');
-	if (typeof service.refresh !== 'function') throw new Error('当前 DSH 版本的会话服务不支持刷新');
+	if (service === undefined) throw new Error(uiText('error.sessions'));
+	if (typeof service.refresh !== 'function') throw new Error(uiText('error.refresh'));
 	refreshState.running = true;
 	try { await service.refresh(); }
 	finally { refreshState.running = false; }
@@ -127,6 +132,8 @@ export async function refreshSessionList() {
 }
 
 export function apply(ctx) {
+ localeService = ctx.locale;
+ if (typeof localeService?.subscribe === 'function') ctx.effect(() => localeService.subscribe(() => { for (const listener of store.listeners) listener(); }));
 	// Optional: hosts without the manager retain the rest of the plugin. Use the
 	// public Remote API, with its declared injection, for update reconciliation.
 	ctx.inject?.(['remote', 'remote.pluginManager'], scope => {
@@ -144,6 +151,7 @@ export function apply(ctx) {
 	const workspaceList = ctx.get?.('workspaces')?.list;
 	if (typeof workspaceList?.subscribe === 'function') ctx.effect(() => workspaceList.subscribe(() => { void loadState(); }));
 	const vaultInstance = vault = createVault({
+		t: (key, values) => text(undefined, key, values),
 		endpoint: ENDPOINT,
 		getInput: sessionId => {
 			const binding = sessionsService?.binding?.(sessionId);
@@ -158,13 +166,13 @@ export function apply(ctx) {
 	const onVaultChange = () => { void loadState(); };
 	vaultInstance.on('change', onVaultChange);
 	ctx.effect(() => () => { clearInterval(timer); vaultInstance.off('change', onVaultChange); vaultInstance.stop(); });
-	void vaultInstance.start().catch(error => sayRow(`草稿保险箱启动失败：${error.message}`));
+	void vaultInstance.start().catch(error => sayRow(uiText('error.vaultStart', { error: error.message })));
 	// `locale` is injected above, so the service is guaranteed here; registering
 	// inside ctx.effect keeps the dictionaries disposable across hot reloads
 	// (same shape as the official client plugins).
 	ctx.effect(() => ctx.locale.register(NS, {
-		zh: { 'menu.move': '切换到其它项目…', 'menu.trash': '归档到归档池', ...workspaceChinese },
-		en: { 'menu.move': 'Move to another project…', 'menu.trash': 'Archive', ...workspaceEnglish },
+		zh: dictionaries.zh,
+		en: dictionaries.en,
 	}), 'session-toolbox: dictionaries');
 
  if (typeof ctx.inject === 'function') ctx.inject(['inputTriggers'], scope => scope.effect(() => {
@@ -208,10 +216,10 @@ function useKit() {
 }
 
 const styles = `
-.sk{--sk-accent:var(--dsw-alias-state-active-primary,#3a71db);--sk-border:var(--dsw-alias-border-l2,#444);--sk-bg:var(--dsw-alias-bg-layer-1,#202020);--sk-card:var(--dsw-alias-bg-module-platform,#282828);--sk-text:var(--dsw-alias-label-primary,#f4f4f4);--sk-muted:var(--dsw-alias-label-secondary,#b0b0b0);color:var(--sk-text);font:inherit;font-size:14px;line-height:1.6;max-width:1120px}
+.sk{--sk-accent:var(--dsw-alias-state-active-primary,#3a71db);--sk-border:var(--dsw-alias-border-l2,#444);--sk-bg:var(--dsw-alias-bg-layer-1,#202020);--sk-card:var(--dsw-alias-bg-module-platform,#282828);--sk-text:var(--dsw-alias-label-primary,#f4f4f4);--sk-muted:var(--dsw-alias-label-secondary,#b0b0b0);color:var(--sk-text);font:inherit;font-size:13px;line-height:1.5;max-width:1120px;min-width:0}
 .sk *{box-sizing:border-box}.sk h2,.sk h3,.sk p{margin:0}.sk h2{font-size:22px}.sk h3{font-size:16px}.sk .muted,.sk small{color:var(--sk-muted)}
-.sk .box{border:1px solid var(--sk-border);border-radius:12px;padding:18px 20px;background:var(--sk-card);display:flex;flex-direction:column;gap:14px}
-.sk .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.sk.stack,.sk .stack{display:flex;flex-direction:column;gap:16px}
+.sk .box{border:1px solid var(--sk-border);border-radius:10px;padding:14px 16px;background:var(--sk-card);display:flex;flex-direction:column;gap:10px;min-width:0}
+.sk .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.sk.stack,.sk .stack{display:flex;flex-direction:column;gap:12px}
 .sk .community{padding:10px 14px;border:1px solid var(--sk-border);border-radius:8px;background:var(--sk-card)}.sk .community a{color:var(--sk-accent);font-weight:500;text-decoration:underline;text-underline-offset:3px}.sk .community a:hover{opacity:.8}.sk .community a:focus-visible{outline:2px solid var(--sk-accent);outline-offset:4px;border-radius:2px}
 .sk button,.sk input,.sk select{font:inherit;color:inherit;border:1px solid var(--sk-border);border-radius:8px;background:var(--sk-bg);min-height:36px;padding:7px 12px}
 .sk button{cursor:pointer}.sk button:hover{background:var(--sk-card)}.sk button:disabled{opacity:.45;cursor:default}
@@ -221,6 +229,20 @@ const styles = `
 .sk .pill{border:1px solid var(--sk-border);border-radius:100px;padding:2px 10px;font-size:12px;background:var(--sk-bg);display:inline-block}
 .sk .mono{font:12px ui-monospace,monospace;overflow-wrap:anywhere}
 .sk input.grow{flex:1;min-width:0}
+.sk select.grow{flex:1;min-width:0;max-width:100%}.sk input[type=checkbox]{min-height:0;padding:0;accent-color:var(--sk-accent)}
+.sk :is(button,input,select,summary):focus-visible{outline:2px solid var(--sk-accent);outline-offset:3px}
+.sk-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.sk-header-title{display:flex;align-items:center;gap:10px}.sk-header-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.sk .sk-header h2{font-size:20px;letter-spacing:-.3px}
+.sk .community{padding:8px 12px;border-radius:7px;font-size:12px}.sk .sk-caption{font-size:12px;line-height:1.5}.sk .sk-notice{padding:8px 12px;border:1px solid var(--sk-border);border-radius:7px;overflow-wrap:anywhere}
+.sk-page-grid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:12px;align-items:start}.sk-column{display:flex;flex-direction:column;gap:12px;min-width:0}
+.sk-field{display:flex;flex-direction:column;gap:4px;min-width:0}.sk-field>span{font-size:12px;color:var(--sk-muted)}.sk-field :is(input,select){width:100%;min-width:0}
+.sk-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.sk-model-form{display:flex;flex-direction:column;gap:8px}.sk-model-mode .sk-field{flex:1}.sk-model-mode{align-items:flex-end!important}
+.sk-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:0;padding:10px 0;border-block:1px solid var(--sk-border)}.sk-metrics>div{min-width:0}.sk-metrics dt{font-size:11px;color:var(--sk-muted)}.sk-metrics dd{font-size:19px;font-weight:600;line-height:1.3;font-variant-numeric:tabular-nums;margin:3px 0 0;overflow-wrap:anywhere}
+.sk details>summary{cursor:pointer;color:var(--sk-muted);font-size:12px;min-height:28px;display:list-item;align-content:center}.sk details[open]>summary{margin-bottom:8px}.sk-table-scroll{max-width:100%;overflow-x:auto}.sk .sk-section-heading{display:flex;gap:8px;align-items:center;justify-content:space-between}.sk-archive td{overflow-wrap:anywhere;max-width:280px}
+@container toolbox-page (max-width:760px){.sk-page-grid{grid-template-columns:1fr}}
+.sk-page{container:toolbox-page / inline-size;width:100%}
+@media(max-width:760px){.sk-page-grid{grid-template-columns:1fr}}
+@media(max-width:440px){.sk .box{padding:12px}.sk-fields{grid-template-columns:1fr}.sk-header-tools{width:100%}.sk-header-tools>label{flex:1}.sk-header-tools select{max-width:100%}.sk-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.sk .community{gap:6px 10px}}
+@media(pointer:coarse){.sk :is(button,select,input:not([type=checkbox]),summary){min-height:44px}.sk label.row{min-height:44px}}
 .sk-dialog-body{max-height:calc(100dvh - 160px);overflow-y:auto;overscroll-behavior:contain;padding-right:4px}.sk-dialog-body>*{flex-shrink:0}
 `;
 
@@ -244,157 +266,88 @@ export function KitPage({ t } = {}) {
 	}, []);
 	const act = async (input, ok) => {
 		setBusy(true);
-		try { const result = await callHost(input); if (result.deferred) say(result.note ?? '迁移账本尚待完成，请在恢复区继续处理'); else if (ok) say(ok); await loadState(); setBusy(false); return result; }
-		catch (err) { say(`失败：${err.message}`); setBusy(false); throw err; }
+		try { const result = await callHost(input); if (result.deferred) say(result.note ?? uiText('move.deferred')); else if (ok) say(ok); await loadState(); setBusy(false); return result; }
+		catch (err) { say(text(t, 'common.failed', { error: err.message })); setBusy(false); throw err; }
 	};
 	const settings = state?.settings;
 	return (
-		<div className="sk stack">
+		<div className="sk stack sk-page" lang={activeLanguage()}>
 			<style>{styles}</style>
-			<h2>会话工具箱</h2>
+			<header className="sk-header"><div><div className="sk-header-title"><h2>{text(t, 'page.title')}</h2><span className="pill">v{pluginVersion}</span></div><p className="muted sk-caption">{text(t, 'page.subtitle')}</p></div>
+			 <div className="sk-header-tools"><label className="row"><span className="muted sk-caption">{text(t, 'page.language')}</span><select aria-label={text(t, 'page.language')} value={settings?.language ?? 'auto'} disabled={busy || !settings} onChange={event => { setFeedback(''); void act({ type: 'settings.update', patch: { language: event.target.value } }).catch(() => {}); }}><option value="auto">{text(t, 'page.followLanguage')}</option><option value="zh">中文</option><option value="en">English</option></select></label>
+			 <button disabled={busy || refreshing} title={text(t, 'page.refreshHelp')} onClick={() => { setRefreshing(true); void refreshSessionList().then(() => say(text(t, 'page.refreshed'))).catch(err => say(text(t, 'common.failed', { error: err.message }))).finally(() => setRefreshing(false)); }}>{text(t, refreshing ? 'page.refreshing' : 'page.refresh')}</button></div>
+			</header>
 			<div className="row community">
 				<a href="https://qm.qq.com/q/eQC7OQXQe4" target="_blank" rel="noopener noreferrer">{text(t, 'community.join')}</a>
 				<span className="muted">{text(t, 'community.name')} · {text(t, 'community.number')} <strong>1124103038</strong></span>
+				<a href="https://github.com/AndroidSix/dsh-session-toolbox" target="_blank" rel="noopener noreferrer">{text(t, 'community.repository')}</a>
+				<span className="muted">{text(t, 'community.star')}</span>
 			</div>
-			<p className="muted">草稿保险箱 · 会话切换项目 · 归档池 — v{pluginVersion}。数据仅存本机（浏览器 IndexedDB + ~/.dsh/session-toolbox/）。</p>
-			<div className="row">
-				<button disabled={busy || refreshing} onClick={() => {
-					setRefreshing(true);
-					void refreshSessionList()
-						.then(() => say('会话列表已刷新；迁移或还原过的会话应出现在新项目下'))
-						.catch(err => say(`刷新失败：${err.message}`))
-						.finally(() => setRefreshing(false));
-				}}>{refreshing ? '刷新中…' : '刷新会话列表'}</button>
-				<span className="muted">迁移或还原会话后，若侧栏没变化，点这里重新拉取列表（不影响任何会话内容）。</span>
-			</div>
-			{error ? <p className="error">后台连接失败：{error}</p> : null}
-			{feedback ? <p className="good">{feedback}</p> : null}
-			<NextTaskSettings state={state} act={act} busy={busy} />
+			{error ? <p className="error sk-notice" role="alert">{text(t, 'page.connection', { error })}</p> : null}
+			{feedback ? <p className="good sk-notice" role="status">{feedback}</p> : null}
+			<div className="sk-page-grid"><div className="sk-column"><NextTaskSettings state={state} act={act} busy={busy} /><WorkspaceSection state={state} t={t} /></div><div className="sk-column">
 			<section className="box">
-				<h3>草稿保险箱（图片草稿持久化）</h3>
+				<h3>{text(t, 'vault.title')}</h3>
 				{settings ? (
 					<>
 						<div className="row">
 							<label className="row"><input type="checkbox" checked={settings.draftVault?.enabled !== false} disabled={busy}
-								onChange={e => void act({ type: 'settings.update', patch: { draftVault: { ...settings.draftVault, enabled: e.target.checked } } }, e.target.checked ? '已启用草稿保险箱' : '已停用草稿保险箱（保留已有备份）').catch(() => {})} /> 启用</label>
-							<span className="pill">容量 {Math.round((settings.draftVault?.maxSizeBytes ?? 0) / 1048576)} MB</span>
-							<span className="pill">保留 {settings.draftVault?.ttlDays ?? 7} 天</span>
+								onChange={e => void act({ type: 'settings.update', patch: { draftVault: { ...settings.draftVault, enabled: e.target.checked } } }, text(t, e.target.checked ? 'vault.on' : 'vault.off')).catch(() => {})} /> {text(t, 'vault.enabled')}</label>
 						</div>
 						<div className="row">
-							<span className="muted">清单：已备份 {state?.vault?.records ?? 0} 项 · 约 {fmtBytes(state?.vault?.bytes ?? 0)}（图片字节在 IndexedDB，超出上限按最旧清理，事件会显示在这里）</span>
+							<strong>{text(t, 'vault.summary', { count: state?.vault?.records ?? 0, size: fmtBytes(state?.vault?.bytes ?? 0) })}</strong>
 						</div>
+						<p className="muted sk-caption">{text(t, 'vault.policy', { size: Math.round((settings.draftVault?.maxSizeBytes ?? 0) / 1048576), days: settings.draftVault?.ttlDays ?? 7 })}</p>
+						<p className="muted sk-caption">{text(t, 'vault.help')}</p>
 						{vault?.lastNotice ? <p className="muted">{vault.lastNotice}</p> : null}
-						<div className="row"><button disabled={busy} onClick={() => void act({ type: 'vault.sweep' }, '已按 TTL/容量清理').catch(() => {})}>立即整理</button></div>
+						<div className="row"><button disabled={busy} onClick={() => void act({ type: 'vault.sweep' }, text(t, 'vault.swept')).catch(() => {})}>{text(t, 'vault.sweep')}</button></div>
 					</>
-				) : <p className="muted">等待后台数据…</p>}
+				) : <p className="muted">{text(t, 'common.loading')}</p>}
 			</section>
-			<WorkspaceSection state={state} t={t} />
 			<MoveSection act={act} busy={busy} say={say} state={state} />
+			</div></div>
 			<TrashSection act={act} busy={busy} say={say} state={state} />
+			<p className="muted sk-caption">{text(t, 'page.privacy')}</p>
 		</div>
 	);
 }
 
 function MoveSection({ act, busy, say, state }) {
-	const [sessionId, setSessionId] = useState('');
-	const [toCwd, setToCwd] = useState('');
-	const [createTarget, setCreateTarget] = useState(false);
-	const [plan, setPlan] = useState(null);
-	const journal = state?.journal;
-	// Known projects, so the target can be picked by name instead of typed as a path.
-	const projects = state?.projects ?? [];
-	// Which project the typed session currently belongs to (computed host-side).
-	const [fromProject, setFromProject] = useState(null);
-	useEffect(() => {
-		if (!sessionId) { setFromProject(null); return; }
-		let alive = true;
-		void callHost({ type: 'project.of', sessionId })
-			.then(result => { if (alive) setFromProject(result?.project ?? null); })
-			.catch(() => { if (alive) setFromProject(null); });
-		return () => { alive = false; };
-	}, [sessionId]);
-	const pick = async () => {
-		try {
-			const result = await directoryPicker?.pick?.();
-			const value = result?.ok ? result.value : undefined;
-			if (typeof value === 'string' && value) setToCwd(value);
-			else say('当前 DSH 未提供目录选择器（或已取消），请手动输入绝对路径');
-		} catch (error) { say(`目录选择失败：${error.message}`); }
-	};
-	return (
-		<section className="box">
-			<h3>会话切换项目</h3>
-			{journal && <p className="error">存在未完成的迁移：{journal.sessionId} → {journal.toCwd}（已完成 {journal.done?.join('/') || '无'}）。
-				<button disabled={busy} onClick={() => void act({ type: 'move.complete' }, '迁移已前滚完成').catch(() => {})}>完成</button>
-				{' '}<button disabled={busy} onClick={() => void act({ type: 'move.rollback' }, '迁移已回滚').catch(() => {})}>回滚</button></p>}
-			<div className="row">
-				<input className="grow mono" placeholder="session-…（或从会话右键菜单发起）" value={sessionId} onChange={e => { setSessionId(e.target.value); setPlan(null); }} />
-				{projects.length > 0 && (
-					<select className="grow" value={projects.some(p => p.path === toCwd) ? toCwd : ''}
-						onChange={e => { setToCwd(e.target.value); setPlan(null); }}>
-						<option value="">选择目标项目…</option>
-						{projects.map(project => (
-							<option key={project.id} value={project.path} disabled={fromProject?.path === project.path}>
-								{project.title}（{project.sessions} 个会话）{fromProject?.path === project.path ? ' — 当前项目' : ''}
-							</option>
-						))}
-					</select>
-				)}
-				<input className="grow mono" placeholder="目标项目绝对路径" value={toCwd} onChange={e => { setToCwd(e.target.value); setPlan(null); }} />
-				<button onClick={() => void pick()} disabled={busy}>浏览…</button>
-			</div>
-			{sessionId && (
-				<p className="muted">
-					当前项目：{fromProject === null ? '（未找到该会话，或它不属于任何项目）'
-						: <><strong>{fromProject.title}</strong>{' '}<span className="mono">{fromProject.path}</span></>}
-				</p>
-			)}
-			<label className="row"><input type="checkbox" checked={createTarget} onChange={e => { setCreateTarget(e.target.checked); setPlan(null); }} /> 目标不存在时创建</label>
-			<div className="row">
-				<button disabled={busy || !sessionId || !toCwd} onClick={() => { setPlan(null); void act({ type: 'preflight', sessionId, toCwd, createTarget }).then(setPlan).catch(() => {}); }}>体检</button>
-				<button className="primary" disabled={busy || plan?.toProject === undefined} onClick={() => void act({ type: 'move', sessionId, toCwd, createTarget }, '迁移完成，已刷新会话列表').catch(() => {})}>迁移</button>
-			</div>
-			{plan?.toProject && (
-				<pre className="mono muted" style={{ whiteSpace: 'pre-wrap' }}>{JSON.stringify({ 从: plan.fromCwd, 到: plan.toCwd, 原目录: plan.fromProject, 新目录: plan.toProject, 日志文件: plan.logName }, null, 2)}</pre>
-			)}
-			<p className="muted">只改 DSH 内部归属与会话头；历史不变，旧消息中的绝对路径仍指向原项目（已知语义）。会话空闲且无排队消息时，自动释放写入句柄后迁移，无需重启 DSH。</p>
-		</section>
-	);
+ const [sessionId, setSessionId] = useState(''), [toCwd, setToCwd] = useState('');
+ const [createTarget, setCreateTarget] = useState(false), [plan, setPlan] = useState(null);
+ const [fromProject, setFromProject] = useState(null);
+ const projects = state?.projects ?? [], journal = state?.journal;
+ useEffect(() => {
+  if (!sessionId) { setFromProject(null); return; }
+  let alive = true;
+  void callHost({ type: 'project.of', sessionId }).then(result => { if (alive) setFromProject(result?.project ?? null); }).catch(() => { if (alive) setFromProject(null); });
+  return () => { alive = false; };
+ }, [sessionId]);
+ const pick = async () => {
+  try { const result = await directoryPicker?.pick?.(); if (result?.ok && typeof result.value === 'string') { setToCwd(result.value); setPlan(null); } else say(uiText('move.pickerUnavailable')); }
+  catch (error) { say(uiText('common.failed', { error: error.message })); }
+ };
+ return <section className="box"><h3>{uiText('move.title')}</h3>
+  {journal && <div className="stack"><p className="error">{uiText('move.pending')} <span className="mono">{journal.sessionId} → {journal.toCwd}</span></p><div className="row"><button disabled={busy} onClick={() => void act({ type: 'move.complete' }, uiText('move.completed')).catch(() => {})}>{uiText('move.complete')}</button><button disabled={busy} onClick={() => void act({ type: 'move.rollback' }, uiText('move.rolledBack')).catch(() => {})}>{uiText('move.rollback')}</button></div></div>}
+  <label className="sk-field"><span>{uiText('move.session')}</span><input className="mono" placeholder={uiText('move.sessionPlaceholder')} value={sessionId} onChange={event => { setSessionId(event.target.value); setPlan(null); }} /></label>
+  {projects.length > 0 && <label className="sk-field"><span>{uiText('move.target')}</span><select value={projects.some(project => project.path === toCwd) ? toCwd : ''} onChange={event => { setToCwd(event.target.value); setPlan(null); }}><option value="">{uiText('move.select')}</option>{projects.map(project => <option key={project.id} value={project.path} disabled={fromProject?.path === project.path}>{project.title} ({project.sessions}){fromProject?.path === project.path ? uiText('move.currentSuffix') : ''}</option>)}</select></label>}
+  <label className="sk-field"><span>{uiText('move.path')}</span><div className="row"><input className="grow mono" placeholder={uiText('move.pathPlaceholder')} value={toCwd} onChange={event => { setToCwd(event.target.value); setPlan(null); }} /><button type="button" onClick={() => void pick()} disabled={busy}>{uiText('project.browse')}</button></div></label>
+  {sessionId && <p className="muted sk-caption">{uiText('move.current')}: {fromProject ? <><strong>{fromProject.title}</strong> <span className="mono">{fromProject.path}</span></> : uiText('move.unknown')}</p>}
+  <div className="row"><label className="row"><input type="checkbox" checked={createTarget} onChange={event => { setCreateTarget(event.target.checked); setPlan(null); }} />{uiText('move.create')}</label><button disabled={busy || !sessionId || !toCwd} onClick={() => { setPlan(null); void act({ type: 'preflight', sessionId, toCwd, createTarget }).then(setPlan).catch(() => {}); }}>{uiText('move.preflight')}</button><button className="primary" disabled={busy || plan?.toProject === undefined} onClick={() => void act({ type: 'move', sessionId, toCwd, createTarget }, uiText('move.done')).catch(() => {})}>{uiText('move.submit')}</button></div>
+  {plan?.toProject && <pre className="mono muted" style={{ whiteSpace: 'pre-wrap' }}>{JSON.stringify({ from: plan.fromCwd, to: plan.toCwd, fromProject: plan.fromProject, toProject: plan.toProject, logFile: plan.logName }, null, 2)}</pre>}
+  <details><summary>{uiText('common.details')}</summary><p className="muted sk-caption">{uiText('move.help')}</p></details>
+ </section>;
 }
 
-function TrashSection({ act, busy, say, state }) {
-	const items = state?.trash ?? [];
-	return (
-		<section className="box">
-			<h3>归档池</h3>
-			<p className="muted">
-				这里同时显示 DSH 原生归档和通过工具箱归档的会话。工具箱归档额外保存<b>项目归属、列表位置与置顶状态</b>；原生归档按当前项目归属还原，原始归档时间和归档前置顶状态不可追溯，也不参与到期自动删除。
-				归档项目则保留全部会话日志，只移除项目注册表项。彻底删除会先移入暂存目录再清理，中断可用 CLI 检出。
-			</p>
-			{items.length === 0 ? <p className="muted">（空）</p> : (
-				<table>
-					<thead><tr><th>类型</th><th>对象</th><th>标题 / 路径</th><th>入池时间</th><th /></tr></thead>
-					<tbody>{items.map(item => (
-						<tr key={item.itemId}>
-							<td>{item.source === 'native' ? '会话（原生归档）' : item.kind === 'session' ? '会话' : '项目'}</td>
-							<td className="mono">{shortId(item.targetId)}</td>
-							<td className="mono">{item.kind === 'session' ? item.snapshot.title || '（无标题）' : item.snapshot.path}</td>
-							<td>{item.trashedAt ? new Date(item.trashedAt).toLocaleString('zh-CN', { hour12: false }) : '未知（原生归档）'}</td>
-							<td className="row">
-								<button disabled={busy} onClick={() => void act({ type: 'trash.restore', itemId: item.itemId }, '已还原到原位').catch(() => {})}>还原</button>
-								<button disabled={busy} onClick={() => showOverlay({ kind: 'purge', itemId: item.itemId, title: item.snapshot.title || item.snapshot.path || item.targetId })}>彻底删除</button>
-							</td>
-						</tr>))}
-					</tbody>
-				</table>
-			)}
-			<div className="row">
-				<span className="muted">保留 {state?.settings?.trash?.ttlDays ?? 30} 天；到期自动移出{state?.settings?.trash?.autoPurge ? '（已开）' : '（未开，仅提醒）'}。</span>
-				<button disabled={busy} onClick={() => void act({ type: 'settings.update', patch: { trash: { ...state?.settings?.trash, autoPurge: !(state?.settings?.trash?.autoPurge) } } }, '策略已更新').catch(() => {})}>切换自动清理</button>
-				<button disabled={busy} onClick={() => void act({ type: 'trash.sweep' }, '已按 TTL 巡检').catch(() => {})}>巡检到期项</button>
-			</div>
-		</section>
-	);
+function TrashSection({ act, busy, state }) {
+ const items = state?.trash ?? [];
+ return <section className="box sk-archive"><div className="sk-section-heading"><h3>{uiText('trash.title')} <span className="pill">{items.length}</span></h3><details><summary>{uiText('common.details')}</summary><p className="muted sk-caption">{uiText('trash.help')}</p></details></div>
+  {items.length === 0 ? <p className="muted sk-caption">{uiText('trash.empty')}</p> : <div className="sk-table-scroll"><table><thead><tr>{['trash.type', 'trash.object', 'trash.path', 'trash.date', 'common.actions'].map(key => <th key={key}>{uiText(key)}</th>)}</tr></thead><tbody>{items.map(item => <tr key={item.itemId}>
+   <td>{uiText(item.source === 'native' ? 'trash.native' : item.kind === 'session' ? 'trash.chat' : 'trash.project')}</td><td className="mono">{shortId(item.targetId)}</td><td className="mono">{item.kind === 'session' ? item.snapshot.title || uiText('trash.untitled') : item.snapshot.path}</td><td>{item.trashedAt ? new Date(item.trashedAt).toLocaleString(activeLanguage(), { hour12: false }) : uiText('trash.unknownDate')}</td>
+   <td><div className="row"><button disabled={busy} onClick={() => void act({ type: 'trash.restore', itemId: item.itemId }, uiText('trash.restored')).catch(() => {})}>{uiText('trash.restore')}</button><button disabled={busy} onClick={() => showOverlay({ kind: 'purge', itemId: item.itemId, title: item.snapshot.title || item.snapshot.path || item.targetId })}>{uiText('trash.delete')}</button></div></td>
+  </tr>)}</tbody></table></div>}
+  <div className="row"><span className="muted sk-caption">{uiText('trash.policy', { days: state?.settings?.trash?.ttlDays ?? 30 })}</span><label className="row"><input type="checkbox" checked={Boolean(state?.settings?.trash?.autoPurge)} disabled={busy || !state?.settings} onChange={event => void act({ type: 'settings.update', patch: { trash: { autoPurge: event.target.checked } } }, uiText('common.saved')).catch(() => {})} />{uiText('trash.auto')}</label><button disabled={busy} onClick={() => void act({ type: 'trash.sweep' }, uiText('trash.swept')).catch(() => {})}>{uiText('trash.sweep')}</button></div>
+ </section>;
 }
 
 const shortId = id => String(id).length > 18 ? `${String(id).slice(0, 8)}…${String(id).slice(-6)}` : String(id);
@@ -402,19 +355,21 @@ const fmtBytes = n => n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : n >= 102
 
 /** Menu entry: move this session to another project (§10 MR6). */
 export function MoveSessionMenuItem({ sessionId, useMenuOpenState, t }) {
+ useLanguage();
 	const [, setMenuOpen] = useMenuOpenState?.() ?? [false, () => {}];
 	return <MenuItemButton separatorBefore icon={<IconFolderOpenOutlineRegular size={14} />} onSelect={() => {
 		setMenuOpen(false);
 		showOverlay({ kind: 'move', sessionId });
-	}}>{t ? t('menu.move') : '切换到其它项目…'}</MenuItemButton>;
+	}}>{text(t, 'menu.move')}</MenuItemButton>;
 }
 
 export function TrashSessionMenuItem({ sessionId, displayTitle, useMenuOpenState, t }) {
+ useLanguage();
 	const [, setMenuOpen] = useMenuOpenState?.() ?? [false, () => {}];
 	return <MenuItemButton icon={<IconArchiveOutlineRegular size={14} />} onSelect={() => {
 		setMenuOpen(false);
 		showOverlay({ kind: 'archive', sessionId, title: displayTitle || sessionId });
-	}}>{t ? t('menu.trash') : '归档到归档池'}</MenuItemButton>;
+	}}>{text(t, 'menu.trash')}</MenuItemButton>;
 }
 function sayRow(message) { store.error = message; for (const listener of store.listeners) listener(); }
 
@@ -445,9 +400,9 @@ function TrashDialog({ request, close }) {
 			close();
 		} catch (reason) { setError(reason.message); setBusy(false); }
 	};
-	return <Modal open onClose={dismiss} closeLabel="关闭" title={purge ? '彻底删除' : '归档到归档池'}
-		description={purge ? `将永久删除「${request.title}」的会话记录，此操作无法还原。` : `归档「${request.title}」后，可在工具箱归档池中还原。`}
-		footer={<><Button variant="outline" disabled={busy} onClick={dismiss}>取消</Button><Button variant="outline" disabled={busy} onClick={() => void submit()}>{busy ? '处理中…' : purge ? '确认彻底删除' : '确认归档'}</Button></>}>
+	return <Modal open onClose={dismiss} closeLabel={uiText('common.close')} title={uiText(purge ? 'trash.delete' : 'menu.trash')}
+		description={uiText(purge ? 'trash.deleteHelp' : 'trash.archiveHelp', { title: request.title })}
+		footer={<><Button variant="outline" disabled={busy} onClick={dismiss}>{uiText('common.cancel')}</Button><Button variant="outline" disabled={busy} onClick={() => void submit()}>{uiText(busy ? 'common.busy' : purge ? 'trash.confirmDelete' : 'trash.confirmArchive')}</Button></>}>
 		{error ? <p role="alert">{error}</p> : null}
 	</Modal>;
 }
@@ -478,28 +433,28 @@ export function MoveDialog({ sessionId, close }) {
 			// that plainly instead of closing on a silent success.
 			close();
 			dispatchNotice(result?.deferred
-				? '文件已迁移，但项目账本尚未完成；请在工具箱点击完成或回滚'
-				: '迁移完成，已刷新会话列表');
+				? uiText('move.deferred')
+				: uiText('move.done'));
 		}
 		catch (err) { setError(err.message); setBusy(false); }
 	};
 	const valid = /^\/|^[A-Za-z]:[\\/]/.test(toCwd);
 	return (
-		<Modal open onClose={() => { if (!busy) close(); }} closeLabel="关闭" title="会话切换到其它项目"
-			footer={<><Button variant="outline" disabled={busy} onClick={close}>取消</Button><Button variant="primary" disabled={busy || !valid || fromProject?.path === toCwd} onClick={() => void submit()}>{busy ? '迁移中…' : '体检并迁移'}</Button></>}>
+		<Modal open onClose={() => { if (!busy) close(); }} closeLabel={uiText('common.close')} title={uiText('move.title')}
+			footer={<><Button variant="outline" disabled={busy} onClick={close}>{uiText('common.cancel')}</Button><Button variant="primary" disabled={busy || !valid || fromProject?.path === toCwd} onClick={() => void submit()}>{uiText(busy ? 'move.moving' : 'move.checkAndMove')}</Button></>}>
 			<div className="sk stack"><style>{styles}</style>
 				<p className="muted mono">{sessionId}</p>
-				<p className="muted">当前项目：{fromProject ? <><strong>{fromProject.title}</strong> <span className="mono">{fromProject.path}</span></> : '（未找到项目）'}</p>
-				{projects.length > 0 && <label className="stack">目标项目
+				<p className="muted">{uiText('move.current')}: {fromProject ? <><strong>{fromProject.title}</strong> <span className="mono">{fromProject.path}</span></> : uiText('move.unknown')}</p>
+				{projects.length > 0 && <label className="stack">{uiText('move.target')}
 					<select value={projects.some(p => p.path === toCwd) ? toCwd : ''} onChange={e => setToCwd(e.target.value)} disabled={busy}>
-						<option value="">选择目标项目…</option>
-						{projects.map(project => <option key={project.id} value={project.path} disabled={fromProject?.path === project.path}>{project.title}（{project.sessions} 个会话）{fromProject?.path === project.path ? ' — 当前项目' : ''}</option>)}
+						<option value="">{uiText('move.select')}</option>
+						{projects.map(project => <option key={project.id} value={project.path} disabled={fromProject?.path === project.path}>{project.title} ({project.sessions}){fromProject?.path === project.path ? uiText('move.currentSuffix') : ''}</option>)}
 					</select>
 				</label>}
-				<label className="stack">目标目录<input className="mono" value={toCwd} onChange={e => setToCwd(e.target.value)} disabled={busy} placeholder="目标项目绝对路径" /></label>
-				<label className="row"><input type="checkbox" checked={createTarget} onChange={e => setCreateTarget(e.target.checked)} disabled={busy} /> 目录不存在时创建</label>
+				<label className="stack">{uiText('move.path')}<input className="mono" value={toCwd} onChange={e => setToCwd(e.target.value)} disabled={busy} placeholder={uiText('move.pathPlaceholder')} /></label>
+				<label className="row"><input type="checkbox" checked={createTarget} onChange={e => setCreateTarget(e.target.checked)} disabled={busy} /> {uiText('move.create')}</label>
 				{error ? <p className="error" role="alert">{error}</p> : null}
-				<p className="muted">会话需空闲且没有排队消息。插件会完成写入并释放句柄后迁移，无需重启 DSH。</p>
+				<p className="muted">{uiText('move.help')}</p>
 			</div>
 		</Modal>
 	);
@@ -507,6 +462,7 @@ export function MoveDialog({ sessionId, close }) {
 
 /** Input-dock badge (§4 FR5): how many image drafts are backed up for this session. */
 export function VaultBadge({ sessionId }) {
+ useLanguage();
 	const [count, setCount] = useState(0);
 	const [notice, setNotice] = useState('');
 	useEffect(() => {
@@ -525,46 +481,14 @@ export function VaultBadge({ sessionId }) {
 		return () => { live = false; vault.off('change', listener); window.removeEventListener(`${NS}-notice`, listener); clearInterval(timer); };
 	}, [sessionId]);
 	if (count === 0) return null; // the notice channel serves the panel; the badge anchors per-session counts
-	return <span className="sk"><span className="pill" title={`本会话有 ${count} 张图片草稿已备份（切换会话/刷新/重启后可恢复）${notice ? `｜最近：${notice}` : ''}`}>🛟 草稿备份 {count}</span></span>;
+	const currentNotice = vault?.lastNotice ?? notice;
+	return <span className="sk"><span className="pill" title={uiText('vault.badgeHelp', { count }) + (currentNotice ? ` · ${currentNotice}` : '')}>{uiText('vault.badge', { count })}</span></span>;
 }
 
-const workspaceChinese = {
- 'message.delete': '删除这条消息', 'message.deleteHelp': '从会话界面和后续 AI 上下文中移除这条消息，不撤销文件修改。其它消息仍可能包含相关信息。原始日志保留用于完整性校验，此操作不提供界面撤销。', 'message.deleteConfirm': '确认删除消息', 'message.deleted': '消息已删除，已从后续 AI 上下文移除',
- 'reply.selection': '引用所选内容', 'reply.copy': '复制',
- 'nextTasks.generate': '生成任务联想（单独统计 token）', 'nextTasks.regenerate': '重新生成任务联想（单独统计 token）',
- 'checkpoint.action': '恢复检查点', 'checkpoint.help': '撤销这条消息及之后的文件修改，保留全部聊天记录。仅支持已保存的本地项目文件，忽略 Git 忽略文件、依赖、构建和环境文件。工具运行期间请避免手动修改同一项目，该时段的写入无法区分来源。',
- 'checkpoint.loading': '正在检查文件…', 'checkpoint.restore': '确认恢复文件', 'checkpoint.conflicts': '以下文件又被修改过，请先处理冲突：', 'checkpoint.empty': '没有需要恢复的文件。', 'checkpoint.done': '文件已恢复，聊天记录已保留。', 'checkpoint.retry': '重新检查',
- 'nextTasks.title': '接下来', 'nextTasks.empty': '本轮没有合适的后续建议', 'nextTasks.unavailable': '本轮未生成后续建议', 'nextTasks.reason.credentials': '模型凭据或权限无效', 'nextTasks.reason.rate-limit': '模型服务限流', 'nextTasks.reason.format': '模型返回的候选格式无效', 'nextTasks.reason.output-limit': '达到候选输出上限', 'nextTasks.reason.model-call': '模型调用未完成', 'nextTasks.reason.model-unconfigured': '会话未配置可用模型', 'nextTasks.reason.context': '缺少可用于联想的问答文字', 'nextTasks.reason.busy': '会话仍在运行或收尾', 'nextTasks.reason.host-state': '无法读取会话状态', 'nextTasks.reason.cancelled': '候选生成已取消', 'nextTasks.dismiss': '收起建议', 'reply.fromUser': '引用用户消息', 'reply.fromAssistant': '引用助手回复', 'nextTasks.generating': '正在生成后续任务候选…', 'nextTasks.failed': '后续任务候选生成失败（不会自动重试）', 'message.inComposer': '历史文字已载入输入框，可编辑并添加截图。', 'message.restoreDraft': '恢复原草稿文字', 'message.edit': '编辑并重新发送',
- 'reply.action': '引用回复', 'reply.cancel': '取消引用', 'reply.user': '用户', 'reply.assistant': '助手', 'reply.unavailable': '当前输入框暂不支持引用回复',
- 'community.join': '加入 QQ 交流群 ↗', 'community.name': 'AndroidSix 的开源项目交流群', 'community.number': '群号',
- 'groups.title': '项目分组', 'groups.all': '全部项目', 'groups.none': '未分组', 'groups.manage': '管理项目与分组',
- 'groups.reorder': '拖动分组标题调整顺序；也可聚焦后按 Alt/Option + ↑/↓。未分组也可自由排序。', 'groups.move': '移入分组…', 'groups.drop': '可将项目拖到分组标题，或从项目菜单选择“移入分组”。', 'groups.name': '分组名称', 'groups.create': '新建分组', 'groups.rename': '重命名', 'groups.delete': '删除分组',
- 'groups.help': '每个项目可归入一个分组；删除分组会将其中项目恢复为未分组。侧栏按“分组 → 项目 → 会话”展开，原生搜索仍搜索全部会话。',
- 'groups.intro': '整理项目归属，侧栏会同步更新。', 'groups.list': '分组', 'groups.projects': '项目', 'groups.empty': '这个分组还没有项目', 'groups.emptyHelp': '在“全部项目”中为项目选择所属分组。', 'groups.sortHelp': '拖动分组或点击箭头排序，与侧栏同步。', 'groups.up': '上移', 'groups.down': '下移', 'groups.saved': '分组变更自动保存', 'groups.sessions': '个会话',
- 'project.groupHelp': '分组选择后立即保存；名称和路径点击“保存”后生效。', 'project.editGroup': '编辑项目', 'project.edit': '编辑项目', 'project.title': '项目名称', 'project.path': '项目目录', 'project.browse': '浏览…',
- 'project.help': '选择已有代码目录。保存后，将该项目的全部已有会话一起迁入新路径，保留顺序、归档及置顶状态；代码文件不会搬动，历史消息中的路径保持原样。会话必须空闲且没有排队消息。',
- 'project.resume': '继续迁移', 'project.pending': '项目迁移尚未完成，请继续迁移。',
- 'common.save': '保存', 'common.cancel': '取消', 'common.close': '关闭', 'common.busy': '处理中…', 'common.loading': '正在加载项目…',
-};
-const workspaceEnglish = {
- 'message.delete': 'Delete this message', 'message.deleteHelp': 'Remove this message from the chat and future AI context. File changes are kept. Other messages may still contain related information. Original logs are retained for integrity; there is no UI undo.', 'message.deleteConfirm': 'Delete message', 'message.deleted': 'Message deleted from the chat and future AI context',
- 'reply.selection': 'Quote selection', 'reply.copy': 'Copy',
- 'nextTasks.generate': 'Generate next steps (tokens tracked separately)', 'nextTasks.regenerate': 'Regenerate next steps (tokens tracked separately)',
- 'checkpoint.action': 'Restore checkpoint', 'checkpoint.help': 'Undo file changes from this message onward; keep all chat messages. Saved local project files only; Git-ignored files, dependencies, build output and environment files are excluded. Avoid manual edits while tools run: changes made during execution cannot be attributed separately.',
- 'checkpoint.loading': 'Checking files…', 'checkpoint.restore': 'Restore files', 'checkpoint.conflicts': 'These files changed again. Resolve conflicts first:', 'checkpoint.empty': 'No files need restoring.', 'checkpoint.done': 'Files restored. Chat history was kept.', 'checkpoint.retry': 'Check again',
- 'nextTasks.title': 'Next steps', 'nextTasks.empty': 'No useful next steps for this answer', 'nextTasks.unavailable': 'No suggestions generated for this answer', 'nextTasks.reason.credentials': 'Invalid model credentials or permissions', 'nextTasks.reason.rate-limit': 'Model rate limit reached', 'nextTasks.reason.format': 'Invalid suggestion format returned by the model', 'nextTasks.reason.output-limit': 'Suggestion output limit reached', 'nextTasks.reason.model-call': 'Model call did not complete', 'nextTasks.reason.model-unconfigured': 'No model configured for this chat', 'nextTasks.reason.context': 'No suitable question and answer text', 'nextTasks.reason.busy': 'Chat is still running or finishing', 'nextTasks.reason.host-state': 'Unable to read chat state', 'nextTasks.reason.cancelled': 'Suggestion generation cancelled', 'nextTasks.dismiss': 'Dismiss suggestions', 'reply.fromUser': 'Quoted message', 'reply.fromAssistant': 'Quoted reply', 'nextTasks.generating': 'Generating next task suggestions…', 'nextTasks.failed': 'Suggestions failed (no automatic retry)', 'message.inComposer': 'History text loaded into the composer. Edit it and add images.', 'message.restoreDraft': 'Restore previous draft text', 'message.edit': 'Edit and resend',
- 'reply.action': 'Quote reply', 'reply.cancel': 'Cancel quote', 'reply.user': 'User', 'reply.assistant': 'Assistant', 'reply.unavailable': 'Quote reply is unavailable for this composer',
- 'community.join': 'Join the QQ community ↗', 'community.name': 'AndroidSix open-source projects', 'community.number': 'Group',
- 'groups.title': 'Project groups', 'groups.all': 'All projects', 'groups.none': 'Ungrouped', 'groups.manage': 'Manage projects and groups',
- 'groups.reorder': 'Drag group headings to reorder, or focus and press Alt/Option + ↑/↓. Ungrouped can also be reordered.', 'groups.move': 'Move to group…', 'groups.drop': 'Drag a project onto a group heading, or choose Move to group from its menu.', 'groups.name': 'Group name', 'groups.create': 'New group', 'groups.rename': 'Rename', 'groups.delete': 'Delete group',
- 'groups.help': 'Each project belongs to one group. Deleting a group leaves its projects ungrouped. The sidebar nests projects under collapsible groups; native search still searches all chats.',
- 'groups.intro': 'Organize your projects. The sidebar updates automatically.', 'groups.list': 'Groups', 'groups.projects': 'Projects', 'groups.empty': 'No projects in this group', 'groups.emptyHelp': 'Choose a group for a project in All projects.', 'groups.sortHelp': 'Drag groups or use the arrows to reorder. Synced with the sidebar.', 'groups.up': 'Move up', 'groups.down': 'Move down', 'groups.saved': 'Group changes save automatically', 'groups.sessions': 'chats',
- 'project.groupHelp': 'Group changes save immediately. Name and directory changes apply when you click Save.', 'project.editGroup': 'Edit project', 'project.edit': 'Edit project', 'project.title': 'Project name', 'project.path': 'Project directory', 'project.browse': 'Browse…',
- 'project.help': 'Choose an existing code directory. Saving moves all existing chats to the new path and keeps their order, archive and pin state. Code files and paths in past messages stay as they are. Chats must be idle with no queued messages; the host releases their writer before migration.',
- 'project.resume': 'Resume migration', 'project.pending': 'Project migration is incomplete. Resume it to continue.',
- 'common.save': 'Save', 'common.cancel': 'Cancel', 'common.close': 'Close', 'common.busy': 'Working…', 'common.loading': 'Loading projects…',
-};
-const text = (t, key) => t ? t(key) : workspaceChinese[key];
+function activeLanguage() { return resolveLanguage(store.state?.settings?.language, localeService?.getSnapshot?.()?.active); }
+const text = (_t, key, values) => translate(activeLanguage(), key, values);
+const subscribeLanguage = listener => { store.listeners.add(listener); return () => store.listeners.delete(listener); };
+function useLanguage() { return useSyncExternalStore(subscribeLanguage, activeLanguage, activeLanguage); }
 
 /** Keep native rows mounted. Portals add group headings and menu entries to public DOM seats. */
 export function GroupedSidebar({ Native, ...props }) {
@@ -586,7 +510,7 @@ export function GroupedSidebar({ Native, ...props }) {
  const dragSnapshot = useRef(null);
  dragSnapshot.current = { workspaces: workspaces.items, projects: state?.projects ?? [], sessions,
   archived: workspaces.archivedSessionIds, blocked: !!state?.journal || !!state?.workspaceMove || state?.settings?.move?.enabled === false || typeof props.actions?.setSessionOrder !== 'function' };
- const sessionDrag = useMemo(() => sessionProjectDrag({ read: () => dragSnapshot.current, move: callHost, report: setSessionFeedback }), []);
+ const sessionDrag = useMemo(() => sessionProjectDrag({ read: () => dragSnapshot.current, move: callHost, report: setSessionFeedback, t: (key, values) => text(undefined, key, values) }), []);
  useEffect(() => () => sessionDrag.dispose(), [sessionDrag]);
  const groupSnapshot = useRef(null);
  const headings = useMemo(() => orderedGroups(groups, state?.ungroupedIndex).map(group => group.id === UNGROUPED ? { ...group, title: text(props.toolboxT, 'groups.none') } : group), [groups, state?.ungroupedIndex, props.toolboxT]);
@@ -666,7 +590,7 @@ export function GroupedSidebar({ Native, ...props }) {
   <style>{`.sk-sidebar{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}.sk-groupbar{display:flex;gap:4px;padding:4px 12px;align-items:center;color:var(--dsw-alias-label-secondary);font-size:12px}.sk-groupbar span{flex:1}.sk-group-heading{position:relative;display:flex;align-items:center;gap:6px;min-height:32px;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;padding:0 8px}[data-toolbox-project-menu]{min-width:172px!important}[data-toolbox-project-menu] [role="menuitem"]>span:last-child{white-space:nowrap;overflow:visible}.sk-group-heading[data-drop="true"]{background:var(--dsw-alias-interactive-bg-hover);outline:1px solid var(--dsw-alias-state-active-primary);border-radius:6px}.sk-group-heading[draggable="true"]{cursor:grab}.sk-group-heading[draggable="true"]>button:first-child{cursor:inherit}.sk-group-heading[data-insertion]::after{content:"";position:absolute;left:8px;right:8px;height:2px;border-radius:1px;background:var(--dsw-alias-state-active-primary);pointer-events:none}.sk-group-heading[data-insertion="before"]::after{top:0}.sk-group-heading[data-insertion="after"]::after{bottom:0}.sk-group-heading button:focus-visible{outline:2px solid var(--dsw-alias-state-active-primary);outline-offset:-2px}.sk-group-heading>button:first-child{flex:1;text-align:left}.sk-group-heading button{background:transparent;color:inherit;border:0;border-radius:6px;cursor:pointer;padding:5px}.sk-group-heading button:hover{background:var(--dsw-alias-interactive-bg-hover)}${rules}`}</style>
   <div className="sk-groupbar"><span>{text(props.toolboxT, 'groups.title')}</span><Button variant="ghost" title={text(props.toolboxT, 'groups.manage')} aria-label={text(props.toolboxT, 'groups.manage')} onClick={() => showOverlay({ kind: 'groups' })}>…</Button></div>
   {groupError && <p role="alert">{groupError}</p>}
-  {sessionFeedback && <p role={sessionFeedback.error ? 'alert' : 'status'} style={{ padding: '0 12px', fontSize: 12 }}>{sessionFeedback.busy ? '正在切换项目…' : sessionFeedback.message}</p>}
+  {sessionFeedback && <p role={sessionFeedback.error ? 'alert' : 'status'} style={{ padding: '0 12px', fontSize: 12 }}>{sessionFeedback.busy ? uiText('move.moving') : sessionFeedback.message}</p>}
   <Native {...nativeProps} />
   {grouped && list && createPortal(<>
    <style>{`.sk-sidebar div:has(>.sk-group-heading){display:flex;flex-direction:column}.sk-sidebar [role="tree"]>div:has([data-row-key="workspace:"]){order:${headings.findIndex(group => group.id === UNGROUPED) * 2 + 1};${collapsed.ungrouped ? 'display:none!important;' : ''}}`}</style>
@@ -719,7 +643,7 @@ function announceDraft() { window.dispatchEvent(new CustomEvent(DRAFT_CHANGED));
 /** Programmatic writes preserve native attachments and semantic reference chips. */
 export function fillComposer(sessionId, value, replace = false) {
  const input = replyInput(sessionId), snapshot = input?.state?.getSnapshot?.();
- if (!replyWritable(sessionId) || snapshot?.phase !== 'plain') throw new Error('请等待当前会话输入框就绪');
+ if (!replyWritable(sessionId) || snapshot?.phase !== 'plain') throw new Error(uiText('input.notReady'));
  // Image-only history has no text to load. Keep the existing draft intact.
  if (replace && !value.trim()) { input.focus?.(); return; }
  const draft = input.draftSnapshot ?? { text: snapshot.draft ?? '', references: (snapshot.occurrences ?? []).map(({ source, ref, offset, length, label, clipboardText, appearance, invalid }) => ({ source, ref, offset, length, label, clipboardText, ...(appearance === undefined ? {} : { appearance }), ...(invalid === undefined ? {} : { invalid }) })) };
@@ -732,6 +656,7 @@ export function fillComposer(sessionId, value, replace = false) {
  input.persistCurrentDraft?.(); input.focus?.(); announceDraft();
 }
 export function EditDraftNotice({ sessionId, t }) {
+ useLanguage();
  const [input, snapshot] = useReplyInput(sessionId), [, update] = useState(0);
  const [error, setError] = useState('');
  useEffect(() => { const refresh = () => update(value => value + 1); window.addEventListener(DRAFT_CHANGED, refresh); return () => window.removeEventListener(DRAFT_CHANGED, refresh); }, []);
@@ -743,6 +668,7 @@ export function EditDraftNotice({ sessionId, t }) {
 }
 const candidateView = createCandidateView({ getItem: key => window.sessionStorage?.getItem(key), setItem: (key, value) => window.sessionStorage?.setItem(key, value) });
 export function NextTaskAction({ sessionId, seq, canWrite, running, t }) {
+ useLanguage();
  const [result, setResult] = useState(() => candidateView.get(sessionId)), [pending, setPending] = useState(false), [error, setError] = useState('');
  const locked = useRef(false);
  useEffect(() => { setResult(candidateView.get(sessionId)); return candidateView.subscribe(sessionId, setResult); }, [sessionId]);
@@ -783,6 +709,7 @@ export function NextTaskController({ sessionId, useSession }) {
  return null;
 }
 export function NextTaskCandidates({ sessionId, seq, t }) {
+ useLanguage();
  const [result, setResult] = useState(() => candidateView.get(sessionId)), [error, setError] = useState('');
  useEffect(() => { setResult(candidateView.get(sessionId)); return candidateView.subscribe(sessionId, setResult); }, [sessionId]);
  const candidates = candidatesForTurn(result, seq);
@@ -790,7 +717,7 @@ export function NextTaskCandidates({ sessionId, seq, t }) {
   if (result?.seq !== seq || !['generating', 'ready', 'failed', 'unavailable', 'cancelled', 'error'].includes(result?.status)) return null;
   const key = result.status === 'generating' ? 'nextTasks.generating' : result.status === 'ready' ? 'nextTasks.empty' : result.status === 'unavailable' ? 'nextTasks.unavailable' : 'nextTasks.failed';
   const reasonKey = `nextTasks.reason.${result.reason}`;
-  return <div data-toolbox-next-status className="sk-next-status"><style>{conversationExtrasStyle}</style><span role="status">{text(t, key)}{Object.hasOwn(workspaceChinese, reasonKey) ? ` · ${text(t, reasonKey)}` : ''}</span><button type="button" className="sk-extras-close" aria-label={text(t, 'nextTasks.dismiss')} onClick={() => candidateView.dismiss(sessionId)}><CloseIcon /></button></div>;
+  return <div data-toolbox-next-status className="sk-next-status"><style>{conversationExtrasStyle}</style><span role="status">{text(t, key)}{Object.hasOwn(workspaceChinese, reasonKey) ? ` · ${text(t, reasonKey)}` : ''}{result.customModel && ['failed', 'unavailable'].includes(result.status) ? ` · ${text(t, 'nextTasks.noFallback')}` : ''}</span><button type="button" className="sk-extras-close" aria-label={text(t, 'nextTasks.dismiss')} onClick={() => candidateView.dismiss(sessionId)}><CloseIcon /></button></div>;
  }
  return <section data-toolbox-next-tasks className="sk-next-tasks" aria-label={text(t, 'nextTasks.title')}>
   <style>{conversationExtrasStyle}</style>
@@ -800,22 +727,32 @@ export function NextTaskCandidates({ sessionId, seq, t }) {
  </section>;
 }
 
-function NextTaskSettings({ state, act, busy }) {
+const uiText = (key, values) => text(undefined, key, values);
+const readModelCatalog = provider => callHost({ type: 'nextTasks.models', provider });
+export function NextTaskSettings({ state, act, busy }) {
+ useLanguage();
  const usage = state?.nextTasks, totals = usage?.totals;
  const lastFailure = usage?.recent?.[0]?.status === 'failed' ? usage.recent[0] : null;
- const number = value => Number(value ?? 0).toLocaleString();
- return <section className="box" data-toolbox-next-settings><h3>接下来任务联想</h3>
-  <label className="row"><input type="checkbox" checked={state?.settings?.nextTasks?.enabled !== false} disabled={busy || !state?.settings} onChange={event => void act({ type: 'settings.update', patch: { nextTasks: { enabled: event.target.checked } } }, event.target.checked ? '已开启任务联想' : '已关闭任务联想并取消待生成请求').catch(() => {})} /> 问答结束后生成候选（默认开启）</label>
-  <p className="muted">每轮正常结束后额外调用一次该会话的模型；取最近最多 6 条可见文字（不含图片、工具和思考过程），输入上限 12 KB，输出上限 600 token。点击候选填入输入框，已有草稿会保留，由你决定是否发送。失败不自动重试。</p>
-  {usage?.available === false && <p className="error">当前 DSH 未提供模型调用接口，暂不生成。</p>}
-  {lastFailure && <p className="error" role="status">最近一次联想失败：{text(undefined, `nextTasks.reason.${lastFailure.reason ?? 'model-call'}`) ?? text(undefined, 'nextTasks.reason.model-call')}。不会自动重试，可检查模型配置后点击回答末尾的星光图标手动重试。</p>}
-  {totals && <><div className="row"><span className="pill">调用 {number(totals.calls)}</span><span className="pill">成功 {number(totals.completed)}</span><span className="pill">失败 {number(totals.failed)} / 取消 {number(totals.cancelled)}</span><span className="pill">已报告总 token {number(totals.totalTokens)}</span></div>
-   <p className="muted">独立记录本功能的模型用量，不计入会话消息统计。未缓存输入 {number(totals.inputTokens)} · 缓存读取 {number(totals.cacheReadTokens)} · 缓存写入 {number(totals.cacheWriteTokens)} · 输出 {number(totals.outputTokens)}（含思考 {number(totals.reasoningTokens)}）。按服务商报告统计；缺少完整用量 {number(totals.unreported)} 次，尚未结算 {number(usage.pending)} 次，消耗未计入总数。日期按 UTC 记录。</p>
-   {!!usage.models?.length && <div style={{ overflowX: 'auto' }}><table><thead><tr><th>模型</th><th>调用</th><th>未缓存输入</th><th>缓存读 / 写</th><th>输出</th><th>已报告总 token</th></tr></thead><tbody>{usage.models.map(row => <tr key={`${row.provider}:${row.model}`}><td>{row.provider} / {row.model}</td><td>{number(row.calls)}</td><td>{number(row.inputTokens)}</td><td>{number(row.cacheReadTokens)} / {number(row.cacheWriteTokens)}</td><td>{number(row.outputTokens)}</td><td>{number(row.totalTokens)}</td></tr>)}</tbody></table></div>}
-   {!!usage.days?.length && <details><summary>最近 90 天消耗</summary><table><thead><tr><th>日期（UTC）</th><th>调用</th><th>已报告总 token</th><th>缺少用量</th></tr></thead><tbody>{[...usage.days].reverse().map(row => <tr key={row.date}><td>{row.date}</td><td>{number(row.calls)}</td><td>{number(row.totalTokens)}</td><td>{number(row.unreported)}</td></tr>)}</tbody></table></details>}
+ const number = value => Number(value ?? 0).toLocaleString(activeLanguage());
+ return <section className="box" data-toolbox-next-settings><h3>{uiText('nextTasks.settings')}</h3>
+  <label className="row"><input type="checkbox" checked={state?.settings?.nextTasks?.enabled !== false} disabled={busy || !state?.settings} onChange={event => void act({ type: 'settings.update', patch: { nextTasks: { enabled: event.target.checked } } }, uiText(event.target.checked ? 'nextTasks.enabled' : 'nextTasks.disabled')).catch(() => {})} /> {uiText('nextTasks.auto')}</label>
+  <p className="muted sk-caption">{uiText('nextTasks.help')}</p>
+  <NextTaskModelSettings settings={state?.settings?.nextTasks} act={act} busy={busy} readCatalog={readModelCatalog} t={uiText} />
+  {usage?.available === false && <p className="error" role="status">{uiText('nextTasks.noService')}</p>}
+  {lastFailure && <p className="error sk-caption" role="status">{uiText('nextTasks.failure', { reason: uiText(`nextTasks.reason.${lastFailure.reason ?? 'model-call'}`) })}{lastFailure.customModel ? ` · ${uiText('nextTasks.noFallback')}` : ''}</p>}
+  {totals && <><dl className="sk-metrics">{[['usage.calls', totals.calls], ['usage.completed', totals.completed], ['usage.failed', totals.failed], ['usage.total', totals.totalTokens]].map(([key, value]) => <div key={key}><dt>{uiText(key)}</dt><dd>{number(value)}</dd></div>)}</dl>
+   <details><summary>{uiText('usage.details')}</summary><div className="stack">
+    <p className="muted sk-caption">{uiText('usage.cancelled')} {number(totals.cancelled)} · {uiText('usage.unreported')} {number(totals.unreported)} · {uiText('usage.pending')} {number(usage.pending)}</p>
+    <p className="muted sk-caption">{uiText('usage.input')} {number(totals.inputTokens)} · {uiText('usage.cache')} {number(totals.cacheReadTokens)} / {number(totals.cacheWriteTokens)} · {uiText('usage.output')} {number(totals.outputTokens)} ({uiText('usage.reasoning')} {number(totals.reasoningTokens)})</p>
+    {!!usage.models?.length && <div className="sk-table-scroll"><table><thead><tr>{['common.model', 'usage.calls', 'usage.input', 'usage.cache', 'usage.output', 'usage.total'].map(key => <th key={key}>{uiText(key)}</th>)}</tr></thead><tbody>{usage.models.map(row => <tr key={`${row.provider}:${row.model}`}><td className="mono">{row.provider} / {row.model}</td><td>{number(row.calls)}</td><td>{number(row.inputTokens)}</td><td>{number(row.cacheReadTokens)} / {number(row.cacheWriteTokens)}</td><td>{number(row.outputTokens)}</td><td>{number(row.totalTokens)}</td></tr>)}</tbody></table></div>}
+    {!!usage.days?.length && <details><summary>{uiText('usage.days')}</summary><div className="sk-table-scroll"><table><thead><tr>{['usage.date', 'usage.calls', 'usage.total', 'usage.unreported'].map(key => <th key={key}>{uiText(key)}</th>)}</tr></thead><tbody>{usage.days.map(row => <tr key={row.date}><td>{row.date}</td><td>{number(row.calls)}</td><td>{number(row.totalTokens)}</td><td>{number(row.unreported)}</td></tr>)}</tbody></table></div></details>}
+    <p className="muted sk-caption">{uiText('usage.help')}</p>
+   </div></details>
   </>}
+  <details><summary>{uiText('common.details')}</summary><p className="muted sk-caption">{uiText('nextTasks.limits')}</p></details>
  </section>;
 }
+
 const deletedMessages = new Map();
 function deletedStore(id) {
  if (!deletedMessages.has(id)) deletedMessages.set(id, { seqs: new Set(), listeners: new Set(), revision: 0 });
@@ -852,6 +789,7 @@ const replyStyle = `
 .sk-reply-button{display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;padding:5px;background:transparent;border:0;border-radius:var(--dsw-radius-sm,6px);color:var(--dsw-alias-label-tertiary);cursor:pointer}.sk-reply-button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.sk-reply-button:disabled{opacity:.4;cursor:default}.sk-reply-preview{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,12px);color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;background:var(--dsw-alias-bg-module-platform)}.sk-reply-preview>div{min-width:0;flex:1;border-left:2px solid var(--dsw-alias-label-tertiary);padding-left:10px}.sk-reply-preview p{margin:4px 0 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:pre-wrap;overflow-wrap:anywhere}.sk-reply-preview strong{font-size:12px;font-weight:500}`;
 const replyCarets = new WeakMap();
 export function ReplyMessage({ Native, mirrors, toolboxT, ...props }) {
+ useLanguage();
  const root = useRef(null), [target, setTarget] = useState(null), [error, setError] = useState('');
  const [input, phase] = useReplyInput(props.sessionId, true);
  const quote = messageReply(props.node);
@@ -868,7 +806,7 @@ export function ReplyMessage({ Native, mirrors, toolboxT, ...props }) {
  const reply = () => {
   try {
    if (!replyAvailable || !input || !canWrite) throw new Error(text(toolboxT, 'reply.unavailable'));
-   insertReply(input, quote, `${label} · ${text(toolboxT, quote.role === 'user' ? 'reply.user' : 'reply.assistant')}`, replyCarets.get(input));
+   insertReply(input, quote, `${label} · ${text(toolboxT, quote.role === 'user' ? 'reply.user' : 'reply.assistant')}`, replyCarets.get(input), uiText);
    setError('');
   } catch (reason) { setError(reason.message); }
  };
@@ -915,6 +853,7 @@ const conversationExtrasStyle = `
 `;
 
 export function SentReplyCard({ node, t }) {
+ useLanguage();
  const [expanded, setExpanded] = useState(false);
  const quote = node.data;
  return <span data-toolbox-sent-reply className="sk-sent-quote" data-expanded={expanded}><style>{conversationExtrasStyle}</style>
@@ -928,6 +867,7 @@ function RestoreIcon() {
 
 const CHECKPOINT_CHANGED = 'dsh-session-toolbox:checkpoint-changed';
 export function MessageAction({ sessionId, node, canWrite, running, t }) {
+ useLanguage();
  const [status, setStatus] = useState(null), [error, setError] = useState(''), [busy, setBusy] = useState(false);
  const locked = useRef(false);
  useEffect(() => {
@@ -967,6 +907,7 @@ function DeleteIcon() {
  return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true"><path d="M2.5 4.5h11M6 4V2.5h4V4M4 4.5l.7 9h6.6l.7-9M6.5 6.5v5M9.5 6.5v5" strokeLinejoin="round" /></svg>;
 }
 export function DeleteMessageDialog({ request, close, t }) {
+ useLanguage();
  const [busy, setBusy] = useState(false), [error, setError] = useState('');
  const locked = useRef(false);
  const remove = async () => {
@@ -975,7 +916,7 @@ export function DeleteMessageDialog({ request, close, t }) {
   try {
    if (!replyWritable(request.sessionId)) throw new Error(text(t, 'reply.unavailable'));
    const result = await callHost({ type: 'message.delete', sessionId: request.sessionId, seq: request.seq });
-   if (!result.removedFromContext) throw new Error('宿主尚未确认移除上下文，请重试');
+   if (!result.removedFromContext) throw new Error(uiText('error.contextDelete'));
    publishDeleted(request.sessionId, result.seqs); close(); dispatchNotice(text(t, 'message.deleted'));
   } catch (reason) { setError(reason.message); }
   finally { locked.current = false; setBusy(false); }
@@ -988,6 +929,7 @@ export function DeleteMessageDialog({ request, close, t }) {
 }
 
 export function CheckpointDialog({ request, close, t }) {
+ useLanguage();
  const [preview, setPreview] = useState(null), [busy, setBusy] = useState(false), [error, setError] = useState(''), [done, setDone] = useState(false), [revision, setRevision] = useState(0);
  useEffect(() => {
   let live = true; setPreview(null); setError('');
@@ -1014,6 +956,7 @@ export function CheckpointDialog({ request, close, t }) {
 }
 
 export function SelectionReplyMenu({ t }) {
+ useLanguage();
  const [menu, setMenu] = useState(null), [error, setError] = useState('');
  const root = useRef(null);
  useEffect(() => {
@@ -1040,7 +983,7 @@ export function SelectionReplyMenu({ t }) {
   try {
    if (!available || !replyWritable(menu.sessionId) || !menu.surface.isConnected) throw new Error(text(t, 'reply.unavailable'));
    window.getSelection()?.removeAllRanges();
-   insertReply(input, { role: menu.role, text: menu.text }, text(t, 'reply.selection'), replyCarets.get(input));
+   insertReply(input, { role: menu.role, text: menu.text }, text(t, 'reply.selection'), replyCarets.get(input), uiText);
    setMenu(null);
   } catch (reason) { setError(reason.message); }
  };
@@ -1056,6 +999,7 @@ export function SelectionReplyMenu({ t }) {
  </div>, document.body);
 }
 export function ReplyPreview({ sessionId, t, renderFactorySlot }) {
+ useLanguage();
  const [input, snapshot] = useReplyInput(sessionId);
  const [error, setError] = useState(''), [target, setTarget] = useState(null), anchor = useRef(null);
  useEffect(() => {
@@ -1079,7 +1023,7 @@ export function ReplyPreview({ sessionId, t, renderFactorySlot }) {
   const observer = new MutationObserver(() => { if (find()) observer.disconnect(); }); observer.observe(surface, { childList: true, subtree: true });
   return () => observer.disconnect();
  }, [sessionId, Boolean(quotes.length)]);
- const cancel = occurrence => { try { input.setDraft(withoutReply(input.state.getSnapshot(), occurrence)); input.persistCurrentDraft?.(); input.focus?.(); setError(''); } catch (reason) { setError(reason.message); } };
+ const cancel = occurrence => { try { input.setDraft(withoutReply(input.state.getSnapshot(), occurrence, uiText)); input.persistCurrentDraft?.(); input.focus?.(); setError(''); } catch (reason) { setError(reason.message); } };
  return <><span hidden ref={anchor} />{quotes.length > 0 && target?.sessionId === sessionId && createPortal(<div className="sk-quote-list" data-toolbox-replies role="region" aria-label={text(t, 'reply.action')} onMouseDown={event => event.stopPropagation()}>
   <style>{conversationExtrasStyle}</style>{quotes.map(({ occurrence, quote }, index) => <div className="sk-quote-draft" data-toolbox-reply key={occurrence.occurrenceId ?? `${occurrence.offset}:${occurrence.ref}`}>
    <span className="sk-quote-mark"><QuoteIcon /></span>
@@ -1098,8 +1042,8 @@ function WorkspaceSection({ state, t }) {
   catch (reason) { setError(reason.message); }
   finally { await loadState(); setBusy(false); }
  };
- return <section className="box"><h3>项目分组与路径 / Projects</h3>
-  <p className="muted">{(state?.groups?.length ?? 0) + 1} 个分组（含未分组） · {state?.projects?.length ?? 0} 个项目。侧栏按分组展开项目，项目菜单可编辑名称、路径和分组。</p>
+ return <section className="box"><h3>{text(t, 'groups.pageTitle')}</h3>
+  <p className="muted">{text(t, 'groups.summary', { groups: (state?.groups?.length ?? 0) + 1, projects: state?.projects?.length ?? 0 })}</p>
   <div><Button variant="outline" onClick={() => showOverlay({ kind: 'groups' })}>{text(t, 'groups.manage')}</Button></div>
   {state?.workspaceMove && <p role="status">{text(t, 'project.pending')}<br /><span className="mono">{state.workspaceMove.fromCwd} → {state.workspaceMove.toCwd}</span><br />{state.workspaceMove.moved.length} / {state.workspaceMove.sessionIds.length} <Button variant="outline" disabled={busy} onClick={() => void resume()}>{text(t, busy ? 'common.busy' : 'project.resume')}</Button></p>}
   {error && <p className="error" role="alert">{error}</p>}

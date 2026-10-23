@@ -8,12 +8,38 @@ const count = value => Number.isSafeInteger(value) && value >= 0;
 // Provider errors may contain request bodies or URLs. Persist only a bounded
 // category, never the raw message, stack, response or conversation text.
 function failureReason(error) {
- const status = error?.status ?? error?.statusCode ?? error?.response?.status;
- if ([401, 403].includes(status)) return 'credentials';
- if (status === 429) return 'rate-limit';
+ const status = error?.status ?? error?.statusCode ?? error?.failure?.status ?? error?.response?.status;
+ const code = error?.code ?? error?.failure?.code;
+ if ([401, 403].includes(status) || ['AUTH', 'INVALID_CREDENTIAL', 'MISSING_API_KEY', 'NO_CREDENTIALS'].includes(code)) return 'credentials';
+ if (status === 429 || code === 'RATE_LIMIT') return 'rate-limit';
+ if (status === 404 || ['NO_ADAPTER', 'MODEL_NOT_FOUND', 'UNKNOWN_MODEL'].includes(code)) return 'model-unavailable';
  if (error?.code === 'invalid-candidates') return 'format';
  if (error?.code === 'output-limit') return 'output-limit';
  return 'model-call';
+}
+
+function abortable(pending, signal) {
+ return new Promise((resolve, reject) => {
+  const abort = () => reject(signal.reason);
+  if (signal.aborted) abort();
+  else signal.addEventListener('abort', abort, { once: true });
+  Promise.resolve(pending).then(value => { signal.removeEventListener('abort', abort); resolve(value); }, error => { signal.removeEventListener('abort', abort); reject(error); });
+ });
+}
+
+async function* boundedStream(stream, signal) {
+ const iterator = stream[Symbol.asyncIterator]();
+ try {
+  while (true) {
+   signal.throwIfAborted();
+   const { value, done } = await abortable(iterator.next(), signal);
+   if (done) return;
+   yield value;
+  }
+ } finally {
+  // An adapter that ignores abort must not hold our queue during cleanup.
+  try { void Promise.resolve(iterator.return?.()).catch(() => {}); } catch { /* best effort */ }
+ }
 }
 
 /** DSH reports uncached input separately from cache reads/writes; reasoning is part of output. */
@@ -93,6 +119,7 @@ export class NextTasks {
  constructor({ root, settings, llm, sessions = () => undefined, busy = () => false, now = () => new Date(), timeoutMs = 45000 }) {
   this.settings = settings; this.llm = llm; this.sessions = sessions; this.busy = busy; this.now = now; this.timeoutMs = timeoutMs;
   this.configuredEnabled = this.enabled();
+  this.configuredRoute = this.routeKey();
   this.doc = new JsonDocument(root, 'next-task-usage.json', { version: 1, totals: emptyTotals(), models: [], days: [], recent: [] });
   this.cache = new JsonDocument(root, 'next-task-candidates.json', { version: 1, items: [] });
   this.cacheTail = Promise.resolve();
@@ -100,10 +127,28 @@ export class NextTasks {
  }
  available() { return typeof this.llm()?.prepareCall === 'function'; }
  enabled() { return this.settings()?.nextTasks?.enabled !== false; }
+ routeKey() { const config = this.settings()?.nextTasks; return JSON.stringify([config?.provider || '', config?.model || '']); }
+ /** Advisory catalog only: no preparation, credentials or paid model requests. */
+ async catalog(provider = '') {
+  const result = { providers: [], models: [] }; let timer;
+  const entries = rows => rows.filter(row => typeof row?.id === 'string' && typeof row?.name === 'string').map(({ id, name }) => ({ id, name }));
+  try {
+   const llm = this.llm();
+   if (typeof llm?.listProviders !== 'function' || provider && typeof llm.listModels !== 'function') return { ...result, reason: 'model-catalog' };
+   result.providers = entries(llm.listProviders());
+   if (provider) result.models = entries(await Promise.race([
+    llm.listModels(provider),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('catalog timeout')), 5000); timer.unref?.(); }),
+   ]));
+   return result;
+  } catch { return { ...result, reason: 'model-catalog' }; }
+  finally { clearTimeout(timer); }
+ }
  /** Restore only completed, recent results; never reissue a paid request. */
  async restore() {
   const value = await this.cache.read(), now = this.now().getTime();
   if (value.version !== 1 || !Array.isArray(value.items)) throw new Error('Invalid next-task candidate cache');
+  if ((value.route ?? JSON.stringify(['', ''])) !== this.routeKey()) return;
   for (const row of value.items.slice(-100)) {
    if (!this.enabled() && row?.manual !== true) continue;
    const age = now - Date.parse(row?.updatedAt);
@@ -113,13 +158,15 @@ export class NextTasks {
  }
  save() {
   const items = [...this.states].filter(([,row]) => row.status === 'ready').slice(-100).map(([sessionId,row]) => ({ sessionId, seq: row.seq, candidates: row.candidates, updatedAt: row.updatedAt, ...(row.manual ? { manual: true } : {}) }));
-  const pending = this.cacheTail.then(() => this.cache.write({ version: 1, items }));
+  const route = this.routeKey();
+  const pending = this.cacheTail.then(() => this.cache.write({ version: 1, route, items }));
   this.cacheTail = pending.catch(() => {}); return pending;
  }
  invalidate(id) { clearTimeout(this.timers.get(id)); this.timers.delete(id); this.jobs.get(id)?.abort(); if (this.states.delete(id)) void this.save().catch(() => {}); }
  configure() {
   const enabled = this.enabled(), changed = enabled !== this.configuredEnabled; this.configuredEnabled = enabled;
-  if (!enabled && changed) { for (const id of new Set([...this.jobs.keys(), ...this.timers.keys()])) this.invalidate(id); this.states.clear(); void this.save().catch(() => {}); }
+  const route = this.routeKey(), routeChanged = route !== this.configuredRoute; this.configuredRoute = route;
+  if (!enabled && changed || routeChanged) { for (const id of new Set([...this.jobs.keys(), ...this.timers.keys()])) this.invalidate(id); this.states.clear(); void this.save().catch(() => {}); }
  }
  state(id) {
   if (!this.enabled() && !this.states.get(id)?.manual) return { status: 'disabled', candidates: [] };
@@ -203,21 +250,24 @@ export class NextTasks {
   return pending;
  }
  async generate(session, task, controller) {
-  const input = nextTaskContext(session, 12000 - Buffer.byteLength(SYSTEM)), route = session.requestHeader?.()?.config;
+  const config = this.settings()?.nextTasks;
+  const customModel = Boolean(config?.provider || config?.model);
+  const input = nextTaskContext(session, 12000 - Buffer.byteLength(SYSTEM)), route = customModel ? config : session.requestHeader?.()?.config;
+  if (customModel) task.customModel = true;
   if (!input || !route?.provider || !route?.model) { Object.assign(task, { status: 'unavailable', reason: input ? 'model-unconfigured' : 'context' }); return; }
-  const row = { id: randomUUID(), startedAt: this.now().toISOString(), provider: route.provider, model: route.model, status: 'pending', dispatched: false, usage: null };
-  let timer, usage;
+  const row = { id: randomUUID(), startedAt: this.now().toISOString(), provider: route.provider, model: route.model, ...(customModel ? { customModel: true } : {}), status: 'pending', dispatched: false, usage: null };
+  let timer, usage, timedOut = false;
   try {
    await this.record(row, true);
-   timer = setTimeout(() => controller.abort(), this.timeoutMs); timer.unref?.();
+   timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.timeoutMs); timer.unref?.();
    const signal = controller.signal; signal.throwIfAborted();
-   const call = await this.llm().prepareCall({ provider: route.provider, model: route.model, maxTokens: 600 }, signal,
-    (controls, model) => ({ ...controls, ...(model.reasoning?.efforts?.[0]?.id === undefined ? {} : { reasoningEffort: model.reasoning.efforts[0].id }) }));
+   const call = await abortable(this.llm().prepareCall({ provider: route.provider, model: route.model, maxTokens: 600 }, signal,
+    (controls, model) => ({ ...controls, ...(model.reasoning?.efforts?.[0]?.id === undefined ? {} : { reasoningEffort: model.reasoning.efforts[0].id }) })), signal);
    signal.throwIfAborted();
    const messages = [{ id: randomUUID(), role: 'user', content: [{ type: 'text', text: input }], source: { kind: 'dsh-session-toolbox-next-tasks' } }];
    row.dispatched = true;
    const blocks = new Map(); let finish;
-   for await (const chunk of call.stream({ ...call.config, system: SYSTEM, messages, sessionId: session.id, purpose: 'session-toolbox-next-tasks', signal })) {
+   for await (const chunk of boundedStream(call.stream({ ...call.config, system: SYSTEM, messages, sessionId: session.id, purpose: 'session-toolbox-next-tasks', signal }), signal)) {
     if (chunk.type === 'usage') usage = chunk.usage;
     signal.throwIfAborted();
     if (chunk.type === 'text-delta') blocks.set(chunk.index, (blocks.get(chunk.index) ?? '') + chunk.text);
@@ -225,7 +275,7 @@ export class NextTasks {
     if (chunk.type === 'finish') finish = chunk.reason;
    }
    signal.throwIfAborted();
-   if (finish?.kind !== 'stop') throw Object.assign(new Error('候选生成未完成'), { code: finish?.kind === 'max-tokens' ? 'output-limit' : 'incomplete' });
+   if (finish?.kind !== 'stop') throw finish?.failure ?? Object.assign(new Error('候选生成未完成'), { code: finish?.kind === 'max-tokens' ? 'output-limit' : 'incomplete' });
    const candidates = parseNextTasks([...blocks.values()].join(''));
    row.status = 'completed';
    if (this.states.get(session.id) === task && (this.enabled() || task.manual)) {
@@ -233,8 +283,8 @@ export class NextTasks {
     await this.save().catch(() => {});
    }
   } catch (error) {
-   row.status = controller.signal.aborted ? 'cancelled' : 'failed';
-   row.reason = controller.signal.aborted ? 'cancelled' : failureReason(error);
+   row.status = timedOut ? 'failed' : controller.signal.aborted ? 'cancelled' : 'failed';
+   row.reason = timedOut ? 'timeout' : controller.signal.aborted ? 'cancelled' : failureReason(error);
    if (this.states.get(session.id) === task) Object.assign(task, { status: row.status, reason: row.reason, candidates: [] });
   } finally {
    clearTimeout(timer); row.finishedAt = this.now().toISOString(); row.usage = normalizeNextTaskUsage(usage);

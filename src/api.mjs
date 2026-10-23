@@ -64,6 +64,7 @@ export async function dispatch(kit, input) {
 		throw Object.assign(new Error('会话迁移功能已停用'), { code: 'feature-disabled' });
 	}
 	switch (input.type) {
+		case 'nextTasks.models': return kit.nextTasks.catalog(String(input.provider ?? ''));
 		case 'nextTasks.get': return kit.nextTasks.state(String(input.sessionId ?? ''));
 		case 'nextTasks.generate': return kit.nextTasks.request(String(input.sessionId ?? ''), input.seq);
 		case 'message.list': return kit.messages.list(String(input.sessionId ?? ''));

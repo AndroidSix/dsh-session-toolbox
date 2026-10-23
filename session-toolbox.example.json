@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "language": "auto",
   "draftVault": {
     "enabled": true,
     "maxSizeBytes": 209715200,
@@ -13,6 +14,8 @@
     "enabled": true
   },
   "nextTasks": {
-    "enabled": true
+    "enabled": true,
+    "provider": "",
+    "model": ""
   }
 }

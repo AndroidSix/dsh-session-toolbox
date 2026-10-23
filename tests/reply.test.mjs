@@ -1,5 +1,11 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 const module=()=>import('../src/reply.mjs');
+test('quote errors honor the plugin language without changing quote data', async () => {
+ const { insertReply } = await module();
+ const { translate } = await import('../src/locale.mjs');
+ const input = { state: { getSnapshot: () => ({ phase: 'running' }) } };
+ assert.throws(() => insertReply(input, { role: 'user', text: '原文' }, 'Quote', undefined, (key, values) => translate('en', key, values)), /Wait for the chat composer/);
+});
 test('the final quote still renders when native sending trims its trailing blank lines', async () => {
  const { quoteText, replyTextRule } = await module();
  const first = { role: 'user', text: '第一条' }, last = { role: 'assistant', text: '最后一条\n第二行' };
@@ -62,7 +68,7 @@ test('cancelling one quote keeps identical quotes, text and file references acro
  const shifted={draft:'prefix '+snapshot.draft,occurrences:snapshot.occurrences.map(row=>({...row,offset:row.offset+7}))};
  assert.equal(withoutReply(shifted,target).text,'prefix '+a.text);
  const gone=withoutReply(shifted,{...target,occurrenceId:999});assert.equal(gone.text,shifted.draft);assert.equal(gone.references.length,3);
- const corrupt={...snapshot,draft:'broken'+snapshot.draft.slice(6)};assert.throws(()=>withoutReply(corrupt,quotes[0]),/no longer matches/);
+ const corrupt={...snapshot,draft:'broken'+snapshot.draft.slice(6)};assert.throws(()=>withoutReply(corrupt,quotes[0]),/不再匹配/);
 });
 test('multiple quoted messages survive serialization and render as separate cards around draft text',async()=>{
  const {withReply,replySource,replyTextRule,REPLY_SOURCE}=await module();

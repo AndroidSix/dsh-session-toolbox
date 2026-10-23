@@ -129,7 +129,9 @@ CLI 写入 `~/.dsh/storages/workspace.json` 的离线镜像。`status` 可能含
 
 ## 后续任务联想（0.1.32）
 
-`next-tasks.mjs` 监听新增 `session/event` 的正常 `turn/end`，延迟等待轮次空闲，逐个独立调用公开 `llm.prepareCall` / `stream`。使用该 Session 最近的 `requestHeader().config` 路由和最低支持的 reasoning effort，标记独立 `purpose`，不带工具，不 append 聊天事件。canonical `deriveMessages()` 的最近 6 条用户/助手文字受 12 KB 限制，替换删除已生效的原文不会进入候选请求。输出不超过 600 token，解析文字中的单份 JSON 字符串数组，兼容说明、JSON 围栏及四种候选字段包装，最多 3 条。新消息/轮次、关闭设置、Session disposal 及 HMR 会取消旧任务；读接口只读取，不产生收费调用。
+`next-tasks.mjs` 监听新增 `session/event` 的正常 `turn/end`，延迟等待轮次空闲，逐个独立调用公开 `llm.prepareCall` / `stream`。默认使用该 Session 最近的 `requestHeader().config` 路由；0.1.47 起可用 `nextTasks.provider/model` 成对覆盖，只影响辅助调用，不改变会话配置，指定失败不回落。使用最低支持的 reasoning effort，标记独立 `purpose`，不带工具，不 append 聊天事件。canonical `deriveMessages()` 的最近 6 条用户/助手文字受 12 KB 限制，替换删除已生效的原文不会进入候选请求。输出不超过 600 token，解析文字中的单份 JSON 字符串数组，兼容说明、JSON 围栏及四种候选字段包装，最多 3 条。新消息/轮次、关闭设置、模型路由变更、Session disposal 及 HMR 会取消旧任务；读接口只读取，不产生收费调用。
+
+`nextTasks.models` 只读取公开 `llm.listProviders/listModels`，仅返回 ID/名称，目录读取最多等待 5 秒，不调用 `prepareCall`。模型目录是建议列表，不以目录成员资格拒绝手填 ID。联想配置损坏时禁用模型接口，不用默认路由掩盖配置失败。`locale.mjs` 集中保存中英文词典和占位符插值；插件 `language` 默认 `auto`，只读订阅宿主 locale 的 `getSnapshot/subscribe`，显式 `zh/en` 仅覆盖插件，不调用宿主 `setLocale`。
 
 独立 `next-task-usage.json` 在调用前原子记录请求，结束时按最新 provider usage 结算累计、模型及 UTC 日统计；缓存桶与未缓存输入分开，reasoning 已包含在 output。没有完整 usage 的已发出请求列为 unreported，异常中断留下的 pending 从累计已结算次数差额计算，避免伪造精确总数。保留最近 200 次请求元数据、90 天日统计；不持久化提示词、模型回复或聊天正文。主会话的消息用量投影不会收到此辅助请求的事件。
 

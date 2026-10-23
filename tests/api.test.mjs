@@ -37,6 +37,11 @@ test('manual suggestion dispatch forwards the selected turn without exposing gen
  assert.equal(result.status, 'generating'); assert.deepEqual(calls, [{ id: 's', seq: 12 }]);
 });
 
+test('model catalog dispatch forwards the provider without generating suggestions', async () => {
+ const kit = { nextTasks: { catalog: async provider => ({ provider, models: [] }), request() { assert.fail('catalog must not generate'); } } };
+ assert.deepEqual(await dispatch(kit, { type: 'nextTasks.models', provider: 'local' }), { provider: 'local', models: [] });
+});
+
 test('GET serves the snapshot and the write key only to loopback', async () => {
 	const kit = kitDouble();
 	const handler = apiHandler(kit);

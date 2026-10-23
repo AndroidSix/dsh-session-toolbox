@@ -1,3 +1,6 @@
+import { translate } from './locale.mjs';
+const defaultText = (key, values) => translate('zh', key, values);
+
 export const REPLY_SOURCE = 'dsh-session-toolbox.reply';
 export const REPLY_TEXT_NODE = 'dsh-session-toolbox.quote';
 /** Recognize only the exact quote envelope emitted by our serializer. */
@@ -45,21 +48,21 @@ export function replySource() {
   codec: { clipboardText: ref => quoteText(readReply(ref)), serialize: async ref => quoteText(readReply(ref)) } };
 }
 const referenceFields = ({ source, ref, offset, length, label, clipboardText, appearance, invalid }) => ({ source, ref, offset, length, label, clipboardText, ...(appearance === undefined ? {} : { appearance }), ...(invalid === undefined ? {} : { invalid }) });
-export function withoutReply(snapshot, occurrence) {
+export function withoutReply(snapshot, occurrence, t = defaultText) {
  let text = snapshot.draft ?? '';
  const removed = (snapshot.occurrences ?? []).filter(row => row.source === REPLY_SOURCE && (!occurrence || (occurrence.occurrenceId !== undefined ? row.occurrenceId === occurrence.occurrenceId : row.offset === occurrence.offset && row.ref === occurrence.ref)));
  let references = (snapshot.occurrences ?? []).map(referenceFields);
  for (const quote of removed.sort((a,b) => b.offset-a.offset)) {
   const end = quote.offset + quote.length;
   // Never delete user text if a future host no longer publishes matching spans.
-  if (text.slice(quote.offset, end) !== quote.clipboardText) throw new Error('Message quote no longer matches the draft');
+  if (text.slice(quote.offset, end) !== quote.clipboardText) throw new Error(t('reply.mismatch'));
   text = text.slice(0, quote.offset) + text.slice(end);
   references = references.filter(row => row.offset !== quote.offset || row.source !== REPLY_SOURCE).map(row => row.offset >= end ? { ...row, offset: row.offset - quote.length } : row);
  }
  return { text, references };
 }
-export function withReply(snapshot, quote, label, offset = 0) {
- if (snapshot.phase !== 'plain') throw new Error('请等待输入框就绪后再引用 / Wait until the composer is ready');
+export function withReply(snapshot, quote, label, offset = 0, t = defaultText) {
+ if (snapshot.phase !== 'plain') throw new Error(t('input.notReady'));
  const ref = JSON.stringify({ version: 1, ...quote });
  const content = quoteText(readReply(ref)), draft = { text: snapshot.draft ?? '', references: (snapshot.occurrences ?? []).map(referenceFields) };
  const at = Math.max(0, Math.min(offset, draft.text.length));
@@ -67,17 +70,17 @@ export function withReply(snapshot, quote, label, offset = 0) {
 }
 /** Insert through the native chip API so its caret follows the insertion, not the draft end.
  * Native detect coordinates count every reference chip as one character. */
-export function insertReply(input, quote, label, savedSpan) {
+export function insertReply(input, quote, label, savedSpan, t = defaultText) {
  const snapshot = input.state.getSnapshot();
- if (snapshot.phase !== 'plain') throw new Error('请等待输入框就绪后再引用 / Wait until the composer is ready');
+ if (snapshot.phase !== 'plain') throw new Error(t('input.notReady'));
  if (typeof input.insertReference !== 'function') {
-  input.setDraft(withReply(snapshot, quote, label, (snapshot.draft ?? '').length));
+  input.setDraft(withReply(snapshot, quote, label, (snapshot.draft ?? '').length, t));
  } else {
   const occurrences = [...(snapshot.occurrences ?? [])].sort((a,b) => a.offset-b.offset);
   const end = (snapshot.draft ?? '').length - occurrences.reduce((sum,row) => sum + row.length - 1, 0);
   const at = savedSpan?.draftRev === snapshot.draftRev ? Math.max(0, Math.min(savedSpan.end, end)) : end;
   const ref = JSON.stringify({ version: 1, ...quote }), clipboardText = quoteText(readReply(ref));
-  if (!input.insertReference({ source: REPLY_SOURCE, ref, label, appearance: 'session', clipboardText }, { start: at, end: at, draftRev: input.state.getSnapshot().draftRev })) throw new Error('引用位置已变化，请重试');
+  if (!input.insertReference({ source: REPLY_SOURCE, ref, label, appearance: 'session', clipboardText }, { start: at, end: at, draftRev: input.state.getSnapshot().draftRev })) throw new Error(t('reply.changed'));
  }
  input.persistCurrentDraft?.(); input.focus?.();
 }

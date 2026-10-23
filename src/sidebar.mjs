@@ -1,4 +1,5 @@
 import { orderedGroups, UNGROUPED } from './group-order.mjs';
+import { translate } from './locale.mjs';
 
 /** Restrict both projections: otherwise filtered projects leak into native "ungrouped". */
 export function filterSidebar(workspaces, sessions, groups, selected) {
@@ -78,7 +79,7 @@ export function groupOrderDrag({ read, move, preview, report }) {
 const SESSION_DRAG = 'application/x-dsh-toolbox-session';
 /** Extend native session sorting with project-header drops. Keep native dragend
  * cleanup, but suppress its last hovered insertion marker after a project drop. */
-export function sessionProjectDrag({ read, move, report }) {
+export function sessionProjectDrag({ read, move, report, t = (key, values) => translate('zh', key, values) }) {
  let sessionId, highlighted, resetTimer, consumed = false, moving = false;
  const clear = () => { highlighted?.removeAttribute('data-toolbox-session-drop'); highlighted = undefined; };
  const projectRow = event => event.target.closest?.('[data-row-key^="workspace:"]');
@@ -126,7 +127,7 @@ export function sessionProjectDrag({ read, move, report }) {
    moving = true; report({ busy: true, message: '' });
    try {
     const result = await move({ type: 'move', sessionId: id, toCwd: project.path, createTarget: false });
-    report({ busy: false, message: result?.deferred ? '文件已迁移，但项目账本尚未完成；请在工具箱点击完成或回滚' : `已切换到项目「${project.title}」`, error: false });
+    report({ busy: false, message: result?.deferred ? t('move.deferred') : t('move.switched', { title: project.title }), error: false });
    } catch (error) { report({ busy: false, message: error.message, error: true }); }
    finally { moving = false; }
   },

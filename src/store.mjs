@@ -10,6 +10,7 @@ import { writeFileAtomic, withFileLock } from '@deepseek-ai/dsh-atomic-write';
 
 export const DEFAULT_SETTINGS = Object.freeze({
 	version: 1,
+	language: 'auto',
 	draftVault: { enabled: true, maxSizeBytes: 200 * 1024 * 1024, ttlDays: 7 },
 	trash: { ttlDays: 30, autoPurge: false },
 	move: { enabled: true },
@@ -21,6 +22,7 @@ const OWNED = { mode: 0o600, dirMode: 0o700 };
 function mergeSettings(raw) {
 	return {
 		version: 1,
+		language: raw.language ?? DEFAULT_SETTINGS.language,
 		draftVault: { ...DEFAULT_SETTINGS.draftVault, ...(raw.draftVault ?? {}) },
 		trash: { ...DEFAULT_SETTINGS.trash, ...(raw.trash ?? {}) },
 		move: { ...DEFAULT_SETTINGS.move, ...(raw.move ?? {}) },
@@ -76,8 +78,17 @@ export class JsonDocument {
 
 export function guardSettings(value, file) {
 	if (value.version !== undefined && value.version !== 1) throw new Error(`session-toolbox: unsupported settings version in ${file}: ${String(value.version)}`);
+	if (value.language !== undefined && !['auto', 'zh', 'en'].includes(value.language)) throw new Error(`session-toolbox: settings.language must be auto, zh or en (${file})`);
 	if (value.move?.enabled !== undefined && typeof value.move.enabled !== 'boolean') throw new Error(`session-toolbox: settings.move.enabled must be boolean (${file})`);
 	if (value.nextTasks?.enabled !== undefined && typeof value.nextTasks.enabled !== 'boolean') throw new Error(`session-toolbox: settings.nextTasks.enabled must be boolean (${file})`);
+	if (value.nextTasks !== undefined && (value.nextTasks === null || typeof value.nextTasks !== 'object' || Array.isArray(value.nextTasks))) throw new Error(`session-toolbox: settings.nextTasks must be an object (${file})`);
+	const nextTasks = { ...value.nextTasks };
+	for (const key of ['provider', 'model']) {
+		if (nextTasks[key] === undefined) continue;
+		if (typeof nextTasks[key] !== 'string' || nextTasks[key].length > 256 || /[\u0000-\u001f\u007f]/.test(nextTasks[key])) throw new Error(`session-toolbox: settings.nextTasks.${key} must be a string of at most 256 characters without control characters (${file})`);
+		nextTasks[key] = nextTasks[key].trim();
+	}
+	if (Boolean(nextTasks.provider) !== Boolean(nextTasks.model)) throw new Error(`session-toolbox: settings.nextTasks.provider and model must be configured together (${file})`);
 	const draft = value.draftVault ?? {};
 	if (draft.enabled !== undefined && typeof draft.enabled !== 'boolean') throw new Error(`session-toolbox: settings.draftVault.enabled must be boolean (${file})`);
 	if (draft.maxSizeBytes !== undefined && !positiveInt(draft.maxSizeBytes)) throw new Error(`session-toolbox: settings.draftVault.maxSizeBytes must be a positive safe integer (${file})`);
@@ -85,7 +96,7 @@ export function guardSettings(value, file) {
 	const trash = value.trash ?? {};
 	if (trash.ttlDays !== undefined && !positiveInt(trash.ttlDays)) throw new Error(`session-toolbox: settings.trash.ttlDays must be a positive integer (${file})`);
 	if (trash.autoPurge !== undefined && typeof trash.autoPurge !== 'boolean') throw new Error(`session-toolbox: settings.trash.autoPurge must be boolean (${file})`);
-	return mergeSettings(value);
+	return mergeSettings({ ...value, nextTasks });
 }
 
 export function guardJournal(value, file) {

@@ -84,7 +84,8 @@ async function applyInner(ctx, options = {}) {
 	const groupsDoc = new JsonDocument(root, 'groups.json', { version: 1, groups: [] }, guardGroups);
 	const workspaceJournalDoc = new JsonDocument(root, 'workspace-journal.json', { version: 1, active: null }, guardWorkspaceJournal);
 
-	let settingsCache = await settingsDoc.read().catch(() => ({ trash: {}, draftVault: {} }));
+	let settingsReadable = true;
+	let settingsCache = await settingsDoc.read().catch(() => { settingsReadable = false; return { trash: {}, draftVault: {}, nextTasks: { enabled: false } }; });
 	let journalCache = null;
 	try { journalCache = (await journalDoc.read()).active; }
 	catch (error) { ctx.logger?.warn?.(`session-toolbox: journal unreadable — ${error.message}`); }
@@ -119,7 +120,7 @@ async function applyInner(ctx, options = {}) {
 		if (await hostCapabilities(ctx).sessionLive(sessionId)) return true;
 		return !messageIdle(sessionId);
 	} });
-	const nextTasks = new NextTasks({ root, settings: () => settingsCache, llm: () => ctx.get('llm'), sessions: () => ctx.get('sessions'), busy: id => !messageIdle(id) });
+	const nextTasks = new NextTasks({ root, settings: () => settingsCache, llm: () => settingsReadable ? ctx.get('llm') : undefined, sessions: () => ctx.get('sessions'), busy: id => !messageIdle(id) });
 	await nextTasks.restore().catch(error => ctx.logger.warn(`任务联想缓存恢复失败：${error.message}`));
 	installNextTasks(ctx, nextTasks);
 	const trash = new TrashEngine({
@@ -164,6 +165,7 @@ async function applyInner(ctx, options = {}) {
 		updateSettings: async patch => {
 			const next = await settingsDoc.update(current => deepMerge(current, patch));
 			settingsCache = next;
+			settingsReadable = true;
 			nextTasks.configure();
 			return next;
 		},
@@ -181,6 +183,8 @@ async function applyInner(ctx, options = {}) {
 		state: async () => {
 			const settings = await settingsDoc.read();
 			settingsCache = settings;
+			settingsReadable = true;
+			nextTasks.configure();
 			const journal = (await journalDoc.read().catch(() => ({ active: journalCache }))).active;
 			journalCache = journal;
 			const manifest = await manifestDoc.read();
@@ -215,7 +219,7 @@ async function applyInner(ctx, options = {}) {
 		},
 		action: input => {
 			const result = pendingAction.then(async () => {
-				if (!['nextTasks.get', 'nextTasks.generate', 'workspace.complete', 'project.of', 'trash.list', 'vault.sync', 'vault.sweep', 'settings.update'].includes(input.type)) await workspace.assertIdle();
+				if (!['nextTasks.get', 'nextTasks.models', 'nextTasks.generate', 'workspace.complete', 'project.of', 'trash.list', 'vault.sync', 'vault.sweep', 'settings.update'].includes(input.type)) await workspace.assertIdle();
 				return dispatch(kit, input);
 			});
 			pendingAction = result.catch(() => {});

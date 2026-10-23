@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import pkg from '../package.json' with { type: 'json' };
+import { translate } from '../src/locale.mjs';
 
 async function client() {
 	let entry;
@@ -12,7 +13,7 @@ async function client() {
 	const events = new Map();
 	const render = (type, props) => ({ type, props });
 	const native = Object.fromEntries(['MenuItemButton', 'Modal', 'Button', 'IconFolderOpenOutlineRegular', 'IconArchiveOutlineRegular'].map(name => [name, name]));
-	const react = { useState: initial => { const value = values.length ? values.shift() : typeof initial === 'function' ? initial() : initial; initialized.push(value); return [value, value => updates.push(value)]; }, useRef: value => ({ current: value }), useEffect: (run, deps) => effects.push({ run, deps }), useMemo: fn => fn() };
+	const react = { useState: initial => { const value = values.length ? values.shift() : typeof initial === 'function' ? initial() : initial; initialized.push(value); return [value, value => updates.push(value)]; }, useRef: value => ({ current: value }), useEffect: (run, deps) => effects.push({ run, deps }), useMemo: fn => fn(), useSyncExternalStore: (_subscribe, read) => read() };
 	const sandbox = vm.createContext({ console, setTimeout: (run, delay) => { const id = ++timerId; timers.set(id, { run, at: clock + delay }); return id; }, clearTimeout: id => timers.delete(id), setInterval: () => 0, clearInterval() {},
 		CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } },
 		window: { __ModuleLoader__: { load: value => { entry = value; } }, dispatchEvent(event) { events.get(event.type)?.(event); }, addEventListener: (type, listener) => events.set(type, listener), removeEventListener() {} },
@@ -125,6 +126,55 @@ function find(node, predicate) {
 	if (predicate(node)) return node;
 	for (const child of [node.props?.children, node.props?.footer].flat(Infinity)) { const result = find(child, predicate); if (result) return result; }
 }
+
+test('plugin language follows the live DSH locale unless explicitly overridden, without changing DSH', async () => {
+ const c = await client(); let hostLanguage = 'en', listener, language = 'auto';
+ const actions = [];
+ c.plugin.apply({ get() {}, effect: fn => fn(), slots: { inject() {} }, locale: {
+  register() {}, getSnapshot: () => ({ active: hostLanguage }), subscribe: callback => { listener = callback; return () => {}; },
+  setLocale() { assert.fail('plugin preferences must never change the DSH language'); },
+ } });
+ c.fetch(async (_url, options) => {
+  if (options?.body) { const action = JSON.parse(options.body); actions.push(action); language = action.patch.language; }
+  return { ok: true, status: 200, text: async () => JSON.stringify({ key: 'k', settings: { language }, projects: [] }) };
+ });
+ await c.plugin.loadState();
+ let page = c.plugin.KitPage();
+ assert.equal(find(page, node => node.type === 'h2').props.children, 'Session Toolbox');
+ assert.equal(find(page, node => node.type === 'select' && node.props['aria-label'] === 'Interface language').props.value, 'auto');
+ hostLanguage = 'zh'; listener(); page = c.plugin.KitPage();
+ assert.equal(find(page, node => node.type === 'h2').props.children, '会话工具箱');
+ const selector = find(page, node => node.type === 'select' && node.props['aria-label'] === '界面语言');
+ selector.props.onChange({ target: { value: 'en' } }); await new Promise(resolve => setImmediate(resolve));
+ assert.equal(actions[0].type, 'settings.update'); assert.equal(actions[0].patch.language, 'en');
+ page = c.plugin.KitPage(); assert.equal(find(page, node => node.type === 'h2').props.children, 'Session Toolbox');
+ assert.equal(hostLanguage, 'zh');
+});
+
+test('model settings save a trimmed paired route, reset to following and reject partial routes', async () => {
+ const c = await client(), actions = [], settings = { provider: 'old', model: 'large' };
+ const render = draft => { c.states([draft, { providers: [], models: [], loading: false }, '']); return c.plugin.NextTaskModelSettings({ settings, act: async action => actions.push(action), readCatalog: async () => ({}), t: key => translate('en', key) }); };
+ const submit = async tree => { tree.props.onSubmit({ preventDefault() {} }); await new Promise(resolve => setImmediate(resolve)); };
+ await submit(render({ custom: true, provider: ' local ', model: ' small ' }));
+ assert.deepEqual(JSON.parse(JSON.stringify(actions[0])), { type: 'settings.update', patch: { nextTasks: { provider: 'local', model: 'small' } } });
+ await submit(render({ custom: false, provider: 'old', model: 'large' }));
+ assert.equal(actions[1].patch.nextTasks.provider, ''); assert.equal(actions[1].patch.nextTasks.model, '');
+ const invalid = render({ custom: true, provider: 'local', model: '' });
+ assert.equal(find(invalid, node => node.type === 'button' && node.props.type === 'submit').props.disabled, true);
+ await submit(invalid); assert.equal(actions.length, 2);
+ assert(c.updates.includes('Enter both a provider ID and a model ID.'));
+});
+
+test('model catalog reads are debounced, never generate suggestions and discard obsolete results', async () => {
+ const c = await client(), reads = []; let release;
+ c.states([{ custom: true, provider: 'local', model: '' }, { providers: [], models: [], loading: false }, '']);
+ c.plugin.NextTaskModelSettings({ settings: {}, act: () => assert.fail('catalog must not save settings'), readCatalog: provider => { reads.push(provider); return new Promise(resolve => { release = resolve; }); }, t: key => translate('en', key) });
+ const effect = c.effects.find(effect => effect.deps?.[0] === true);
+ const cleanup = effect.run(); assert.equal(reads.length, 0); c.tick(250); assert.deepEqual(reads, ['local']);
+ cleanup(); const before = c.updates.length;
+ release({ providers: [], models: [{ id: 'old', name: 'Old' }] }); await new Promise(resolve => setImmediate(resolve));
+ assert.equal(c.updates.length, before, 'an obsolete provider catalog must not overwrite current choices');
+});
 
 test('empty checkpoint uses an edit icon, changes keep restore, and action is checked again on click', async () => {
  const c = await client(); let latest = { action: 'edit', tracked: true };

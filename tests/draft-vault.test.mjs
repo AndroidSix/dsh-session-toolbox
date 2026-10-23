@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createVault as createVaultImpl, isImageFile, contentHash, MAX_FILE_BYTES, DEFAULT_LIMITS } from '../src/draft-vault.js';
+import { translate } from '../src/locale.mjs';
 
 const vaults = [];
 function createVault(options) { const vault = createVaultImpl(options); vaults.push(vault); return vault; }
@@ -150,6 +151,15 @@ test('capture listeners register at document level; intake persists to IndexedDB
 	assert.equal(records[0].sessionId, 'session-aaaa');
 	assert.equal(records[0].blob instanceof File, true);
 	vault.stop();
+});
+
+test('draft notices use the live plugin language without changing saved records', async () => {
+ browser(makeEditor()); let language = 'en';
+ const vault = createVault({ t: (key, values) => translate(language, key, values), fetchImpl: async () => Response.json({ settings: {}, key: 'k' }) });
+ await vault.start(); await vault.intake('session-aaaa', [pngFile()]);
+ assert.match(vault.lastNotice, /Backed up 1/);
+ language = 'zh'; assert.match(vault.lastNotice, /已备份 1/);
+ assert.equal((await vault.records()).length, 1);
 });
 
 test('seedSession replays a synthetic ClipboardEvent the official handler accepts', async () => {
@@ -378,11 +388,16 @@ test('native removal retires only the removed image and failed-send restoration 
 	const b = { id: 'b', kind: 'image', file: pngFile('b.png', 2048) };
 	const vault = createVault({ getInput: () => input, fetchImpl: async () => Response.json({ key: 'k' }) });
 	await vault.start({ limits: {} });
-	input.set([a, b]); await settle();
-	input.set([b]); await settle();
+	const waitForCount = async expected => {
+		const deadline = Date.now() + 1000;
+		while (await vault.countFor('session-aaaa') !== expected && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
+		assert.equal(await vault.countFor('session-aaaa'), expected);
+	};
+	input.set([a, b]); await waitForCount(2);
+	input.set([b]); await waitForCount(1);
 	assert.equal(await vault.countFor('session-aaaa'), 1);
-	input.set([]); await settle();
-	input.set([b]); await settle(); // native failed-send path restores its rail
+	input.set([]); await waitForCount(0);
+	input.set([b]); await waitForCount(1); // native failed-send path restores its rail
 	assert.equal(await vault.countFor('session-aaaa'), 1);
 });
 

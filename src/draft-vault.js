@@ -8,6 +8,8 @@
  * late. No host attachment registry or input method is patched.
  */
 
+import { translate } from './locale.mjs';
+
 export const DB_NAME = 'dsh-session-toolbox-vault';
 export const STORE = 'blobs';
 export const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
@@ -89,13 +91,14 @@ async function blobToFile(record) {
  * @param options - {endpoint, log, now, fetchImpl}
  */
 export function createVault(options = {}) {
+	const t = options.t ?? ((key, values) => translate('zh', key, values));
 	const log = options.log ?? (() => {});
 	const now = options.now ?? (() => Date.now());
 	const fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
 	const bus = emitter();
 	let dbPromise = null;
 	let limits = { ...DEFAULT_LIMITS };
-	let lastNotice = '';
+	let lastNotice = null;
 	let started = false;
 	let teardown = null;
 	let hostKey = '';
@@ -112,8 +115,9 @@ export function createVault(options = {}) {
 	};
 
 	const db = () => dbPromise ??= openDb();
-	function notice(message) {
-		lastNotice = message;
+	function notice(key, values) {
+		lastNotice = { key, values };
+		const message = t(key, values);
 		bus.emit('notice', message);
 		try { globalThis.window?.dispatchEvent?.(new CustomEvent('dsh-session-toolbox-notice', { detail: message })); } catch { /* test envs */ }
 	}
@@ -164,7 +168,7 @@ export function createVault(options = {}) {
 			remove.push(oldest);
 		}
 		for (const record of remove) await dropRecord(record.key);
-		if (remove.length > 0) notice(`草稿保险箱已清理 ${remove.length} 项（超期/超容量）`);
+		if (remove.length > 0) notice('vault.cleaned', { count: remove.length });
 		changed();
 		return { removed: remove.length, kept: keep.length, bytes };
 	}
@@ -188,7 +192,7 @@ export function createVault(options = {}) {
 			added += 1;
 		}
 		await sweep();
-		if (added > 0) notice(`已备份 ${added} 张草稿图片（会话 ${sessionId.slice(-6)}）`);
+		if (added > 0) notice('vault.backedUp', { count: added, session: sessionId.slice(-6) });
 		await syncHost();
 		changed();
 	}
@@ -306,7 +310,7 @@ export function createVault(options = {}) {
 			if (accepted) {
 				for (const record of pending) delivered.add(record.hash);
 				seeded.set(editor, delivered);
-				notice(`已恢复 ${files.length} 张草稿图片（会话 ${sessionId.slice(-6)}）`);
+				notice('vault.restored', { count: files.length, session: sessionId.slice(-6) });
 			} else log('warn', 'synthetic paste was not accepted; backup retained for retry');
 			changed();
 			return accepted;
@@ -332,9 +336,7 @@ export function createVault(options = {}) {
 			retired += 1;
 		}
 		if (retired > 0) {
-			notice(reason === 'sent'
-				? `本会话草稿已随消息发送，${retired} 张备份不再恢复`
-				: `本会话草稿已清空，${retired} 张备份不再恢复`);
+			notice(reason === 'sent' ? 'vault.sent' : 'vault.cleared', { count: retired });
 			void syncHost();
 		}
 		changed();
@@ -386,7 +388,7 @@ export function createVault(options = {}) {
 
 	return {
 		on: bus.on, off: bus.off,
-		get lastNotice() { return lastNotice; },
+		get lastNotice() { return lastNotice ? t(lastNotice.key, lastNotice.values) : ''; },
 		currentSession,
 		records: allRecords,
 		countFor: async sessionId => {

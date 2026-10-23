@@ -3,9 +3,11 @@
  * old fibers are disposed before the new entry starts. Never replace routes or
  * start a second host ourselves (that would duplicate automatic model calls).
  */
-export function createHostVersionGuard({ version, name, manager, readState }) {
+import { translate } from './locale.mjs';
+
+export function createHostVersionGuard({ version, name, manager, readState, t = (key, values) => translate('zh', key, values) }) {
  let recovery;
- const mismatch = state => new Error(`插件前后台版本不一致（界面 ${version}，后台 ${state?.pluginVersion || '未知'}）。请在插件页重新启用插件；若已更新后台，请刷新界面后重试。`);
+ const mismatch = state => new Error(t('error.versionMismatch', { client: version, host: state?.pluginVersion || t('common.unknown') }));
  return async (state, repair = true) => {
   if (state?.pluginVersion === version) return;
   const service = manager();
@@ -16,7 +18,7 @@ export function createHostVersionGuard({ version, name, manager, readState }) {
    const bundle = (await service.listBundles()).find(bundle => bundle.name === name);
    if (!bundle?.enabled || !bundle.installed || bundle.version !== version) throw mismatch(state);
    const result = await service.setBundleEnabled(name, true);
-   if (result?.application !== 'applied') throw new Error('插件后台重新加载未生效。请在 DSH 插件页查看更新状态，再重新启用插件。');
+   if (result?.application !== 'applied') throw new Error(t('error.reload'));
    const latest = await readState();
    if (latest?.pluginVersion !== version) throw mismatch(latest);
   })();
