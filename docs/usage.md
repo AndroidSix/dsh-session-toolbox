@@ -1,6 +1,6 @@
 # 使用指南
 
-适用：Session Toolbox 0.1.47（源码版，尚未发布至 npm）；分组管理截图使用 0.1.41，其余既有截图使用 0.1.23，界面截图基于 DSH 0.2.1-rc.2。
+适用：Session Toolbox 0.1.47；分组管理截图使用 0.1.41，其余既有截图使用 0.1.23，界面截图基于 DSH 0.2.1-rc.2。
 
 [返回首页](../README.md) · [观看图文导览视频](media/session-toolbox-tour.mp4) · [素材脱敏说明](media/README.md)
 

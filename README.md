@@ -33,9 +33,7 @@
 
 兼容范围以 [package.json](package.json) 中的 `engines` 为准；当前声明支持 `^0.2.0-rc.2 || ^0.2.1-rc.2`，本机验收基线为 DSH 0.2.1-rc.2。Node 版本要求为 `^22.19.0 || >=24.0.0`。
 
-**已发布版本：0.1.45。** 在 DSH 插件安装页输入 `dsh-session-toolbox` 安装，或使用 [GitHub Release](https://github.com/AndroidSix/dsh-session-toolbox/releases/tag/v0.1.45) 中的本地包。
-
-当前源码版本为 **0.1.47**，包含独立联想模型、紧凑布局和中英文切换，尚未发布至 npm；需要这些功能时请按下方步骤构建本地安装包。
+**已发布版本：0.1.47。** 在 DSH 插件安装页输入 `dsh-session-toolbox` 安装，或使用 [GitHub Release](https://github.com/AndroidSix/dsh-session-toolbox/releases/tag/v0.1.47) 中的本地包。本版包含独立联想模型、紧凑布局和中英文切换。
 
 ### 从源码构建本地安装包
 
